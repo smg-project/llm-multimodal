@@ -22,7 +22,7 @@ use image::DynamicImage;
 use ndarray::Array3;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
-use crate::multimodal::vision::{
+use crate::vision::{
     image_processor::{ImagePreProcessor, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
     transforms::TransformError,
@@ -246,9 +246,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::multimodal::vision::{
-        image_processor::ModelSpecificValue, preprocessor_config::PatchSize,
-    };
+    use crate::vision::{image_processor::ModelSpecificValue, preprocessor_config::PatchSize};
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))

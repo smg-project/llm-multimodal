@@ -87,6 +87,8 @@ pub struct ImageFrame {
     pub raw_bytes: bytes::Bytes,
     pub detail: ImageDetail,
     pub source: ImageSource,
+    /// Blake3 hex-digest of raw_bytes, computed at decode time.
+    pub hash: String,
 }
 
 impl ImageFrame {
@@ -95,12 +97,14 @@ impl ImageFrame {
         raw_bytes: bytes::Bytes,
         detail: ImageDetail,
         source: ImageSource,
+        hash: String,
     ) -> Self {
         Self {
             image,
             raw_bytes,
             detail,
             source,
+            hash,
         }
     }
 
@@ -135,6 +139,28 @@ pub type MultiModalData = HashMap<Modality, Vec<TrackedMedia>>;
 pub type MultiModalUUIDs = HashMap<Modality, Vec<Option<String>>>;
 
 pub type TokenId = i32;
+
+/// Declares how a multimodal tensor's first dimension maps to items (images).
+///
+/// Used by [`ModelProcessorSpec::field_layouts`] to tell the backend how to
+/// split tensors for per-item scheduling (vLLM `MultiModalFieldConfig`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldLayout {
+    /// First dimension equals num_images (one slice per image).
+    Batched,
+    /// Variable-length slices per image.  The sizes are stored in the
+    /// tensor named by `sizes_key` (e.g. `"patches_per_image"`).
+    Flat { sizes_key: String },
+}
+
+impl FieldLayout {
+    /// Convenience constructor for `Flat`.
+    pub fn flat(sizes_key: impl Into<String>) -> Self {
+        Self::Flat {
+            sizes_key: sizes_key.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImageSize {

@@ -1,28 +1,20 @@
-mod kimi_k25;
 mod llama4;
 mod llava;
-mod minimax_m3;
 mod phi3_v;
-mod qwen3_asr;
-mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
 mod traits;
 
-use kimi_k25::KimiK25VisionSpec;
 use llama4::Llama4Spec;
-use llava::{LlavaNextSpec, LlavaSpec};
-use minimax_m3::MiniMaxM3VisionSpec;
+use llava::LlavaSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
-use qwen3_asr::Qwen3AsrSpec;
-use qwen3_omni::Qwen3OmniSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
+// Re-export for use by spec modules within the crate.
+pub(crate) use traits::image_sizes_hw;
 // Re-export public API from traits.
-pub use traits::{
-    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, Tokenizer,
-};
+pub use traits::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult};
 
 pub struct ModelRegistry {
     specs: Vec<LazySpec>,
@@ -32,18 +24,12 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
-                LazySpec::new(|| Box::new(KimiK25VisionSpec)),
-                LazySpec::new(|| Box::new(Llama4Spec)),
-                // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
-                LazySpec::new(|| Box::new(LlavaNextSpec)),
-                LazySpec::new(|| Box::new(LlavaSpec)),
-                LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
-                LazySpec::new(|| Box::new(Qwen3AsrSpec)),
-                LazySpec::new(|| Box::new(Qwen3OmniSpec)),
+                LazySpec::new("llama4", || Box::new(Llama4Spec)),
+                LazySpec::new("llava", || Box::new(LlavaSpec)),
                 // Qwen3-VL must be registered before QwenVL so "qwen3" matches first.
-                LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
-                LazySpec::new(|| Box::new(QwenVLVisionSpec)),
-                LazySpec::new(|| Box::new(Phi3VisionSpec)),
+                LazySpec::new("qwen3_vl", || Box::new(Qwen3VLVisionSpec)),
+                LazySpec::new("qwen_vl", || Box::new(QwenVLVisionSpec)),
+                LazySpec::new("phi3_v", || Box::new(Phi3VisionSpec)),
             ],
         }
     }
@@ -70,7 +56,7 @@ struct LazySpec {
 }
 
 impl LazySpec {
-    fn new(factory: fn() -> Box<dyn ModelProcessorSpec>) -> Self {
+    fn new(_id: &'static str, factory: fn() -> Box<dyn ModelProcessorSpec>) -> Self {
         Self {
             inner: Lazy::new(factory),
         }
@@ -85,10 +71,12 @@ impl LazySpec {
 pub(super) mod test_helpers {
     use std::collections::HashMap;
 
+    use llm_tokenizer::{Decoder, Encoder, Encoding, SpecialTokens, TokenizerTrait};
+    use once_cell::sync::Lazy;
+
     use crate::{
-        encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-        registry::Tokenizer,
         types::ImageSize,
+        vision::image_processor::{ModelSpecificValue, PreprocessedImages},
     };
 
     pub struct TestTokenizer {
@@ -105,7 +93,48 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl Tokenizer for TestTokenizer {
+    impl Encoder for TestTokenizer {
+        fn encode(&self, _input: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            Ok(Encoding::Plain(Vec::new()))
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            inputs
+                .iter()
+                .map(|_| self.encode("", add_special_tokens))
+                .collect()
+        }
+    }
+
+    impl Decoder for TestTokenizer {
+        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl TokenizerTrait for TestTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.vocab.len()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            static TOKENS: Lazy<SpecialTokens> = Lazy::new(|| SpecialTokens {
+                bos_token: None,
+                eos_token: None,
+                unk_token: None,
+                sep_token: None,
+                pad_token: None,
+                cls_token: None,
+                mask_token: None,
+                additional_special_tokens: vec![],
+            });
+            &TOKENS
+        }
+
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }
@@ -117,30 +146,35 @@ pub(super) mod test_helpers {
                 .map(|(k, _)| k.clone())
         }
 
-        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
-            Some(Vec::new())
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
         }
     }
 
+    /// Build a minimal `PreprocessedImages` for testing prompt_replacements.
+    pub fn test_preprocessed(image_sizes: &[ImageSize]) -> PreprocessedImages {
+        test_preprocessed_with_tokens(image_sizes, &vec![0; image_sizes.len()])
+    }
+
     pub fn test_preprocessed_with_tokens(
-        item_sizes: &[ImageSize],
-        feature_token_counts: &[usize],
-    ) -> PreprocessedEncoderInputs {
-        let sizes: Vec<(u32, u32)> = item_sizes.iter().map(|s| (s.height, s.width)).collect();
-        PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
-            feature_token_counts: feature_token_counts.to_vec(),
-            item_sizes: sizes,
+        image_sizes: &[ImageSize],
+        num_img_tokens: &[usize],
+    ) -> PreprocessedImages {
+        let sizes: Vec<(u32, u32)> = image_sizes.iter().map(|s| (s.height, s.width)).collect();
+        PreprocessedImages {
+            pixel_values: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            num_img_tokens: num_img_tokens.to_vec(),
+            image_sizes: sizes,
             model_specific: HashMap::new(),
         }
     }
 
-    /// Build `PreprocessedEncoderInputs` with explicit aspect_ratios (for Llama4 tests).
+    /// Build `PreprocessedImages` with explicit aspect_ratios (for Llama4 tests).
     pub fn test_preprocessed_with_aspects(
-        item_sizes: &[ImageSize],
+        image_sizes: &[ImageSize],
         aspect_ratios: &[(i64, i64)],
-    ) -> PreprocessedEncoderInputs {
-        let sizes: Vec<(u32, u32)> = item_sizes.iter().map(|s| (s.height, s.width)).collect();
+    ) -> PreprocessedImages {
+        let sizes: Vec<(u32, u32)> = image_sizes.iter().map(|s| (s.height, s.width)).collect();
         let flat: Vec<i64> = aspect_ratios
             .iter()
             .flat_map(|&(h, w)| vec![h, w])
@@ -154,10 +188,10 @@ pub(super) mod test_helpers {
                 shape: vec![batch, 2],
             },
         );
-        PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
-            feature_token_counts: vec![0; sizes.len()],
-            item_sizes: sizes,
+        PreprocessedImages {
+            pixel_values: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            num_img_tokens: vec![0; sizes.len()],
+            image_sizes: sizes,
             model_specific,
         }
     }

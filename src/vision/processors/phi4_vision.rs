@@ -39,8 +39,8 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage}
 use ndarray::{s, Array2, Array3, Array4, IxDyn};
 
 use crate::vision::{
+    image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{self, TransformError},
 };
 
@@ -63,7 +63,7 @@ pub const MASK_RESOLUTION: usize = 32;
 pub const PATCH_SIZE: usize = 14;
 
 /// Result type for single image processing.
-/// Contains (encoder_input, attention_mask, (height, width), num_tokens).
+/// Contains (pixel_values, attention_mask, (height, width), num_tokens).
 type SingleImageResult = (Array4<f32>, Array3<u32>, (u32, u32), usize);
 
 /// Phi4-Vision image processor.
@@ -273,7 +273,7 @@ impl Phi4VisionProcessor {
         // Resize image with bilinear interpolation (matching HuggingFace torchvision)
         // HuggingFace uses torchvision.transforms.functional.resize with BILINEAR + antialias=True.
         // FilterType::Triangle (bilinear) closely matches this behavior.
-        let resized = transforms::resize(image, new_w, new_h, FilterType::Triangle);
+        let resized = image.resize_exact(new_w, new_h, FilterType::Triangle);
 
         // Pad to target dimensions (white padding on right/bottom)
         let padded = self.pad_image(&resized, target_width, target_height);
@@ -442,7 +442,7 @@ impl Phi4VisionProcessor {
     }
 }
 
-impl VisionPreProcessor for Phi4VisionProcessor {
+impl ImagePreProcessor for Phi4VisionProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.mean
     }
@@ -455,7 +455,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         &self,
         images: &[DynamicImage],
         config: &PreProcessorConfig,
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+    ) -> Result<PreprocessedImages, TransformError> {
         if images.is_empty() {
             return Err(TransformError::InvalidShape {
                 expected: "non-empty image batch".to_string(),
@@ -471,15 +471,15 @@ impl VisionPreProcessor for Phi4VisionProcessor {
 
         let mut all_outputs = Vec::new();
         let mut all_masks = Vec::new();
-        let mut item_sizes = Vec::new();
-        let mut feature_token_counts = Vec::new();
+        let mut image_sizes = Vec::new();
+        let mut num_img_tokens = Vec::new();
 
         for image in images {
             let (output, mask, size, tokens) = processor.process_single_image(image);
             all_outputs.push(output);
             all_masks.push(mask);
-            item_sizes.push(size);
-            feature_token_counts.push(tokens);
+            image_sizes.push(size);
+            num_img_tokens.push(tokens);
         }
 
         // Find max crops across batch for padding
@@ -493,7 +493,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
 
         // Pad all outputs to max_crops
         let batch_size = images.len();
-        let mut encoder_input =
+        let mut pixel_values =
             ndarray::ArrayD::<f32>::zeros(IxDyn(&[batch_size, max_crops, 3, base, base]));
         let mut attention_masks =
             ndarray::ArrayD::<u32>::zeros(IxDyn(&[batch_size, max_crops, mask_res, mask_res]));
@@ -504,7 +504,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
                 for c in 0..3 {
                     for y in 0..base {
                         for x in 0..base {
-                            encoder_input[[b, t, c, y, x]] = output[[t, c, y, x]];
+                            pixel_values[[b, t, c, y, x]] = output[[t, c, y, x]];
                         }
                     }
                 }
@@ -531,7 +531,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         );
 
         // Store image sizes (H, W after HD transform)
-        let sizes_flat: Vec<i64> = item_sizes
+        let sizes_flat: Vec<i64> = image_sizes
             .iter()
             .flat_map(|&(h, w)| vec![h as i64, w as i64])
             .collect();
@@ -543,10 +543,10 @@ impl VisionPreProcessor for Phi4VisionProcessor {
             },
         );
 
-        Ok(PreprocessedEncoderInputs {
-            encoder_input: encoder_input.into_dyn(),
-            feature_token_counts,
-            item_sizes,
+        Ok(PreprocessedImages {
+            pixel_values: pixel_values.into_dyn(),
+            num_img_tokens,
+            image_sizes,
             model_specific,
         })
     }
@@ -672,10 +672,10 @@ mod tests {
         let result = processor.preprocess(&[image], &config).unwrap();
 
         assert_eq!(result.batch_size(), 1);
-        assert!(result.feature_token_counts[0] > 256); // At least global tokens
+        assert!(result.num_img_tokens[0] > 256); // At least global tokens
 
         // Check pixel values are normalized
-        let flat = result.encoder_input_flat();
+        let flat = result.pixel_values_flat();
         assert!(flat.iter().all(|&v| (-1.5..=1.5).contains(&v)));
     }
 
@@ -689,7 +689,7 @@ mod tests {
 
         assert_eq!(result.batch_size(), 1);
         // Wide image should have more crops in width direction
-        assert!(result.item_sizes[0].1 >= result.item_sizes[0].0);
+        assert!(result.image_sizes[0].1 >= result.image_sizes[0].0);
     }
 
     #[test]
@@ -705,8 +705,8 @@ mod tests {
         let result = processor.preprocess(&images, &config).unwrap();
 
         assert_eq!(result.batch_size(), 2);
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
+        assert_eq!(result.image_sizes.len(), 2);
+        assert_eq!(result.num_img_tokens.len(), 2);
     }
 
     #[test]

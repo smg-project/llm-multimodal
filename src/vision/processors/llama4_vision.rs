@@ -30,12 +30,12 @@
 
 use std::collections::HashSet;
 
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage};
 use ndarray::{s, Array3, Array4};
 
 use crate::vision::{
+    image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
-    processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{self, TransformError},
 };
 
@@ -258,55 +258,25 @@ impl Llama4VisionProcessor {
         }
     }
 
-    /// Build a padded [C, H, W] f32 tensor from a smaller image.
-    ///
-    /// The image is placed at top-left, and the remaining canvas is filled with
-    /// the normalized value of black (0). This fuses pad + tensor conversion
-    /// into one step, avoiding an intermediate padded `RgbImage` allocation.
-    fn pad_and_normalize_to_tensor(
-        &self,
-        image: &DynamicImage,
-        canvas_w: usize,
-        canvas_h: usize,
-    ) -> Array3<f32> {
-        let (img_w, img_h, raw) = transforms::rgb_bytes(image);
-        let canvas_pixels = canvas_h * canvas_w;
-
-        // Precompute fused scale/bias: (pixel/255 - mean) / std
-        let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * self.std[c] as f32));
-        let bias: [f32; 3] = std::array::from_fn(|c| -(self.mean[c] as f32) / (self.std[c] as f32));
-
-        let mut data = vec![0.0f32; 3 * canvas_pixels];
-        let (r_plane, rest) = data.split_at_mut(canvas_pixels);
-        let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
-
-        // Pre-fill with normalized black: 0 * scale + bias = bias
-        r_plane.fill(bias[0]);
-        g_plane.fill(bias[1]);
-        b_plane.fill(bias[2]);
-
-        // Overwrite image region row-by-row using the shared block-optimized helper
-        let rw = img_w.min(canvas_w);
-        let rh = img_h.min(canvas_h);
-        for y in 0..rh {
-            let src_row = &raw[y * img_w * 3..y * img_w * 3 + rw * 3];
-            let dst_offset = y * canvas_w;
-            transforms::deinterleave_rgb_to_planes(
-                src_row,
-                &mut r_plane[dst_offset..dst_offset + rw],
-                &mut g_plane[dst_offset..dst_offset + rw],
-                &mut b_plane[dst_offset..dst_offset + rw],
-                scale,
-                bias,
-            );
+    /// Pad image to target dimensions with black padding.
+    #[expect(
+        clippy::unused_self,
+        reason = "method logically belongs to the processor; keeps API consistent"
+    )]
+    fn pad_image(&self, image: &DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
+        let (w, h) = image.dimensions();
+        if w == target_w && h == target_h {
+            return image.clone();
         }
 
-        #[expect(
-            clippy::expect_used,
-            reason = "data has exactly 3*canvas_h*canvas_w elements by construction"
-        )]
-        Array3::from_shape_vec((3, canvas_h, canvas_w), data)
-            .expect("shape matches pre-allocated buffer")
+        // Create black background (LLaMA 4 uses 0 for padding)
+        let black = Rgb([0u8, 0, 0]);
+        let mut padded = RgbImage::from_pixel(target_w, target_h, black);
+
+        // Copy image to top-left using efficient overlay
+        image::imageops::overlay(&mut padded, &image.to_rgb8(), 0, 0);
+
+        DynamicImage::ImageRgb8(padded)
     }
 
     /// Split image tensor into tiles.
@@ -339,8 +309,10 @@ impl Llama4VisionProcessor {
     /// Create global image by bilinear interpolation to tile size.
     fn create_global_image(&self, image: &DynamicImage) -> Array3<f32> {
         let tile = self.tile_size;
-        let resized = transforms::resize(image, tile, tile, FilterType::Triangle);
-        transforms::to_tensor_and_normalize(&resized, &self.mean, &self.std)
+        let resized = image.resize_exact(tile, tile, FilterType::Triangle);
+        let mut tensor = transforms::to_tensor(&resized);
+        transforms::normalize(&mut tensor, &self.mean, &self.std);
+        tensor
     }
 
     /// Process a single image.
@@ -353,6 +325,7 @@ impl Llama4VisionProcessor {
         let (target_h, target_w) = target_size;
 
         // Step 2: Compute resize target - limit upscaling if not resize_to_max_canvas
+        // This limits how much we resize the image, but we still pad to target_size
         let resize_target = if self.resize_to_max_canvas {
             target_size
         } else {
@@ -366,25 +339,25 @@ impl Llama4VisionProcessor {
         let new_size = Self::get_max_res_without_distortion(image_size, resize_target);
         let (new_h, new_w) = (new_size.0.max(1), new_size.1.max(1));
 
-        let resized = transforms::resize(image, new_w, new_h, FilterType::Triangle);
+        let resized = image.resize_exact(new_w, new_h, FilterType::Triangle);
 
-        // Fused pad + tensor: build the padded f32 tensor directly from the
-        // resized RGB bytes, avoiding an intermediate padded RgbImage allocation.
-        let tensor = if new_w != target_w || new_h != target_h {
-            self.pad_and_normalize_to_tensor(&resized, target_w as usize, target_h as usize)
-        } else {
-            transforms::to_tensor_and_normalize(&resized, &self.mean, &self.std)
-        };
+        // Step 4: Pad to target_size (the canvas from get_best_fit, not resize_target)
+        let padded = self.pad_image(&resized, target_w, target_h);
+
+        // Step 5: Convert to tensor and normalize
+        let mut tensor = transforms::to_tensor(&padded);
+        transforms::normalize(&mut tensor, &self.mean, &self.std);
 
         // Step 6: Calculate tile counts based on target_size (canvas size)
         let tile = self.tile_size as usize;
         let num_tiles_h = target_h as usize / tile;
         let num_tiles_w = target_w as usize / tile;
 
-        // Step 7: Split into tiles + global tile
+        // Step 7: Split into tiles
         let tiles = self.split_to_tiles(&tensor, num_tiles_h, num_tiles_w);
         let num_tiles = num_tiles_h * num_tiles_w;
 
+        // Step 8: Add global tile if there are multiple tiles
         let output = if num_tiles > 1 {
             let global_tile = self.create_global_image(image);
             let mut combined = Array4::<f32>::zeros((num_tiles + 1, 3, tile, tile));
@@ -417,7 +390,7 @@ impl Llama4VisionProcessor {
     }
 }
 
-impl VisionPreProcessor for Llama4VisionProcessor {
+impl ImagePreProcessor for Llama4VisionProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.mean
     }
@@ -430,7 +403,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         &self,
         images: &[DynamicImage],
         config: &PreProcessorConfig,
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+    ) -> Result<PreprocessedImages, TransformError> {
         if images.is_empty() {
             return Err(TransformError::InvalidShape {
                 expected: "non-empty image batch".to_string(),
@@ -438,22 +411,20 @@ impl VisionPreProcessor for Llama4VisionProcessor {
             });
         }
 
-        let owned_processor;
         let processor = if config.max_image_tiles.is_some()
             || config.image_mean.is_some()
             || config.image_std.is_some()
             || config.size.is_some()
         {
-            owned_processor = Self::from_preprocessor_config(config);
-            &owned_processor
+            Self::from_preprocessor_config(config)
         } else {
-            self
+            self.clone()
         };
 
         let mut all_outputs = Vec::new();
         let mut all_aspect_ratios = Vec::new();
-        let mut item_sizes = Vec::new();
-        let mut feature_token_counts = Vec::new();
+        let mut image_sizes = Vec::new();
+        let mut num_img_tokens = Vec::new();
 
         for image in images {
             let (output, aspect_ratio) = processor.process_single_image(image);
@@ -461,25 +432,17 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
             all_outputs.push(output);
             all_aspect_ratios.push(aspect_ratio);
-            item_sizes.push(image.dimensions());
-            feature_token_counts.push(tokens);
+            image_sizes.push((image.height(), image.width()));
+            num_img_tokens.push(tokens);
         }
-
-        // Per-image tile counts (must be computed before remove/concatenate)
-        let patches_per_image: Vec<i64> = all_outputs.iter().map(|o| o.shape()[0] as i64).collect();
 
         // Concatenate all tiles from all images into a single 4D tensor
         // [total_tiles, C, H, W] — no batch dimension, no zero-padding.
         // This matches what sglang and vLLM vision models expect.
-        let encoder_input = if all_outputs.len() == 1 {
-            all_outputs.remove(0)
-        } else {
-            let tile_views: Vec<ndarray::ArrayView4<f32>> =
-                all_outputs.iter().map(|o| o.view()).collect();
-            ndarray::concatenate(ndarray::Axis(0), &tile_views).map_err(|e| {
-                TransformError::ShapeError(format!("Failed to concatenate tiles: {e}"))
-            })?
-        };
+        let tile_views: Vec<ndarray::ArrayView4<f32>> =
+            all_outputs.iter().map(|o| o.view()).collect();
+        let pixel_values = ndarray::concatenate(ndarray::Axis(0), &tile_views)
+            .map_err(|e| TransformError::ShapeError(format!("Failed to concatenate tiles: {e}")))?;
 
         // Store aspect ratios and patches_per_image as model-specific data
         let mut model_specific = std::collections::HashMap::new();
@@ -496,15 +459,18 @@ impl VisionPreProcessor for Llama4VisionProcessor {
                 shape: vec![batch_size, 2],
             },
         );
+
+        // Per-image tile counts for flat slicing of pixel_values.
+        let patches_per_image: Vec<i64> = all_outputs.iter().map(|o| o.shape()[0] as i64).collect();
         model_specific.insert(
             "patches_per_image".to_string(),
             ModelSpecificValue::int_1d(patches_per_image),
         );
 
-        Ok(PreprocessedEncoderInputs {
-            encoder_input: encoder_input.into_dyn(),
-            feature_token_counts,
-            item_sizes,
+        Ok(PreprocessedImages {
+            pixel_values: pixel_values.into_dyn(),
+            num_img_tokens,
+            image_sizes,
             model_specific,
         })
     }
@@ -535,8 +501,6 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
 #[cfg(test)]
 mod tests {
-    use image::{Rgb, RgbImage};
-
     use super::*;
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
@@ -622,12 +586,12 @@ mod tests {
         let result = processor.preprocess(&[image], &config).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
-        assert_eq!(result.encoder_input.ndim(), 4);
-        assert_eq!(result.feature_token_counts.len(), 1);
-        assert!(result.feature_token_counts[0] > 0);
+        assert_eq!(result.pixel_values.ndim(), 4);
+        assert_eq!(result.num_img_tokens.len(), 1);
+        assert!(result.num_img_tokens[0] > 0);
 
         // Check pixel values are normalized
-        let flat = result.encoder_input_flat();
+        let flat = result.pixel_values_flat();
         assert!(flat.iter().all(|&v| (-1.5..=1.5).contains(&v)));
     }
 
@@ -640,8 +604,8 @@ mod tests {
         let result = processor.preprocess(&[image], &config).unwrap();
 
         // 4D output: [total_tiles, C, H, W]
-        assert_eq!(result.encoder_input.ndim(), 4);
-        assert_eq!(result.feature_token_counts.len(), 1);
+        assert_eq!(result.pixel_values.ndim(), 4);
+        assert_eq!(result.num_img_tokens.len(), 1);
         // Wide image should have more tiles in width direction
         let aspect_ratios = result.model_specific.get("aspect_ratios").unwrap();
         if let ModelSpecificValue::IntTensor { data, .. } = aspect_ratios {
@@ -664,11 +628,11 @@ mod tests {
         let result = processor.preprocess(&images, &config).unwrap();
 
         // 4D output: [total_tiles, C, H, W] — tiles from both images concatenated
-        assert_eq!(result.encoder_input.ndim(), 4);
-        assert_eq!(result.feature_token_counts.len(), 2);
-        assert_eq!(result.item_sizes.len(), 2);
+        assert_eq!(result.pixel_values.ndim(), 4);
+        assert_eq!(result.num_img_tokens.len(), 2);
+        assert_eq!(result.image_sizes.len(), 2);
         // Total tiles should be > 2 (at least 1 tile per image)
-        assert!(result.encoder_input.shape()[0] >= 2);
+        assert!(result.pixel_values.shape()[0] >= 2);
     }
 
     #[test]
@@ -689,7 +653,7 @@ mod tests {
             if num_tiles > 1 {
                 // 4D output: [total_tiles, C, H, W]
                 // total_tiles = num_tiles + 1 (global tile)
-                let shape = result.encoder_input.shape();
+                let shape = result.pixel_values.shape();
                 assert_eq!(shape[0], num_tiles + 1);
             }
         }

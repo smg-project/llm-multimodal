@@ -20,11 +20,12 @@
 use std::ops::Deref;
 
 use image::DynamicImage;
+use ndarray::Array3;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
+use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
 use crate::vision::{
+    image_processor::{ImagePreProcessor, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::TransformError,
 };
 
@@ -34,11 +35,11 @@ pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 /// CLIP normalization std values used by Qwen2-VL models.
 pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
-/// Default minimum pixels (4 * 28 * 28 = 3,136)
-pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
+/// Default minimum pixels (256 * 28 * 28 = 200,704)
+pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
 
-/// Default maximum pixels (16,384 * 28 * 28 = 12,845,056)
-pub const DEFAULT_MAX_PIXELS: usize = 16_384 * 28 * 28;
+/// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
+pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
 
 /// Default patch size
 pub const DEFAULT_PATCH_SIZE: usize = 14;
@@ -73,8 +74,8 @@ impl Qwen2VLProcessor {
     /// Defaults:
     /// - patch_size: 14
     /// - merge_size: 2
-    /// - min_pixels: 3,136 (4 * 28 * 28)
-    /// - max_pixels: 12,845,056 (16,384 * 28 * 28)
+    /// - min_pixels: 200,704 (256 * 28 * 28)
+    /// - max_pixels: 1,003,520 (1280 * 28 * 28)
     /// - temporal_patch_size: 2
     /// - normalization: CLIP mean/std
     pub fn new() -> Self {
@@ -84,9 +85,6 @@ impl Qwen2VLProcessor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 min_pixels: DEFAULT_MIN_PIXELS,
                 max_pixels: DEFAULT_MAX_PIXELS,
-                video_min_pixels: DEFAULT_MIN_PIXELS,
-                video_max_pixels: DEFAULT_MAX_PIXELS,
-                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -109,9 +107,6 @@ impl Qwen2VLProcessor {
                 merge_size,
                 min_pixels,
                 max_pixels,
-                video_min_pixels: min_pixels,
-                video_max_pixels: max_pixels,
-                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -128,9 +123,6 @@ impl Qwen2VLProcessor {
                 merge_size: config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE),
                 min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
                 max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-                video_min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
-                video_max_pixels: config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS),
-                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size: config
                     .temporal_patch_size
                     .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
@@ -138,16 +130,6 @@ impl Qwen2VLProcessor {
                 std: CLIP_STD,
                 model_name: "qwen2-vl",
             }),
-        }
-    }
-
-    /// Build the effective processor for a request, applying any structural
-    /// overrides from `config`; otherwise reuse the existing defaults.
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides() {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
         }
     }
 
@@ -206,6 +188,18 @@ impl Qwen2VLProcessor {
         self.inner
             .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
+
+    /// Reshape pixel values from [C, H, W] to flattened patches format.
+    pub fn reshape_to_patches(
+        &self,
+        tensor: &Array3<f32>,
+        grid_t: usize,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> Result<Vec<f32>, TransformError> {
+        self.inner
+            .reshape_to_patches(tensor, grid_t, grid_h, grid_w)
+    }
 }
 
 impl Deref for Qwen2VLProcessor {
@@ -216,7 +210,7 @@ impl Deref for Qwen2VLProcessor {
     }
 }
 
-impl VisionPreProcessor for Qwen2VLProcessor {
+impl ImagePreProcessor for Qwen2VLProcessor {
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -229,14 +223,12 @@ impl VisionPreProcessor for Qwen2VLProcessor {
         &self,
         images: &[DynamicImage],
         config: &PreProcessorConfig,
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.preprocess(images, config)
+    ) -> Result<PreprocessedImages, TransformError> {
+        self.inner.preprocess(images, config)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.calculate_num_tokens(width, height, config)
+        self.inner.calculate_num_tokens(width, height, config)
     }
 
     fn model_name(&self) -> &'static str {
@@ -253,7 +245,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
-    use crate::vision::{preprocessor_config::PatchSize, processor::ModelSpecificValue};
+    use crate::vision::{image_processor::ModelSpecificValue, preprocessor_config::PatchSize};
 
     fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
         DynamicImage::from(RgbImage::from_pixel(width, height, color))
@@ -334,15 +326,12 @@ mod tests {
     }
 
     #[test]
-    fn test_smart_resize_small_dimension_clamps_to_factor() {
+    fn test_smart_resize_too_small_dimension_error() {
         let processor = Qwen2VLProcessor::new();
 
-        // Dimension smaller than factor (28) should be clamped up, not rejected
-        let (h, w) = processor.smart_resize(10, 100).unwrap();
-        assert!(h >= 28);
-        assert!(w >= 28);
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
+        // Dimension smaller than factor
+        let result = processor.smart_resize(10, 100);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -387,12 +376,12 @@ mod tests {
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
         let result = processor.preprocess(&[image], &config).unwrap();
 
-        // encoder_input is patchified: [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
-        assert!(result.encoder_input.shape()[0] > 0); // total_patches > 0
+        // pixel_values is patchified: [total_patches, patch_features]
+        assert_eq!(result.pixel_values.ndim(), 2);
+        assert!(result.pixel_values.shape()[0] > 0); // total_patches > 0
 
         // Check pixel values are normalized
-        let flat = result.encoder_input_flat();
+        let flat = result.pixel_values_flat();
         // After normalization with CLIP mean/std, gray (0.5) should be near 0
         // (0.5 - 0.48) / 0.27 ≈ 0.07
         assert!(flat.iter().all(|&v| v.abs() < 1.0)); // Should be normalized
@@ -402,7 +391,7 @@ mod tests {
         assert!(result.model_specific.contains_key("patches_per_image"));
 
         // Verify token count is reasonable
-        assert!(result.feature_token_counts[0] > 0);
+        assert!(result.num_img_tokens[0] > 0);
     }
 
     #[test]
@@ -418,11 +407,11 @@ mod tests {
         let result = processor.preprocess(&images, &config).unwrap();
 
         // Both images processed
-        assert_eq!(result.item_sizes.len(), 2);
-        assert_eq!(result.feature_token_counts.len(), 2);
+        assert_eq!(result.image_sizes.len(), 2);
+        assert_eq!(result.num_img_tokens.len(), 2);
 
-        // encoder_input is 2D [total_patches, patch_features]
-        assert_eq!(result.encoder_input.ndim(), 2);
+        // pixel_values is 2D [total_patches, patch_features]
+        assert_eq!(result.pixel_values.ndim(), 2);
 
         // Check grid_thw shape
         if let Some(ModelSpecificValue::IntTensor { data, shape }) =
@@ -441,7 +430,7 @@ mod tests {
             assert_eq!(shape, &[2]); // 2 images
             assert_eq!(data.len(), 2);
             let total: i64 = data.iter().sum();
-            assert_eq!(total as usize, result.encoder_input.shape()[0]);
+            assert_eq!(total as usize, result.pixel_values.shape()[0]);
         } else {
             panic!("Expected patches_per_image to be IntTensor");
         }
@@ -468,50 +457,6 @@ mod tests {
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);
         assert_eq!(processor.temporal_patch_size(), 4);
-    }
-
-    #[test]
-    fn test_calculate_num_tokens_honors_config_max_pixels() {
-        let processor = Qwen2VLProcessor::new();
-
-        // A 1400x1400 image fits below the default max_pixels, while a lower
-        // config max_pixels must still yield fewer tokens.
-        let default_tokens =
-            processor.calculate_num_tokens(1400, 1400, &PreProcessorConfig::default());
-        assert_eq!(default_tokens, 2500); // 1400x1400 -> (100*100)/4
-
-        let config = PreProcessorConfig {
-            max_pixels: Some(512 * 28 * 28), // 401,408, below the 1,003,520 default
-            ..Default::default()
-        };
-        let config_tokens = processor.calculate_num_tokens(1400, 1400, &config);
-        assert_eq!(config_tokens, 484); // resized to 616x616 -> (44*44)/4
-        assert_ne!(
-            config_tokens, default_tokens,
-            "config max_pixels override must change the token count"
-        );
-    }
-
-    #[test]
-    fn test_preprocess_honors_config_max_pixels() {
-        let processor = Qwen2VLProcessor::new();
-        let image = create_test_image(1400, 1400, Rgb([128, 128, 128]));
-
-        let config = PreProcessorConfig {
-            max_pixels: Some(512 * 28 * 28),
-            ..Default::default()
-        };
-        let result = processor.preprocess(&[image], &config).unwrap();
-
-        // 616x616 -> grid (1, 44, 44) -> (44*44)/4 = 484 tokens, vs 1225 at the default.
-        assert_eq!(result.feature_token_counts[0], 484);
-        if let Some(ModelSpecificValue::IntTensor { data, .. }) =
-            result.model_specific.get("image_grid_thw")
-        {
-            assert_eq!(data, &[1, 44, 44]);
-        } else {
-            panic!("Expected image_grid_thw to be IntTensor");
-        }
     }
 
     #[test]

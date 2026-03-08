@@ -1,7 +1,7 @@
 //! Pure Rust vision processing module for multimodal models.
 //!
-//! This module provides vision preprocessing pipelines that match HuggingFace
-//! processor outputs without requiring Python dependencies.
+//! This module provides image preprocessing pipelines that match HuggingFace processor
+//! outputs without requiring Python dependencies.
 //!
 //! # Architecture
 //!
@@ -9,11 +9,8 @@
 //!
 //! - `transforms`: Core image transformations (resize, normalize, crop, etc.)
 //! - `preprocessor_config`: HuggingFace config parsing
-//! - `processor`: Vision processor trait and registry
+//! - `image_processor`: Trait and output types for processors
 //! - `processors`: Model-specific implementations (LLaVA, Qwen-VL, etc.)
-//!
-//! Modality-neutral encoder outputs live in [`crate::encoder_inputs`], while
-//! shared errors live in [`crate::error`].
 //!
 //! # Usage
 //!
@@ -21,7 +18,7 @@
 //! use smg::multimodal::vision::{
 //!     PreProcessorConfig,
 //!     processors::LlavaProcessor,
-//!     VisionPreProcessor,
+//!     ImagePreProcessor,
 //! };
 //!
 //! // Load config from HuggingFace
@@ -32,22 +29,18 @@
 //! let result = processor.preprocess(&images, &config)?;
 //! ```
 
-pub(crate) mod execution;
+pub mod image_processor;
 pub mod preprocessor_config;
-pub mod processor;
 pub mod processors;
-pub(crate) mod scratch;
 pub mod transforms;
 
-// Re-export commonly used types, including compatibility paths for shared
-// preprocessing outputs.
-pub use preprocessor_config::PreProcessorConfig;
-pub use processor::{
-    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionProcessorRegistry,
+// Re-export commonly used types
+pub use image_processor::{
+    ImagePreProcessor, ImageProcessorRegistry, ModelSpecificValue, PreprocessedImages,
 };
+pub use preprocessor_config::PreProcessorConfig;
 pub use processors::{
-    Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor, MiniMaxM3Processor,
-    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
-    Qwen3OmniVisionProcessor, Qwen3VLProcessor,
+    Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor, Phi3VisionProcessor,
+    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
 };
 pub use transforms::TransformError;

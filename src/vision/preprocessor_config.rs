@@ -7,36 +7,8 @@ use std::collections::HashMap;
 
 use image::imageops::FilterType;
 use serde::{Deserialize, Deserializer};
-use serde_with::{serde_as, TryFromInto};
 
 use super::transforms;
-
-/// Deserialization shape for HF size fields.
-///
-/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
-/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum SizeRepr {
-    Map(HashMap<String, u32>),
-    Array([u32; 2]),
-}
-
-impl TryFrom<SizeRepr> for HashMap<String, u32> {
-    type Error = &'static str;
-
-    fn try_from(value: SizeRepr) -> Result<Self, Self::Error> {
-        match value {
-            SizeRepr::Map(size) => Ok(size),
-            SizeRepr::Array([height, width]) => {
-                let mut size = HashMap::new();
-                size.insert("height".to_string(), height);
-                size.insert("width".to_string(), width);
-                Ok(size)
-            }
-        }
-    }
-}
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -129,7 +101,6 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
-#[serde_as]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
@@ -177,13 +148,11 @@ pub struct PreProcessorConfig {
     pub resampling: Option<usize>,
 
     /// Target size for resizing
-    /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
-    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
+    /// Can be {"height": H, "width": W} or {"shortest_edge": S}
     #[serde(default)]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
-    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
     #[serde(default)]
     pub crop_size: Option<HashMap<String, u32>>,
 
@@ -223,7 +192,7 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub max_image_tiles: Option<usize>,
 
-    /// Fixed number of image tokens (some model configs use this HF field name).
+    /// Fixed number of image tokens (some models use this)
     #[serde(default)]
     pub num_img_tokens: Option<usize>,
 
@@ -261,63 +230,13 @@ pub struct PreProcessorConfig {
 
 impl PreProcessorConfig {
     /// Parse from JSON string.
-    ///
-    /// Handles both standard HuggingFace format (top-level fields) and Kimi-K2.5's
-    /// nested format where values are under `media_proc_cfg`.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        let raw: serde_json::Value = serde_json::from_str(json)?;
-        Self::from_value(raw)
+        serde_json::from_str(json)
     }
 
     /// Parse from JSON value.
-    ///
-    /// Handles both standard HuggingFace format (top-level fields) and Kimi-K2.5's
-    /// nested format where values are under `media_proc_cfg`.
     pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        let mut config: Self = serde_json::from_value(value.clone())?;
-        Self::apply_nested_media_cfg(&mut config, &value);
-        Ok(config)
-    }
-
-    /// Extract values from nested `media_proc_cfg` (used by Kimi-K2.5 and
-    /// similar models) when top-level fields are missing.
-    fn apply_nested_media_cfg(config: &mut Self, raw: &serde_json::Value) {
-        let Some(media_cfg) = raw.get("media_proc_cfg") else {
-            return;
-        };
-        if config.image_mean.is_none() {
-            config.image_mean = media_cfg
-                .get("image_mean")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-        }
-        if config.image_std.is_none() {
-            config.image_std = media_cfg
-                .get("image_std")
-                .and_then(|v| serde_json::from_value(v.clone()).ok());
-        }
-        if config.patch_size.is_none() {
-            config.patch_size = media_cfg.get("patch_size").and_then(|v| {
-                v.as_u64().map(|ps| PatchSize {
-                    height: Some(ps as u32),
-                    width: Some(ps as u32),
-                })
-            });
-        }
-        if config.merge_size.is_none() {
-            config.merge_size = media_cfg
-                .get("merge_kernel_size")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-        }
-        // Also extract Kimi-specific limits into the extra map
-        // so processors can read them via get_extra()
-        for key in ["in_patch_limit", "patch_limit_on_one_side"] {
-            if !config.extra.contains_key(key) {
-                if let Some(v) = media_cfg.get(key) {
-                    config.extra.insert(key.to_string(), v.clone());
-                }
-            }
-        }
+        serde_json::from_value(value)
     }
 
     /// Get patch size as a simple usize.
@@ -329,26 +248,6 @@ impl PreProcessorConfig {
             .and_then(|p| p.height)
             .map(|h| h as usize)
             .unwrap_or(default)
-    }
-
-    /// Whether this config changes Qwen-style processor structure or budgets.
-    pub(crate) fn has_structural_overrides(&self) -> bool {
-        self.patch_size.is_some()
-            || self.merge_size.is_some()
-            || self.min_pixels.is_some()
-            || self.max_pixels.is_some()
-            || self.temporal_patch_size.is_some()
-            || self.size.is_some()
-    }
-
-    /// Whether the declared processor type is image-only rather than video-capable.
-    pub(crate) fn is_image_only_processor_type(&self) -> bool {
-        self.image_processor_type
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|processor| {
-                processor.contains("imageprocessor") && !processor.contains("video")
-            })
     }
 
     /// Get image mean as fixed array, with fallback to CLIP defaults.
@@ -398,23 +297,6 @@ impl PreProcessorConfig {
                 .unwrap_or(224);
             (h, w)
         })
-    }
-
-    /// Get a scalar value from the `size` map, such as `shortest_edge` or
-    /// `longest_edge`.
-    pub fn get_size_value(&self, key: &str) -> Option<usize> {
-        self.size
-            .as_ref()
-            .and_then(|s| s.get(key))
-            .map(|v| *v as usize)
-    }
-
-    pub fn get_shortest_edge(&self) -> Option<usize> {
-        self.get_size_value("shortest_edge")
-    }
-
-    pub fn get_longest_edge(&self) -> Option<usize> {
-        self.get_size_value("longest_edge")
     }
 
     /// Get crop size.
@@ -543,11 +425,6 @@ mod tests {
         let json2 = r#"{"size": {"shortest_edge": 224}}"#;
         let config2 = PreProcessorConfig::from_json(json2).unwrap();
         assert_eq!(config2.get_target_size(), Some((224, 224)));
-
-        // Array format [height, width] (e.g. MiniMax M3)
-        let json3 = r#"{"size": [672, 672]}"#;
-        let config3 = PreProcessorConfig::from_json(json3).unwrap();
-        assert_eq!(config3.get_target_size(), Some((672, 672)));
     }
 
     #[test]
@@ -563,23 +440,6 @@ mod tests {
         assert!(!config.should_rescale()); // false by default
         assert!(config.should_resize()); // true by default
         assert!(!config.should_center_crop()); // false by default
-    }
-
-    #[test]
-    fn test_image_only_processor_type_detection() {
-        for (processor_type, expected) in [
-            (Some("Qwen3VLImageProcessor"), true),
-            (Some("qWeN3vLiMaGePrOcEsSoR"), true),
-            (Some("Qwen3VLVideoProcessor"), false),
-            (Some("Qwen3VLImageProcessorVideo"), false),
-            (None, false),
-        ] {
-            let config = PreProcessorConfig {
-                image_processor_type: processor_type.map(str::to_owned),
-                ..Default::default()
-            };
-            assert_eq!(config.is_image_only_processor_type(), expected);
-        }
     }
 
     #[test]
@@ -606,36 +466,5 @@ mod tests {
             nested.as_ref().unwrap().get("foo"),
             Some(&"bar".to_string())
         );
-    }
-
-    #[test]
-    fn test_parse_kimi_nested_media_proc_cfg() {
-        let json = r#"{
-            "auto_map": {
-                "AutoProcessor": "kimi_k25_processor.KimiK25Processor"
-            },
-            "media_proc_cfg": {
-                "in_patch_limit": 16384,
-                "patch_size": 14,
-                "image_mean": [0.5, 0.5, 0.5],
-                "image_std": [0.5, 0.5, 0.5],
-                "merge_kernel_size": 2,
-                "patch_limit_on_one_side": 512
-            }
-        }"#;
-
-        let config = PreProcessorConfig::from_json(json).unwrap();
-
-        // image_mean/std should be extracted from media_proc_cfg
-        let mean = config.get_image_mean();
-        assert!((mean[0] - 0.5).abs() < 1e-6);
-        assert!((mean[1] - 0.5).abs() < 1e-6);
-        assert!((mean[2] - 0.5).abs() < 1e-6);
-
-        let std = config.get_image_std();
-        assert!((std[0] - 0.5).abs() < 1e-6);
-
-        assert_eq!(config.get_patch_size(0), 14);
-        assert_eq!(config.merge_size, Some(2));
     }
 }

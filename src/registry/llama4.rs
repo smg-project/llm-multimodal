@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::image_processor::{ModelSpecificValue, PreprocessedImages},
 };
 
 pub(super) struct Llama4Spec;
@@ -50,7 +50,7 @@ impl Llama4Spec {
     /// `aspect_ratios` tensor.  Falls back to deriving tile counts from
     /// the original image sizes when aspect_ratios are unavailable.
     fn extract_aspect_ratios(
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: &PreprocessedImages,
         tile_size: usize,
     ) -> Vec<(usize, usize)> {
         if let Some(ModelSpecificValue::IntTensor { data, shape }) =
@@ -65,7 +65,7 @@ impl Llama4Spec {
         }
         // Fallback: derive from original image sizes (height, width).
         preprocessed
-            .item_sizes
+            .image_sizes
             .iter()
             .map(|&(h, w)| {
                 let h_tiles = (h as usize).div_ceil(tile_size);
@@ -83,11 +83,8 @@ impl ModelProcessorSpec for Llama4Spec {
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
-        id.contains("llama-4")
-            || id.contains("llama4")
-            || metadata
-                .config_model_type()
-                .is_some_and(|mt| mt == "llama4")
+        // Match "llama-4", "llama4", "Llama-4-Maverick", "Llama-4-Scout", etc.
+        id.contains("llama-4") || id.contains("llama4")
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -115,7 +112,7 @@ impl ModelProcessorSpec for Llama4Spec {
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: &PreprocessedImages,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let patch_token_id = self.placeholder_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
@@ -170,7 +167,7 @@ impl ModelProcessorSpec for Llama4Spec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // encoder_input is [total_tiles, C, H, W] — variable tiles per image.
+        // pixel_values is [total_tiles, C, H, W] — variable tiles per image.
         // aspect_ratios and patches_per_image are [num_images, ...].
         HashMap::from([
             (
@@ -267,30 +264,5 @@ mod tests {
                                                                      // The token before the last patch block is <|image|> (global tile marker)
                                                                      // Position: 1 + 290 + 290 = 581
         assert_eq!(replacements[0].tokens[581], 200090); // <|image|>
-    }
-
-    #[test]
-    fn llama4_matches_alias_via_model_type() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image|>", 200090),
-            ("<|image_start|>", 200088),
-            ("<|image_end|>", 200089),
-            ("<|patch|>", 200092),
-            ("<|tile_x_separator|>", 200093),
-            ("<|tile_y_separator|>", 200094),
-        ]);
-        let config = json!({
-            "model_type": "llama4",
-            "image_token_index": 200092,
-            "vision_config": {"image_size": 336, "patch_size": 14}
-        });
-        let metadata = ModelMetadata {
-            model_id: "custom-model",
-            tokenizer: &tokenizer,
-            config: &config,
-        };
-        let registry = ModelRegistry::new();
-        let spec = registry.lookup(&metadata).expect("llama4 alias");
-        assert_eq!(spec.name(), "llama4");
     }
 }

@@ -8,11 +8,10 @@
 //! - `llava_pad/` - Expand-to-square mode (liuhaotian/llava-* models, image_aspect_ratio=pad)
 //! - `qwen2_vl/` - Dynamic resolution with smart resize (Qwen/Qwen2-VL-* models)
 //! - `qwen3_vl/` - Dynamic resolution with patch_size=16 and [0.5,0.5,0.5] norm (Qwen/Qwen3-VL-* models)
-//! - `minimax_m3/` - Qwen2-VL patchify with MiniMax smart resize (MiniMaxAI/MiniMax-M3 models)
 //!
 //! To regenerate golden outputs:
 //! ```bash
-//! python scripts/generate_vision_golden.py
+//! python crates/multimodal/scripts/generate_vision_golden.py
 //! ```
 
 #![expect(
@@ -32,9 +31,9 @@
 use std::{fs::File, io::Read, path::Path};
 
 use llm_multimodal::vision::{
-    Llama4VisionProcessor, LlavaProcessor, MiniMaxM3Processor, ModelSpecificValue,
+    image_processor::ModelSpecificValue, ImagePreProcessor, Llama4VisionProcessor, LlavaProcessor,
     Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig,
-    Qwen2VLProcessor, Qwen3VLProcessor, VisionPreProcessor,
+    Qwen2VLProcessor, Qwen3VLProcessor,
 };
 use ndarray::{Array4, Array5};
 
@@ -123,28 +122,19 @@ fn load_golden_num_tokens(path: &Path) -> usize {
     data[0] as usize
 }
 
-fn skip_missing_fixture(message: String, command: &str) {
-    if std::env::var_os("LLM_MULTIMODAL_REQUIRE_GOLDEN").is_some() {
-        panic!("{message}. Run: {command}");
-    }
-    eprintln!("{message}, skipping test");
-    eprintln!("Run: {command}");
-}
-
 /// Run a golden test for a specific mode and image.
 ///
 /// # Arguments
 /// * `mode` - Either "llava" (standard CLIP) or "llava_pad" (expand-to-square mode)
 /// * `image_name` - Name of the test image (e.g., "square", "tall", "wide", "small")
 fn run_golden_test(mode: &str, image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden").join(mode);
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden").join(mode);
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for {mode}/{image_name} not found"),
-            "python scripts/generate_vision_golden.py",
-        );
+        eprintln!("Golden test fixtures for {mode}/{image_name} not found, skipping test");
+        eprintln!("Run: python crates/multimodal/scripts/generate_vision_golden.py");
         return;
     }
 
@@ -153,7 +143,7 @@ fn run_golden_test(mode: &str, image_name: &str) {
 
     let image = image::open(&image_path).expect("Failed to open image");
 
-    let processor: Box<dyn VisionPreProcessor> = match mode {
+    let processor: Box<dyn ImagePreProcessor> = match mode {
         "llava" => Box::new(LlavaProcessor::new()),
         "llava_pad" => Box::new(LlavaProcessor::new_with_pad()),
         _ => panic!("Unknown test mode: {mode}"),
@@ -163,10 +153,10 @@ fn run_golden_test(mode: &str, image_name: &str) {
         .preprocess(&[image], &config)
         .expect("Processing failed");
 
-    let diff = max_diff(&golden, &result.encoder_input);
+    let diff = max_diff(&golden, &result.pixel_values);
     println!("{mode} - {image_name} image - Max difference: {diff:.6}");
     println!("Golden shape: {:?}", golden.shape());
-    println!("Rust shape: {:?}", result.encoder_input.shape());
+    println!("Rust shape: {:?}", result.pixel_values.shape());
 
     // Allow tolerance for floating point and interpolation algorithm differences
     // Different interpolation implementations (Rust vs Python/PIL) can produce
@@ -289,13 +279,10 @@ fn test_llava_pad_golden_grayscale() {
 
 #[test]
 fn test_llava_token_count() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llava");
 
     if !golden_dir.exists() {
-        skip_missing_fixture(
-            "Golden test fixtures not found".to_string(),
-            "python scripts/generate_vision_golden.py --model llava",
-        );
+        eprintln!("Golden test fixtures not found, skipping test");
         return;
     }
 
@@ -339,13 +326,14 @@ fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
 /// 2. num_tokens calculation is correct
 /// 3. Pixel values match after reshaping to patch format
 fn run_qwen2_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/qwen2_vl");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen2_vl");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for qwen2_vl/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model qwen2_vl",
+        eprintln!("Golden test fixtures for qwen2_vl/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen2_vl"
         );
         return;
     }
@@ -384,7 +372,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     );
 
     // Compare token counts
-    let rust_num_tokens = result.feature_token_counts[0];
+    let rust_num_tokens = result.num_img_tokens[0];
     println!(
         "qwen2_vl - {image_name} image - Tokens: golden={golden_num_tokens}, rust={rust_num_tokens}"
     );
@@ -394,10 +382,10 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     );
 
     // pixel_values is now already patchified: [total_patches, patch_features]
-    let rust_patches = result.encoder_input_flat();
+    let rust_patches = result.pixel_values_flat();
     let rust_shape = (
-        result.encoder_input.shape()[0],
-        result.encoder_input.shape()[1],
+        result.pixel_values.shape()[0],
+        result.pixel_values.shape()[1],
     );
 
     println!(
@@ -489,13 +477,14 @@ fn test_qwen2_vl_golden_grayscale() {
 /// - factor: 32 (vs 28)
 /// - normalization: [0.5, 0.5, 0.5] (vs CLIP)
 fn run_qwen3_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/qwen3_vl");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen3_vl");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for qwen3_vl/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model qwen3_vl",
+        eprintln!("Golden test fixtures for qwen3_vl/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen3_vl"
         );
         return;
     }
@@ -534,7 +523,7 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
     );
 
     // Compare token counts
-    let rust_num_tokens = result.feature_token_counts[0];
+    let rust_num_tokens = result.num_img_tokens[0];
     println!(
         "qwen3_vl - {image_name} image - Tokens: golden={golden_num_tokens}, rust={rust_num_tokens}"
     );
@@ -544,10 +533,10 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
     );
 
     // pixel_values is now already patchified: [total_patches, patch_features]
-    let rust_patches = result.encoder_input_flat();
+    let rust_patches = result.pixel_values_flat();
     let rust_shape = (
-        result.encoder_input.shape()[0],
-        result.encoder_input.shape()[1],
+        result.pixel_values.shape()[0],
+        result.pixel_values.shape()[1],
     );
 
     println!(
@@ -620,152 +609,6 @@ fn test_qwen3_vl_golden_odd_dims() {
 #[test]
 fn test_qwen3_vl_golden_grayscale() {
     run_qwen3_vl_golden_test("grayscale");
-}
-
-// ============================================================================
-// MiniMax-M3 tests
-// ============================================================================
-
-/// Run a MiniMax-M3 golden test for a specific image.
-///
-/// This test validates:
-/// 1. image_grid_thw matches the HuggingFace output
-/// 2. num_tokens calculation is correct
-/// 3. Pixel values match after patchification
-///
-/// MiniMax-M3 shares Qwen2-VL's patchify pipeline (patch_size=14, merge_size=2,
-/// CLIP normalization) with MiniMax's max-pixel smart resize setting.
-fn run_minimax_m3_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/minimax_m3");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
-
-    if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for minimax_m3/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model minimax_m3",
-        );
-        return;
-    }
-
-    let npz_path = golden_dir.join(format!("golden_{image_name}.npz"));
-    let config = load_config(&golden_dir.join("preprocessor_config.json"));
-
-    // Load golden values
-    let golden_grid_thw = load_golden_grid_thw(&npz_path);
-    let golden_num_tokens = load_golden_num_tokens(&npz_path);
-    let (golden_pixels, golden_shape) = load_golden_qwen2_vl_pixels(&npz_path);
-
-    // Process image with our Rust processor
-    let image = image::open(&image_path).expect("Failed to open image");
-    let processor = MiniMaxM3Processor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
-
-    // Extract image_grid_thw from result
-    let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
-        Some(ModelSpecificValue::IntTensor { data, shape }) => {
-            assert_eq!(shape, &[1, 3], "Expected shape [1, 3] for single image");
-            data.clone()
-        }
-        _ => panic!("Expected image_grid_thw in model_specific"),
-    };
-
-    // Compare grid dimensions
-    println!(
-        "minimax_m3 - {image_name} image - Grid T H W: golden={golden_grid_thw:?}, rust={rust_grid_thw:?}"
-    );
-    assert_eq!(
-        golden_grid_thw, rust_grid_thw,
-        "image_grid_thw mismatch for {image_name}"
-    );
-
-    // Compare token counts
-    let rust_num_tokens = result.feature_token_counts[0];
-    println!(
-        "minimax_m3 - {image_name} image - Tokens: golden={golden_num_tokens}, rust={rust_num_tokens}"
-    );
-    assert_eq!(
-        golden_num_tokens, rust_num_tokens,
-        "num_tokens mismatch for {image_name}"
-    );
-
-    // pixel_values is already patchified: [total_patches, patch_features]
-    let rust_patches = result.encoder_input_flat();
-    let rust_shape = (
-        result.encoder_input.shape()[0],
-        result.encoder_input.shape()[1],
-    );
-
-    println!(
-        "minimax_m3 - {image_name} image - Patch shape: golden={golden_shape:?}, rust={rust_shape:?}"
-    );
-    assert_eq!(golden_shape, rust_shape, "Patch shape mismatch");
-
-    // Compare pixel values
-    let max_diff = rust_patches
-        .iter()
-        .zip(golden_pixels.iter())
-        .map(|(r, g)| (r - g).abs())
-        .fold(0.0f32, f32::max);
-
-    println!("minimax_m3 - {image_name} image - Max pixel diff: {max_diff:.6}");
-
-    // Allow tolerance for floating point and interpolation differences
-    assert!(
-        max_diff < 0.1,
-        "Max pixel difference {max_diff} exceeds tolerance 0.1 for {image_name}"
-    );
-}
-
-#[test]
-fn test_minimax_m3_golden_square() {
-    run_minimax_m3_golden_test("square");
-}
-
-#[test]
-fn test_minimax_m3_golden_tall() {
-    run_minimax_m3_golden_test("tall");
-}
-
-#[test]
-fn test_minimax_m3_golden_wide() {
-    run_minimax_m3_golden_test("wide");
-}
-
-#[test]
-fn test_minimax_m3_golden_small() {
-    run_minimax_m3_golden_test("small");
-}
-
-#[test]
-fn test_minimax_m3_golden_tiny() {
-    run_minimax_m3_golden_test("tiny");
-}
-
-#[test]
-fn test_minimax_m3_golden_very_tall() {
-    run_minimax_m3_golden_test("very_tall");
-}
-
-#[test]
-fn test_minimax_m3_golden_very_wide() {
-    run_minimax_m3_golden_test("very_wide");
-}
-
-#[test]
-fn test_minimax_m3_golden_large() {
-    run_minimax_m3_golden_test("large");
-}
-
-#[test]
-fn test_minimax_m3_golden_odd_dims() {
-    run_minimax_m3_golden_test("odd_dims");
-}
-
-#[test]
-fn test_minimax_m3_golden_grayscale() {
-    run_minimax_m3_golden_test("grayscale");
 }
 
 // ============================================================================
@@ -896,13 +739,14 @@ fn find_max_diff_location_5d(
 /// 3. num_img_tokens matches HuggingFace output
 /// 4. Pixel values match within tolerance
 fn run_phi3_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/phi3_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi3_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for phi3_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model phi3_vision",
+        eprintln!("Golden test fixtures for phi3_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi3_vision"
         );
         return;
     }
@@ -923,7 +767,7 @@ fn run_phi3_vision_golden_test(image_name: &str) {
         .expect("Processing failed");
 
     // Check output shape
-    let rust_shape = result.encoder_input.shape();
+    let rust_shape = result.pixel_values.shape();
     let golden_shape = golden_pixels.shape();
     println!(
         "phi3_vision - {image_name} image - Shape: golden={golden_shape:?}, rust={rust_shape:?}"
@@ -956,17 +800,17 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     // Check num_img_tokens
     println!(
         "phi3_vision - {image_name} image - Num tokens: golden={golden_num_tokens:?}, rust={:?}",
-        result.feature_token_counts
+        result.num_img_tokens
     );
     assert_eq!(
-        golden_num_tokens, result.feature_token_counts,
+        golden_num_tokens, result.num_img_tokens,
         "num_img_tokens mismatch for {image_name}"
     );
 
     // Compare pixel values
     // Convert rust ArrayD to Array5 for comparison
     let rust_pixels = result
-        .encoder_input
+        .pixel_values
         .clone()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
@@ -1098,13 +942,14 @@ fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
 /// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
 /// - Default dynamic_hd: 36 (vs 16)
 fn run_phi4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/phi4_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi4_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for phi4_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model phi4_vision",
+        eprintln!("Golden test fixtures for phi4_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi4_vision"
         );
         return;
     }
@@ -1125,7 +970,7 @@ fn run_phi4_vision_golden_test(image_name: &str) {
         .expect("Processing failed");
 
     // Check output shape
-    let rust_shape = result.encoder_input.shape();
+    let rust_shape = result.pixel_values.shape();
     let golden_shape = golden_pixels.shape();
     println!(
         "phi4_vision - {image_name} image - Shape: golden={golden_shape:?}, rust={rust_shape:?}"
@@ -1157,16 +1002,16 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     // Check num_img_tokens
     println!(
         "phi4_vision - {image_name} image - Num tokens: golden={golden_num_tokens:?}, rust={:?}",
-        result.feature_token_counts
+        result.num_img_tokens
     );
     assert_eq!(
-        golden_num_tokens, result.feature_token_counts,
+        golden_num_tokens, result.num_img_tokens,
         "num_img_tokens mismatch for {image_name}"
     );
 
     // Compare pixel values
     let rust_pixels = result
-        .encoder_input
+        .pixel_values
         .clone()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
@@ -1303,13 +1148,14 @@ fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
 /// - Normalization: [0.5, 0.5, 0.5] mean/std
 /// - Global tile added when num_tiles > 1
 fn run_llama4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/llama4_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llama4_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for llama4_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model llama4_vision",
+        eprintln!("Golden test fixtures for llama4_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model llama4_vision"
         );
         return;
     }
@@ -1349,7 +1195,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     );
 
     // Check num_tokens
-    let rust_num_tokens = result.feature_token_counts[0];
+    let rust_num_tokens = result.num_img_tokens[0];
     println!(
         "llama4_vision - {image_name} image - Tokens: golden={golden_num_tokens}, rust={rust_num_tokens}"
     );
@@ -1359,7 +1205,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     );
 
     // Check output shape - both HuggingFace and Rust output 4D (total_tiles, C, H, W)
-    let rust_shape = result.encoder_input.shape();
+    let rust_shape = result.pixel_values.shape();
     println!(
         "llama4_vision - {image_name} image - Shape: golden={golden_shape:?}, rust={rust_shape:?}"
     );
@@ -1377,7 +1223,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     );
 
     // Compare pixel values
-    let rust_pixels = result.encoder_input_flat();
+    let rust_pixels = result.pixel_values_flat();
     let num_golden_elements: usize = golden_shape.iter().product();
 
     // Find the max difference for the actual tiles (not padding)
@@ -1487,13 +1333,14 @@ fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
 /// - Normalization: CLIP mean/std
 /// - No tiling - single output per image
 fn run_pixtral_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/pixtral");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/pixtral");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for pixtral/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model pixtral",
+        eprintln!("Golden test fixtures for pixtral/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model pixtral"
         );
         return;
     }
@@ -1534,7 +1381,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     );
 
     // Check num_tokens
-    let rust_num_tokens = result.feature_token_counts[0];
+    let rust_num_tokens = result.num_img_tokens[0];
     println!(
         "pixtral - {image_name} image - Tokens: golden={golden_num_tokens}, rust={rust_num_tokens}"
     );
@@ -1544,7 +1391,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     );
 
     // Check output shape
-    let rust_shape = result.encoder_input.shape();
+    let rust_shape = result.pixel_values.shape();
     println!("pixtral - {image_name} image - Shape: golden={golden_shape:?}, rust={rust_shape:?}");
 
     // Pixtral outputs [batch, C, H, W] with padding to max size in batch
@@ -1565,7 +1412,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     );
 
     // Compare pixel values - only compare the actual image region, not padding
-    let rust_pixels = result.encoder_input_flat();
+    let rust_pixels = result.pixel_values_flat();
     let golden_pixels_flat: Vec<f32> = golden_pixels.iter().copied().collect();
 
     // Calculate indices for the actual image region (not padding)

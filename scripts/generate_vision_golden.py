@@ -6,14 +6,14 @@ that are used to verify the Rust image preprocessors produce identical results.
 
 Usage:
     # Generate all golden outputs
-    python scripts/generate_vision_golden.py
+    python crates/multimodal/scripts/generate_vision_golden.py
 
     # Generate for specific model
-    python scripts/generate_vision_golden.py --model llava
+    python crates/multimodal/scripts/generate_vision_golden.py --model llava
 
     # Use specific image
-    python scripts/generate_vision_golden.py \
-        --image tests/fixtures/images/square.jpg
+    python crates/multimodal/scripts/generate_vision_golden.py \
+        --image crates/multimodal/tests/fixtures/images/square.jpg
 """
 
 import argparse
@@ -72,25 +72,20 @@ MODELS = {
         "processor_class": "PixtralImageProcessor",
         "description": "Dynamic resolution with CLIP normalization and bicubic resize",
     },
-    "minimax_m3": {
-        "model_id": "MiniMaxAI/MiniMax-M3",
-        "processor_class": "MiniMaxM3VLImageProcessor",
-        "description": "Qwen2-VL patchify with MiniMax smart resize, CLIP normalization",
-    },
 }
 
 # Default test images
 DEFAULT_IMAGES = [
-    "tests/fixtures/images/square.jpg",
-    "tests/fixtures/images/tall.jpg",
-    "tests/fixtures/images/wide.jpg",
-    "tests/fixtures/images/small.jpg",
-    "tests/fixtures/images/tiny.jpg",
-    "tests/fixtures/images/very_tall.jpg",
-    "tests/fixtures/images/very_wide.jpg",
-    "tests/fixtures/images/large.jpg",
-    "tests/fixtures/images/odd_dims.jpg",
-    "tests/fixtures/images/grayscale.jpg",
+    "crates/multimodal/tests/fixtures/images/square.jpg",
+    "crates/multimodal/tests/fixtures/images/tall.jpg",
+    "crates/multimodal/tests/fixtures/images/wide.jpg",
+    "crates/multimodal/tests/fixtures/images/small.jpg",
+    "crates/multimodal/tests/fixtures/images/tiny.jpg",
+    "crates/multimodal/tests/fixtures/images/very_tall.jpg",
+    "crates/multimodal/tests/fixtures/images/very_wide.jpg",
+    "crates/multimodal/tests/fixtures/images/large.jpg",
+    "crates/multimodal/tests/fixtures/images/odd_dims.jpg",
+    "crates/multimodal/tests/fixtures/images/grayscale.jpg",
 ]
 
 
@@ -236,8 +231,8 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     Default parameters:
     - patch_size: 14
     - merge_size: 2
-    - min_pixels: 4 * 28 * 28 = 3,136
-    - max_pixels: 16,384 * 28 * 28 = 12,845,056
+    - min_pixels: 256 * 28 * 28 = 200,704
+    - max_pixels: 1280 * 28 * 28 = 1,003,520
     - temporal_patch_size: 2
     """
     try:
@@ -259,8 +254,8 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     patch_size = processor.patch_size
     merge_size = processor.merge_size
     temporal_patch_size = getattr(processor, "temporal_patch_size", 2)
-    min_pixels = getattr(processor, "min_pixels", None)
-    max_pixels = getattr(processor, "max_pixels", None)
+    min_pixels = processor.min_pixels
+    max_pixels = processor.max_pixels
 
     # Calculate number of tokens
     # tokens = (T * H * W) / merge_size²
@@ -612,79 +607,6 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
     return result
 
 
-def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
-    """Generate golden output for MiniMax-M3 VL.
-
-    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
-    defaults:
-    1. Smart resize to fit within min/max pixel bounds
-    2. Align dimensions to (patch_size * merge_size) boundary
-    3. Normalize with CLIP mean/std
-    4. Returns image_grid_thw for position encoding
-
-    Default parameters:
-    - patch_size: 14
-    - merge_size: 2
-    - temporal_patch_size: 2
-    - min_pixels: 4 * 28 * 28 = 3,136
-    - max_pixels: 672 * 672 = 451,584
-    """
-    from transformers import AutoImageProcessor
-
-    # The image processor is registered under AutoImageProcessor in the model's
-    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
-    # full AutoProcessor.
-    img_processor = AutoImageProcessor.from_pretrained(
-        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
-    )
-    image = Image.open(image_path).convert("RGB")
-    original_size = image.size
-
-    # Process image
-    outputs = img_processor(images=image, return_tensors="pt")
-
-    # Convert to numpy for saving
-    pixel_values = outputs["pixel_values"].numpy()
-    image_grid_thw = outputs.get("image_grid_thw")
-    if image_grid_thw is not None:
-        image_grid_thw = image_grid_thw.numpy()
-
-    # Get config values
-    patch_size = getattr(img_processor, "patch_size", 14)
-    merge_size = getattr(img_processor, "merge_size", 2)
-    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
-
-    # Calculate number of tokens: (T * H * W) / merge_size²
-    if image_grid_thw is not None:
-        grid_thw = image_grid_thw[0]
-        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
-    else:
-        num_tokens = None
-
-    result = {
-        "pixel_values": pixel_values,
-        "original_size": original_size,
-        "processor_config": img_processor.to_dict(),
-    }
-
-    if image_grid_thw is not None:
-        result["image_grid_thw"] = image_grid_thw
-
-    if num_tokens is not None:
-        result["num_tokens"] = num_tokens
-
-    # Add debug info
-    result["config_info"] = {
-        "patch_size": patch_size,
-        "merge_size": merge_size,
-        "temporal_patch_size": temporal_patch_size,
-        "min_pixels": getattr(img_processor, "min_pixels", None),
-        "max_pixels": getattr(img_processor, "max_pixels", None),
-    }
-
-    return result
-
-
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -699,7 +621,6 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "phi4_vision": generate_golden_phi4_vision,
         "llama4_vision": generate_golden_llama4_vision,
         "pixtral": generate_golden_pixtral,
-        "minimax_m3": generate_golden_minimax_m3,
     }.get(model_key)
 
     if generator_fn is None:
@@ -735,7 +656,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         "-o",
-        default="tests/fixtures/golden",
+        default="crates/multimodal/tests/fixtures/golden",
         help="Output directory for golden files",
     )
     args = parser.parse_args()

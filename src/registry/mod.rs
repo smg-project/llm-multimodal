@@ -14,7 +14,9 @@ use phi3_v::Phi3VisionSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
-pub use traits::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult};
+pub use traits::{
+    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, TokenResolver,
+};
 
 pub struct ModelRegistry {
     specs: Vec<LazySpec>,
@@ -74,10 +76,8 @@ impl LazySpec {
 pub(super) mod test_helpers {
     use std::collections::HashMap;
 
-    use llm_tokenizer::{Decoder, Encoder, Encoding, SpecialTokens, TokenizerTrait};
-    use once_cell::sync::Lazy;
-
     use crate::{
+        registry::TokenResolver,
         types::ImageSize,
         vision::image_processor::{ModelSpecificValue, PreprocessedImages},
     };
@@ -96,48 +96,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl Encoder for TestTokenizer {
-        fn encode(&self, _input: &str, _add_special_tokens: bool) -> anyhow::Result<Encoding> {
-            Ok(Encoding::Plain(Vec::new()))
-        }
-
-        fn encode_batch(
-            &self,
-            inputs: &[&str],
-            add_special_tokens: bool,
-        ) -> anyhow::Result<Vec<Encoding>> {
-            inputs
-                .iter()
-                .map(|_| self.encode("", add_special_tokens))
-                .collect()
-        }
-    }
-
-    impl Decoder for TestTokenizer {
-        fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-    }
-
-    impl TokenizerTrait for TestTokenizer {
-        fn vocab_size(&self) -> usize {
-            self.vocab.len()
-        }
-
-        fn get_special_tokens(&self) -> &SpecialTokens {
-            static TOKENS: Lazy<SpecialTokens> = Lazy::new(|| SpecialTokens {
-                bos_token: None,
-                eos_token: None,
-                unk_token: None,
-                sep_token: None,
-                pad_token: None,
-                cls_token: None,
-                mask_token: None,
-                additional_special_tokens: vec![],
-            });
-            &TOKENS
-        }
-
+    impl TokenResolver for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }
@@ -147,10 +106,6 @@ pub(super) mod test_helpers {
                 .iter()
                 .find(|(_, &v)| v == id)
                 .map(|(k, _)| k.clone())
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
         }
     }
 

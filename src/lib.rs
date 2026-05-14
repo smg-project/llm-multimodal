@@ -9,7 +9,7 @@ pub mod vision;
 
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult};
 pub use media::{ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource};
-pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry};
+pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry, TokenResolver};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     FieldLayout, ImageDetail, ImageFrame, ImageSize, ImageSource, MediaContentPart, Modality,

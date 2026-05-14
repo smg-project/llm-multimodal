@@ -1,6 +1,5 @@
 pub mod error;
 pub mod hasher;
-pub mod hub;
 pub mod media;
 pub mod registry;
 pub mod tracker;

@@ -39,8 +39,6 @@ tokio = { version = "1.52.3", features = ["sync", "fs", "rt-multi-thread", "proc
 tracing = "0.1"
 url = "2.5.8"
 
-# Workspace crates
-llm-tokenizer = "1.3.2"
 anyhow = "1.0"
 blake3 = "1.5"
 

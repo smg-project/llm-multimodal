@@ -1,5 +1,6 @@
 pub mod error;
 pub mod hasher;
+#[cfg(feature = "hf-hub")]
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;

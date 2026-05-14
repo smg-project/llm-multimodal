@@ -23,28 +23,25 @@ fast_image_resize = { version = "6.0.0", features = ["image"] }
 image = { version = "0.25.4", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 ndarray = "0.17"
 once_cell = "1.21.3"
-reqwest = { workspace = true, features = ["stream"] }
-serde = { workspace = true, features = ["derive"] }
+reqwest = { version = "0.12.8", default-features = false, features = ["stream", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
-serde_json.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0.12"
+tokio = { version = "1.42.0", features = ["sync", "fs", "rt-multi-thread"] }
 url = "2.5.4"
 
 # Workspace crates
-llm-tokenizer.workspace = true
-anyhow.workspace = true
-blake3.workspace = true
+llm-tokenizer = "1.3.2"
+anyhow = "1.0"
+blake3 = "1.5"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 npyz = { version = "0.9", features = ["npz"] }
 tempfile = "3.8"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros"] }
 
 [[bench]]
 name = "image_preprocess"
 harness = false
-
-[lints]
-workspace = true

@@ -15,6 +15,11 @@ Current upstream split base:
 - Local rewritten split commit: `d552f139ad89f61f43447fa804976a0f3d1294f6`
 - Corresponding SMG PR at extraction time: `lightseekorg/smg#1459`
 
+## License
+
+Licensed under the Apache License, Version 2.0. This repository was extracted
+from `lightseekorg/smg/crates/multimodal`; see `LICENSE` for details.
+
 ## Sync With Upstream
 
 To refresh this fork from a newer SMG checkout:

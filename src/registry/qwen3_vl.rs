@@ -29,9 +29,9 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
         id.contains("qwen3") && id.contains("vl")
-            || metadata
-                .config_model_type()
-                .is_some_and(|mt| mt == "qwen3_vl")
+            || metadata.config_model_type().is_some_and(|mt| {
+                matches!(mt, "qwen3_vl" | "qwen3_5" | "qwen3_5_moe")
+            })
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -176,6 +176,48 @@ mod tests {
         let spec = registry
             .lookup(&metadata)
             .expect("should match qwen3 alias");
+        assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    #[test]
+    fn qwen3_5_matches_via_model_type() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 248056)]);
+        let config = json!({
+            "model_type": "qwen3_5",
+            "vision_start_token_id": 248053,
+            "image_token_id": 248056,
+            "vision_end_token_id": 248054
+        });
+        let metadata = ModelMetadata {
+            model_id: "custom-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&metadata)
+            .expect("should match qwen3.5 alias");
+        assert_eq!(spec.name(), "qwen3_vl");
+    }
+
+    #[test]
+    fn qwen3_5_moe_matches_via_model_type() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 248056)]);
+        let config = json!({
+            "model_type": "qwen3_5_moe",
+            "vision_start_token_id": 248053,
+            "image_token_id": 248056,
+            "vision_end_token_id": 248054
+        });
+        let metadata = ModelMetadata {
+            model_id: "custom-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&metadata)
+            .expect("should match qwen3.5 moe alias");
         assert_eq!(spec.name(), "qwen3_vl");
     }
 }

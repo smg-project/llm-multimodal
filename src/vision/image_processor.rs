@@ -375,7 +375,8 @@ impl ImageProcessorRegistry {
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
     /// - `qwen2-vl` -> Qwen2VLProcessor
     /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
-    /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
+    /// - `qwen3-vl` / `qwen3.5` -> Qwen3VLProcessor
+    ///   (Qwen3.5 reuses the Qwen3-VL image processor)
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
@@ -413,6 +414,14 @@ impl ImageProcessorRegistry {
         );
         registry.register(
             "qwen3_vl",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+        registry.register(
+            "qwen3.5",
+            Box::new(super::processors::Qwen3VLProcessor::new()),
+        );
+        registry.register(
+            "qwen3_5",
             Box::new(super::processors::Qwen3VLProcessor::new()),
         );
 
@@ -607,6 +616,36 @@ mod tests {
         let processor = registry
             .find("custom-model", Some("qwen3_vl"))
             .expect("qwen3 processor by model_type");
+        assert_eq!(processor.model_name(), "qwen3-vl");
+    }
+
+    #[test]
+    fn test_registry_find_qwen3_5_model_type_fallback() {
+        let registry = ImageProcessorRegistry::with_defaults();
+
+        let processor = registry
+            .find("custom-model", Some("qwen3_5"))
+            .expect("qwen3.5 processor by model_type");
+        assert_eq!(processor.model_name(), "qwen3-vl");
+    }
+
+    #[test]
+    fn test_registry_find_qwen3_5_moe_model_type_fallback() {
+        let registry = ImageProcessorRegistry::with_defaults();
+
+        let processor = registry
+            .find("custom-model", Some("qwen3_5_moe"))
+            .expect("qwen3.5 moe processor by model_type");
+        assert_eq!(processor.model_name(), "qwen3-vl");
+    }
+
+    #[test]
+    fn test_registry_find_qwen3_5_model_id_fast_path() {
+        let registry = ImageProcessorRegistry::with_defaults();
+
+        let processor = registry
+            .find("/models/qwen3.5-0.8b-th-mtp", None)
+            .expect("qwen3.5 processor by model_id");
         assert_eq!(processor.model_name(), "qwen3-vl");
     }
 

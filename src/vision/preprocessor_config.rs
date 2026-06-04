@@ -7,80 +7,42 @@ use std::collections::HashMap;
 
 use image::imageops::FilterType;
 use serde::{Deserialize, Deserializer};
+use serde_with::{serde_as, TryFromInto};
 
 use super::transforms;
+
+/// Deserialization shape for HF size fields.
+///
+/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
+/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SizeRepr {
+    Map(HashMap<String, u32>),
+    Array([u32; 2]),
+}
+
+impl TryFrom<SizeRepr> for HashMap<String, u32> {
+    type Error = &'static str;
+
+    fn try_from(value: SizeRepr) -> Result<Self, Self::Error> {
+        match value {
+            SizeRepr::Map(size) => Ok(size),
+            SizeRepr::Array([height, width]) => {
+                let mut size = HashMap::new();
+                size.insert("height".to_string(), height);
+                size.insert("width".to_string(), width);
+                Ok(size)
+            }
+        }
+    }
+}
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PatchSize {
     pub height: Option<u32>,
     pub width: Option<u32>,
-}
-
-/// Custom deserializer for the `size` field that handles both map and array formats.
-/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
-/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
-fn deserialize_size<'de, D>(deserializer: D) -> Result<Option<HashMap<String, u32>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use std::fmt;
-
-    use serde::de::{self, MapAccess, SeqAccess, Visitor};
-
-    struct SizeVisitor;
-
-    impl<'de> Visitor<'de> for SizeVisitor {
-        type Value = Option<HashMap<String, u32>>;
-
-        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-            formatter.write_str("a map with height/width/shortest_edge, an array [height, width], or null")
-        }
-
-        fn visit_none<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_unit<E>(self) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(None)
-        }
-
-        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-        where
-            M: MapAccess<'de>,
-        {
-            let mut result = HashMap::new();
-            while let Some(key) = map.next_key::<String>()? {
-                let value = map.next_value::<u32>()?;
-                result.insert(key, value);
-            }
-            Ok(Some(result))
-        }
-
-        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
-        where
-            S: SeqAccess<'de>,
-        {
-            let h: u32 = seq
-                .next_element()?
-                .ok_or_else(|| de::Error::invalid_length(0, &"array of [height, width]"))?;
-            let w: u32 = seq
-                .next_element()?
-                .ok_or_else(|| de::Error::invalid_length(1, &"array of [height, width]"))?;
-            let mut result = HashMap::new();
-            result.insert("height".to_string(), h);
-            result.insert("width".to_string(), w);
-            Ok(Some(result))
-        }
-    }
-
-    deserializer.deserialize_any(SizeVisitor)
 }
 
 /// Custom deserializer for patch_size that handles both integer and dict formats.
@@ -167,6 +129,7 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
+#[serde_as]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
@@ -215,11 +178,13 @@ pub struct PreProcessorConfig {
 
     /// Target size for resizing
     /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
-    #[serde(default, deserialize_with = "deserialize_size")]
+    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
+    #[serde(default)]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
-    #[serde(default, deserialize_with = "deserialize_size")]
+    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
+    #[serde(default)]
     pub crop_size: Option<HashMap<String, u32>>,
 
     // =====================

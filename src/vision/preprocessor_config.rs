@@ -17,6 +17,72 @@ pub struct PatchSize {
     pub width: Option<u32>,
 }
 
+/// Custom deserializer for the `size` field that handles both map and array formats.
+/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
+/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
+fn deserialize_size<'de, D>(deserializer: D) -> Result<Option<HashMap<String, u32>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use std::fmt;
+
+    use serde::de::{self, MapAccess, SeqAccess, Visitor};
+
+    struct SizeVisitor;
+
+    impl<'de> Visitor<'de> for SizeVisitor {
+        type Value = Option<HashMap<String, u32>>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a map with height/width/shortest_edge, an array [height, width], or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+        where
+            M: MapAccess<'de>,
+        {
+            let mut result = HashMap::new();
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<u32>()?;
+                result.insert(key, value);
+            }
+            Ok(Some(result))
+        }
+
+        fn visit_seq<S>(self, mut seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            let h: u32 = seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(0, &"array of [height, width]"))?;
+            let w: u32 = seq
+                .next_element()?
+                .ok_or_else(|| de::Error::invalid_length(1, &"array of [height, width]"))?;
+            let mut result = HashMap::new();
+            result.insert("height".to_string(), h);
+            result.insert("width".to_string(), w);
+            Ok(Some(result))
+        }
+    }
+
+    deserializer.deserialize_any(SizeVisitor)
+}
+
 /// Custom deserializer for patch_size that handles both integer and dict formats.
 /// - Integer format: `"patch_size": 16` -> PatchSize { height: 16, width: 16 }
 /// - Dict format: `"patch_size": {"height": 16, "width": 16}` -> PatchSize { height: 16, width: 16 }
@@ -148,12 +214,12 @@ pub struct PreProcessorConfig {
     pub resampling: Option<usize>,
 
     /// Target size for resizing
-    /// Can be {"height": H, "width": W} or {"shortest_edge": S}
-    #[serde(default)]
+    /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
+    #[serde(default, deserialize_with = "deserialize_size")]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_size")]
     pub crop_size: Option<HashMap<String, u32>>,
 
     // =====================
@@ -475,6 +541,11 @@ mod tests {
         let json2 = r#"{"size": {"shortest_edge": 224}}"#;
         let config2 = PreProcessorConfig::from_json(json2).unwrap();
         assert_eq!(config2.get_target_size(), Some((224, 224)));
+
+        // Array format [height, width] (e.g. MiniMax M3)
+        let json3 = r#"{"size": [672, 672]}"#;
+        let config3 = PreProcessorConfig::from_json(json3).unwrap();
+        assert_eq!(config3.get_target_size(), Some((672, 672)));
     }
 
     #[test]

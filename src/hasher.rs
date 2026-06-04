@@ -1,8 +1,13 @@
 use std::collections::BTreeMap;
 
+/// Compute a blake3 hex-digest hash for arbitrary bytes.
+pub fn hash_bytes(raw_bytes: &[u8]) -> String {
+    blake3::hash(raw_bytes).to_hex().to_string()
+}
+
 /// Compute a blake3 hex-digest hash for a single image's raw bytes.
 pub fn hash_image(raw_bytes: &[u8]) -> String {
-    blake3::hash(raw_bytes).to_hex().to_string()
+    hash_bytes(raw_bytes)
 }
 
 /// Compute per-image hashes keyed by modality.

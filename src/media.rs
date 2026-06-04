@@ -11,6 +11,12 @@ use super::{
     types::{ImageDetail, ImageFrame, ImageSource},
 };
 
+#[cfg(feature = "video")]
+use super::{
+    types::{VideoFrame, VideoSource},
+    video::FrameSampler,
+};
+
 #[derive(Clone)]
 pub struct MediaConnectorConfig {
     pub allowed_domains: Option<Vec<String>>,
@@ -37,6 +43,21 @@ impl Default for ImageFetchConfig {
     fn default() -> Self {
         Self {
             detail: ImageDetail::Auto,
+        }
+    }
+}
+
+#[cfg(feature = "video")]
+#[derive(Clone)]
+pub struct VideoFetchConfig {
+    pub sampler: Arc<dyn FrameSampler>,
+}
+
+#[cfg(feature = "video")]
+impl VideoFetchConfig {
+    pub fn new(sampler: impl FrameSampler + 'static) -> Self {
+        Self {
+            sampler: Arc::new(sampler),
         }
     }
 }
@@ -87,21 +108,146 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         match source {
             MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            MediaSource::DataUrl(data_url) => self.fetch_data_url(data_url, cfg).await,
+            MediaSource::DataUrl(data_url) => self.fetch_data_url_image(data_url, cfg).await,
             MediaSource::InlineBytes(bytes) => {
                 self.decode_image(bytes.into(), cfg.detail, ImageSource::InlineBytes)
                     .await
             }
-            MediaSource::File(path) => self.fetch_file(path, cfg).await,
+            MediaSource::File(path) => self.fetch_file_image(path, cfg).await,
         }
     }
 
-    async fn fetch_http_image(
+    // -----------------------------------------------------------------------
+    // Video fetching
+    // -----------------------------------------------------------------------
+
+    #[cfg(feature = "video")]
+    pub async fn fetch_video(
         &self,
-        url: String,
-        cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let parsed = Url::parse(&url).map_err(|_| MediaConnectorError::InvalidUrl(url.clone()))?;
+        source: MediaSource,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoFrame>, MediaConnectorError> {
+        match source {
+            MediaSource::File(path) => self.fetch_file_video(path, cfg).await,
+            other => {
+                // For non-file sources, resolve to bytes first
+                let (bytes, video_source) = self.resolve_bytes(other).await?;
+                self.decode_video_bytes(bytes, video_source, cfg).await
+            }
+        }
+    }
+
+    #[cfg(feature = "video")]
+    async fn resolve_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<(Bytes, VideoSource), MediaConnectorError> {
+        match source {
+            MediaSource::Url(url) => {
+                let bytes = self.fetch_http_bytes(&url).await?;
+                Ok((bytes, VideoSource::Url { url }))
+            }
+            MediaSource::DataUrl(data_url) => {
+                let bytes = self.decode_data_url_bytes(&data_url)?;
+                Ok((bytes, VideoSource::DataUrl))
+            }
+            MediaSource::InlineBytes(bytes) => Ok((bytes.into(), VideoSource::InlineBytes)),
+            MediaSource::File(path) => {
+                let bytes = self.fetch_file_bytes(&path).await?;
+                Ok((bytes, VideoSource::File { path }))
+            }
+        }
+    }
+
+    #[cfg(feature = "video")]
+    async fn fetch_file_video(
+        &self,
+        path: PathBuf,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoFrame>, MediaConnectorError> {
+        let allowed_root = self
+            .allowed_local_media_path
+            .as_ref()
+            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
+
+        let canonical = fs::canonicalize(&path).await?;
+        if !canonical.starts_with(allowed_root) {
+            return Err(MediaConnectorError::DisallowedLocalPath(
+                path.display().to_string(),
+            ));
+        }
+
+        let container_hash = {
+            let raw = fs::read(&canonical).await?;
+            crate::hasher::hash_bytes(&raw)
+        };
+
+        let sampler = Arc::clone(&cfg.sampler);
+        let canonical_clone = canonical.clone();
+        let decode_result = task::spawn_blocking(move || {
+            crate::video::decode_video_path(&canonical_clone, sampler.as_ref())
+        })
+        .await
+        .map_err(MediaConnectorError::Blocking)??;
+
+        let frame_hashes: Vec<String> = decode_result
+            .1
+            .iter()
+            .map(|img| {
+                let rgb = img.to_rgb8();
+                crate::hasher::hash_bytes(rgb.as_raw())
+            })
+            .collect();
+
+        Ok(Arc::new(VideoFrame::new(
+            decode_result.1,
+            container_hash,
+            frame_hashes,
+            decode_result.0,
+            VideoSource::File { path: canonical },
+        )))
+    }
+
+    #[cfg(feature = "video")]
+    async fn decode_video_bytes(
+        &self,
+        bytes: Bytes,
+        source: VideoSource,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoFrame>, MediaConnectorError> {
+        let container_hash = crate::hasher::hash_bytes(&bytes);
+
+        let sampler = Arc::clone(&cfg.sampler);
+        let decode_result = task::spawn_blocking(move || {
+            crate::video::decode_video_bytes(&bytes, sampler.as_ref())
+        })
+        .await
+        .map_err(MediaConnectorError::Blocking)??;
+
+        let frame_hashes: Vec<String> = decode_result
+            .1
+            .iter()
+            .map(|img| {
+                let rgb = img.to_rgb8();
+                crate::hasher::hash_bytes(rgb.as_raw())
+            })
+            .collect();
+
+        Ok(Arc::new(VideoFrame::new(
+            decode_result.1,
+            container_hash,
+            frame_hashes,
+            decode_result.0,
+            source,
+        )))
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared byte-fetching helpers
+    // -----------------------------------------------------------------------
+
+    async fn fetch_http_bytes(&self, url: &str) -> Result<Bytes, MediaConnectorError> {
+        let parsed = Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
         let mut req = self.client.get(parsed.as_str());
@@ -118,22 +264,10 @@ impl MediaConnector {
         })?;
 
         let resp = resp.error_for_status()?;
-        let bytes = resp.bytes().await?;
-        self.decode_image(
-            bytes,
-            cfg.detail,
-            ImageSource::Url {
-                url: parsed.to_string(),
-            },
-        )
-        .await
+        resp.bytes().await.map_err(MediaConnectorError::Http)
     }
 
-    async fn fetch_data_url(
-        &self,
-        data_url: String,
-        cfg: ImageFetchConfig,
-    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+    fn decode_data_url_bytes(&self, data_url: &str) -> Result<Bytes, MediaConnectorError> {
         let (metadata, data) = data_url
             .split_once(',')
             .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
@@ -146,11 +280,56 @@ impl MediaConnector {
 
         let data = data.trim();
         let decoded = BASE64_STANDARD.decode(data)?;
-        self.decode_image(decoded.into(), cfg.detail, ImageSource::DataUrl)
+        Ok(decoded.into())
+    }
+
+    #[cfg(feature = "video")]
+    async fn fetch_file_bytes(&self, path: &PathBuf) -> Result<Bytes, MediaConnectorError> {
+        let allowed_root = self
+            .allowed_local_media_path
+            .as_ref()
+            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
+
+        let canonical = fs::canonicalize(path).await?;
+        if !canonical.starts_with(allowed_root) {
+            return Err(MediaConnectorError::DisallowedLocalPath(
+                path.display().to_string(),
+            ));
+        }
+
+        let bytes = fs::read(&canonical).await?;
+        Ok(bytes.into())
+    }
+
+    // -----------------------------------------------------------------------
+    // Image fetching (refactored to use shared helpers)
+    // -----------------------------------------------------------------------
+
+    async fn fetch_http_image(
+        &self,
+        url: String,
+        cfg: ImageFetchConfig,
+    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        let bytes = self.fetch_http_bytes(&url).await?;
+        self.decode_image(
+            bytes,
+            cfg.detail,
+            ImageSource::Url { url },
+        )
+        .await
+    }
+
+    async fn fetch_data_url_image(
+        &self,
+        data_url: String,
+        cfg: ImageFetchConfig,
+    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        let bytes = self.decode_data_url_bytes(&data_url)?;
+        self.decode_image(bytes, cfg.detail, ImageSource::DataUrl)
             .await
     }
 
-    async fn fetch_file(
+    async fn fetch_file_image(
         &self,
         path: PathBuf,
         cfg: ImageFetchConfig,
@@ -195,7 +374,7 @@ impl MediaConnector {
         detail: ImageDetail,
         source: ImageSource,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let hash = crate::hasher::hash_image(&bytes);
+        let hash = crate::hasher::hash_bytes(&bytes);
 
         let cursor = std::io::Cursor::new(bytes.clone());
         let reader = image::ImageReader::new(cursor).with_guessed_format()?;

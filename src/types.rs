@@ -4,6 +4,9 @@ use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[cfg(feature = "video")]
+pub use crate::video::VideoMetadata;
+
 /// Supported multimodal modalities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +63,20 @@ pub enum MediaContentPart {
     },
     ImageEmbeds {
         payload: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+    #[cfg(feature = "video")]
+    VideoUrl {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        uuid: Option<String>,
+    },
+    #[cfg(feature = "video")]
+    VideoData {
+        data: Vec<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
@@ -120,13 +137,78 @@ impl ImageFrame {
     }
 }
 
+/// Video source metadata (useful for hashing & tracing).
+#[cfg(feature = "video")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VideoSource {
+    Url { url: String },
+    DataUrl,
+    InlineBytes,
+    File { path: PathBuf },
+}
+
+/// Concrete video payload captured by the media connector.
+#[cfg(feature = "video")]
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    /// Decoded frames as DynamicImages, ready for vision processor consumption.
+    pub frames: Vec<DynamicImage>,
+    /// Blake3 hex-digest of the original container bytes.
+    pub container_hash: String,
+    /// Per-frame blake3 hashes (hash of each frame's RGB pixel data).
+    pub frame_hashes: Vec<String>,
+    /// Video metadata from the container.
+    pub metadata: VideoMetadata,
+    /// Source provenance.
+    pub source: VideoSource,
+}
+
+#[cfg(feature = "video")]
+impl VideoFrame {
+    pub fn new(
+        frames: Vec<DynamicImage>,
+        container_hash: String,
+        frame_hashes: Vec<String>,
+        metadata: VideoMetadata,
+        source: VideoSource,
+    ) -> Self {
+        Self {
+            frames,
+            container_hash,
+            frame_hashes,
+            metadata,
+            source,
+        }
+    }
+
+    pub fn frames(&self) -> &[DynamicImage] {
+        &self.frames
+    }
+
+    pub fn num_frames(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn source(&self) -> &VideoSource {
+        &self.source
+    }
+
+    pub fn size(&self) -> Option<ImageSize> {
+        self.frames.first().map(|f| ImageSize::new(f.width(), f.height()))
+    }
+}
+
 /// Container for all supported multimodal media objects.
 #[derive(Debug, Clone)]
 pub enum TrackedMedia {
     Image(Arc<ImageFrame>),
     /// Placeholder variants for future modalities.
     Audio,
+    #[cfg(not(feature = "video"))]
     Video,
+    #[cfg(feature = "video")]
+    Video(Arc<VideoFrame>),
     Embeddings,
 }
 

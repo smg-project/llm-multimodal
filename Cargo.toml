@@ -15,6 +15,11 @@ categories = ["multimedia::images", "science"]
 [lib]
 name = "llm_multimodal"
 
+[features]
+default = ["image"]
+image = []
+video = ["dep:opencv", "dep:tempfile"]
+
 [dependencies]
 base64 = "0.22"
 bytes = { version = "1.8.0", features = ["serde"] }
@@ -30,6 +35,8 @@ tokio = { version = "1.42.0", features = ["sync", "fs", "rt-multi-thread"] }
 url = "2.5.4"
 
 blake3 = "1.5"
+opencv = { version = "0.98", optional = true }
+tempfile = { version = "3.8", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

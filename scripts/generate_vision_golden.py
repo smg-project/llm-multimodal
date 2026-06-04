@@ -636,8 +636,7 @@ def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
     # auto_map; instantiate it directly to avoid the tokenizer dependency of the
     # full AutoProcessor. Set MINIMAX_M3_MODEL_PATH to load from a local snapshot
     # (e.g. for offline generation).
-    model_ref = os.environ.get("MINIMAX_M3_MODEL_PATH", "MiniMaxAI/Minimax-M3-preview")
-    img_processor = AutoImageProcessor.from_pretrained(model_ref, trust_remote_code=True)
+    img_processor = AutoImageProcessor.from_pretrained("MiniMaxAI/Minimax-M3-preview", trust_remote_code=True)
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 

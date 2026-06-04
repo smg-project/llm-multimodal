@@ -476,11 +476,11 @@ impl ImageProcessorRegistry {
 
         // Register MiniMax-M3 VL
         registry.register(
-            "minimax-m3",
+            "minimax-m3-vl",
             Box::new(super::processors::MiniMaxM3Processor::new()),
         );
         registry.register(
-            "minimax_m3",
+            "minimax_m3_vl",
             Box::new(super::processors::MiniMaxM3Processor::new()),
         );
 

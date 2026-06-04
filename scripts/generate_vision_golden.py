@@ -72,6 +72,11 @@ MODELS = {
         "processor_class": "PixtralImageProcessor",
         "description": "Dynamic resolution with CLIP normalization and bicubic resize",
     },
+    "minimax_m3": {
+        "model_id": "MiniMaxAI/Minimax-M3-preview",
+        "processor_class": "MiniMaxM3VLImageProcessor",
+        "description": "Qwen2-VL patchify with vLLM-style resize (max_size bound), CLIP normalization",
+    },
 }
 
 # Default test images
@@ -607,6 +612,79 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
     return result
 
 
+def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for MiniMax-M3 VL.
+
+    MiniMax-M3 is "Qwen2VLImageProcessorFast with resize changed to vLLM style":
+    the patchify pipeline is identical to Qwen2-VL, but instead of smart-resize
+    (a min/max pixel budget) it uses ``get_hw_multiple_of``:
+    1. Round each dimension up to a multiple of (patch_size * merge_size)
+    2. If a dimension exceeds max_size (width, height), scale down preserving
+       aspect ratio, then re-align (round up) to the factor
+    3. Normalize with CLIP mean/std
+    4. Returns image_grid_thw for position encoding
+
+    Default parameters:
+    - patch_size: 14
+    - merge_size: 2
+    - temporal_patch_size: 2
+    - max_size: (672, 672)  (inferred from size = {height: 672, width: 672})
+    """
+    from transformers import AutoImageProcessor
+
+    # The image processor is registered under AutoImageProcessor in the model's
+    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
+    # full AutoProcessor. Set MINIMAX_M3_MODEL_PATH to load from a local snapshot
+    # (e.g. for offline generation).
+    model_ref = os.environ.get("MINIMAX_M3_MODEL_PATH", "MiniMaxAI/Minimax-M3-preview")
+    img_processor = AutoImageProcessor.from_pretrained(model_ref, trust_remote_code=True)
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Process image
+    outputs = img_processor(images=image, return_tensors="pt")
+
+    # Convert to numpy for saving
+    pixel_values = outputs["pixel_values"].numpy()
+    image_grid_thw = outputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = image_grid_thw.numpy()
+
+    # Get config values
+    patch_size = getattr(img_processor, "patch_size", 14)
+    merge_size = getattr(img_processor, "merge_size", 2)
+    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
+
+    # Calculate number of tokens: (T * H * W) / merge_size²
+    if image_grid_thw is not None:
+        grid_thw = image_grid_thw[0]
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
+    else:
+        num_tokens = None
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": img_processor.to_dict(),
+    }
+
+    if image_grid_thw is not None:
+        result["image_grid_thw"] = image_grid_thw
+
+    if num_tokens is not None:
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+        "temporal_patch_size": temporal_patch_size,
+        "max_size": getattr(img_processor, "max_size", None),
+    }
+
+    return result
+
+
 def generate_for_model(model_key: str, image_paths: list, output_dir: str):
     """Generate golden outputs for a specific model."""
     print(f"\nGenerating golden outputs for {model_key}...")
@@ -621,6 +699,7 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
         "phi4_vision": generate_golden_phi4_vision,
         "llama4_vision": generate_golden_llama4_vision,
         "pixtral": generate_golden_pixtral,
+        "minimax_m3": generate_golden_minimax_m3,
     }.get(model_key)
 
     if generator_fn is None:

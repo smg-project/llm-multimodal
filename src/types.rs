@@ -197,9 +197,9 @@ impl VideoFrame {
 #[derive(Debug, Clone)]
 pub enum TrackedMedia {
     Image(Arc<ImageFrame>),
+    Video(Arc<VideoFrame>),
     /// Placeholder variants for future modalities.
     Audio,
-    Video(Arc<VideoFrame>),
     Embeddings,
 }
 

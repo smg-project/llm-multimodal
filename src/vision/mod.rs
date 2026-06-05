@@ -33,6 +33,7 @@ pub mod image_processor;
 pub mod preprocessor_config;
 pub mod processors;
 pub mod transforms;
+pub mod video_processor;
 
 // Re-export commonly used types
 pub use image_processor::{
@@ -44,3 +45,4 @@ pub use processors::{
     Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
 };
 pub use transforms::TransformError;
+pub use video_processor::{PreprocessedVideos, VideoPreProcessor, VideoProcessorRegistry};

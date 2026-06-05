@@ -28,6 +28,7 @@ use crate::vision::{
     image_processor::{ImagePreProcessor, ModelSpecificValue, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
     transforms::{pil_to_filter, resize, to_tensor, to_tensor_and_normalize, TransformError},
+    video_processor::PreprocessedVideos,
 };
 
 /// Python-compatible rounding (banker's rounding / round half to even).
@@ -302,6 +303,251 @@ impl QwenVLProcessorBase {
         }
 
         Ok(())
+    }
+
+    /// Patchify a sequence of video frames and append the patches to `output`.
+    ///
+    /// Unlike [`patchify_into`](Self::patchify_into), which duplicates a single
+    /// frame across the temporal dimension, this groups consecutive frames into
+    /// temporal patches: temporal slot `tp` of grid step `gt` reads from
+    /// `frames[gt * temporal_patch_size + tp]`.
+    ///
+    /// `frames` must each be a `[C, H, W]` tensor of identical shape, and
+    /// `frames.len()` must equal `grid_t * temporal_patch_size`.
+    ///
+    /// Output layout per video matches the image path:
+    ///   `[grid_t, patch_rows, patch_cols, merge_h, merge_w, C, temporal, patch_h, patch_w]`
+    pub fn patchify_video_into(
+        &self,
+        frames: &[Array3<f32>],
+        grid_t: usize,
+        grid_h: usize,
+        grid_w: usize,
+        output: &mut Vec<f32>,
+    ) -> Result<(), TransformError> {
+        let patch_size = self.config.patch_size;
+        let merge_size = self.config.merge_size;
+        let temporal_patch_size = self.config.temporal_patch_size;
+
+        if frames.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
+        let channel = frames[0].shape()[0];
+        let height = frames[0].shape()[1];
+        let width = frames[0].shape()[2];
+
+        debug_assert_eq!(
+            frames.len(),
+            grid_t * temporal_patch_size,
+            "frame count must equal grid_t * temporal_patch_size"
+        );
+        debug_assert_eq!(
+            height,
+            grid_h * patch_size,
+            "Height must match grid_h * patch_size"
+        );
+        debug_assert_eq!(
+            width,
+            grid_w * patch_size,
+            "Width must match grid_w * patch_size"
+        );
+
+        let num_patches = grid_t * grid_h * grid_w;
+        let patch_features = channel * temporal_patch_size * patch_size * patch_size;
+        let base_idx = output.len();
+        output.resize(base_idx + num_patches * patch_features, 0.0);
+
+        // Materialize a contiguous, standard-layout view of every frame so we
+        // can index plane data by flat offset.
+        let std_frames: Vec<_> = frames.iter().map(|f| f.as_standard_layout()).collect();
+        let flats: Vec<&[f32]> = std_frames
+            .iter()
+            .map(|f| {
+                f.as_slice().ok_or_else(|| {
+                    TransformError::ShapeError(
+                        "frame tensor not contiguous after as_standard_layout".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
+
+        let merged_patch = merge_size * patch_size;
+        let mut out_idx = base_idx;
+
+        for gt in 0..grid_t {
+            for pr in 0..grid_h / merge_size {
+                for pc in 0..grid_w / merge_size {
+                    let y0 = pr * merged_patch;
+                    let x0 = pc * merged_patch;
+
+                    for mh in 0..merge_size {
+                        for mw in 0..merge_size {
+                            for c in 0..channel {
+                                for tp in 0..temporal_patch_size {
+                                    let plane = &flats[gt * temporal_patch_size + tp]
+                                        [c * height * width..(c + 1) * height * width];
+                                    for py in 0..patch_size {
+                                        let row = (y0 + mh * patch_size + py) * width
+                                            + x0
+                                            + mw * patch_size;
+                                        output[out_idx..out_idx + patch_size]
+                                            .copy_from_slice(&plane[row..row + patch_size]);
+                                        out_idx += patch_size;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Preprocess a batch of videos.
+    ///
+    /// Each video is an ordered slice of frames. All frames of a video are
+    /// resized to a common target size (derived from the first frame via
+    /// [`smart_resize`](Self::smart_resize)), normalized, and grouped into
+    /// temporal patches of `temporal_patch_size`. If the frame count is not a
+    /// multiple of `temporal_patch_size`, the last frame is repeated to pad —
+    /// matching the HuggingFace `Qwen2VLImageProcessor` video path.
+    ///
+    /// Returns patchified `pixel_values` `[total_patches, patch_features]` plus
+    /// `video_grid_thw` and `patches_per_video` in `model_specific`.
+    pub fn preprocess_video(
+        &self,
+        videos: &[Vec<DynamicImage>],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedVideos, TransformError> {
+        if videos.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
+
+        let mean = config.get_image_mean();
+        let std = config.get_image_std();
+        let filter = pil_to_filter(config.resampling);
+
+        let patch_size = self.config.patch_size;
+        let temporal_patch_size = self.config.temporal_patch_size;
+        let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
+
+        let mut all_patches: Vec<f32> = Vec::new();
+        let mut patches_per_video: Vec<i64> = Vec::with_capacity(videos.len());
+        let mut grid_thw_data: Vec<i64> = Vec::with_capacity(videos.len() * 3);
+        let mut num_video_tokens: Vec<usize> = Vec::with_capacity(videos.len());
+        let mut video_sizes: Vec<(u32, u32, u32)> = Vec::with_capacity(videos.len());
+
+        for frames in videos {
+            if frames.is_empty() {
+                return Err(TransformError::EmptyBatch);
+            }
+
+            // Original size: first-frame dimensions plus the sampled frame count.
+            let (w0, h0) = frames[0].dimensions();
+            video_sizes.push((w0, h0, frames.len() as u32));
+
+            // Common target size for every frame in this video.
+            let (target_h, target_w) = self.smart_resize(h0 as usize, w0 as usize)?;
+            let (tw32, th32) = (target_w as u32, target_h as u32);
+
+            // Resize + normalize each frame to [C, H, W].
+            let mut frame_tensors: Vec<Array3<f32>> = Vec::with_capacity(frames.len());
+            for frame in frames {
+                let (w, h) = frame.dimensions();
+                let needs_resize = config.do_resize.unwrap_or(true) && (w != tw32 || h != th32);
+                let resized;
+                let img_ref = if needs_resize {
+                    resized = resize(frame, tw32, th32, filter);
+                    &resized
+                } else {
+                    frame
+                };
+
+                let tensor = if config.do_normalize.unwrap_or(true) {
+                    to_tensor_and_normalize(img_ref, &mean, &std)
+                } else {
+                    to_tensor(img_ref)
+                };
+                frame_tensors.push(tensor);
+            }
+
+            // Pad the temporal dimension by repeating the last frame until the
+            // frame count is a multiple of temporal_patch_size.
+            let remainder = frame_tensors.len() % temporal_patch_size;
+            if remainder != 0 {
+                let pad = temporal_patch_size - remainder;
+                let last = frame_tensors
+                    .last()
+                    .expect("frame_tensors is non-empty")
+                    .clone();
+                for _ in 0..pad {
+                    frame_tensors.push(last.clone());
+                }
+            }
+
+            let num_frames = frame_tensors.len();
+            let (grid_t, grid_h, grid_w) = self.calculate_grid_thw(target_h, target_w, num_frames);
+            grid_thw_data.push(grid_t as i64);
+            grid_thw_data.push(grid_h as i64);
+            grid_thw_data.push(grid_w as i64);
+
+            let num_patches = grid_t * grid_h * grid_w;
+            let tokens = self.calculate_tokens_from_grid(grid_t, grid_h, grid_w);
+            num_video_tokens.push(tokens);
+
+            self.patchify_video_into(&frame_tensors, grid_t, grid_h, grid_w, &mut all_patches)?;
+            patches_per_video.push(num_patches as i64);
+        }
+
+        let total_patches: usize = patches_per_video.iter().map(|&n| n as usize).sum();
+        let pixel_values = Array2::from_shape_vec((total_patches, patch_features), all_patches)
+            .map_err(|e| {
+                TransformError::ShapeError(format!(
+                    "Failed to create patchified pixel_values [{total_patches}, {patch_features}]: {e}"
+                ))
+            })?;
+
+        let result = PreprocessedVideos::new(pixel_values, num_video_tokens, video_sizes)
+            .with_extra(
+                "video_grid_thw",
+                ModelSpecificValue::int_2d(grid_thw_data, videos.len(), 3),
+            )
+            .with_extra(
+                "patches_per_video",
+                ModelSpecificValue::int_1d(patches_per_video),
+            );
+
+        Ok(result)
+    }
+
+    /// Calculate the number of video tokens for a frame size and frame count.
+    ///
+    /// Mirrors the temporal padding of [`preprocess_video`](Self::preprocess_video):
+    /// the frame count is rounded up to a multiple of `temporal_patch_size`
+    /// before computing `grid_t`.
+    pub fn calculate_num_video_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        num_frames: u32,
+    ) -> usize {
+        let (new_height, new_width) = match self.smart_resize(height as usize, width as usize) {
+            Ok((h, w)) => (h, w),
+            Err(_) => {
+                let factor = self.get_factor();
+                (factor, factor)
+            }
+        };
+
+        // Round frame count up to a temporal_patch_size multiple (min one patch).
+        let tps = self.config.temporal_patch_size;
+        let padded_frames = (num_frames as usize).max(1).div_ceil(tps) * tps;
+
+        let (grid_t, grid_h, grid_w) =
+            self.calculate_grid_thw(new_height, new_width, padded_frames);
+        self.calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
 }
 

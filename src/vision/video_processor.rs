@@ -1,134 +1,41 @@
 //! Video processor trait and output types.
 //!
-//! This module defines the interface for model-specific image processors
-//! and the common output format for preprocessed images.
+//! This module defines the interface for model-specific video preprocessors
+//! and the common output format for preprocessed videos.
+//!
+//! A "video" is represented as an ordered slice of decoded frames
+//! (`&[DynamicImage]`), and a batch of videos as `&[Vec<DynamicImage>]`.
+//! Preprocessors group frames along the temporal axis (see
+//! [`VideoPreProcessor::preprocess`]) and produce a patchified tensor plus the
+//! per-video grid dimensions needed for position encoding.
 
 use std::{borrow::Cow, collections::HashMap};
 
-use ndarray::{Array4, ArrayD};
+use image::DynamicImage;
+use ndarray::{Array2, ArrayD};
 
-use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
+use super::{
+    image_processor::ModelSpecificValue, preprocessor_config::PreProcessorConfig,
+    transforms::TransformError,
+};
 use crate::types::FieldLayout;
 
-/// Helper to extract a dimension from pixel_values given an ndim-dependent axis index.
-/// Returns `Err` if the ndim is not 4 or 5.
-fn dim_for_ndim(
-    ndim: usize,
-    axis_4d: usize,
-    axis_5d: usize,
-    shape: &[usize],
-) -> Result<usize, TransformError> {
-    match ndim {
-        4 => Ok(shape[axis_4d]),
-        5 => Ok(shape[axis_5d]),
-        _ => Err(TransformError::InvalidShape {
-            expected: format!("4D or 5D pixel_values tensor, got {ndim}D"),
-            actual: shape.to_vec(),
-        }),
-    }
-}
-
-/// Model-specific output values that vary by architecture.
-///
-/// Different vision models require different auxiliary outputs beyond pixel_values.
-/// This enum captures the common types of such outputs.
-#[derive(Debug, Clone)]
-pub enum ModelSpecificValue {
-    /// A tensor with shape information (data as flat vec, shape as dims)
-    Tensor { data: Vec<f32>, shape: Vec<usize> },
-
-    /// A tensor of integers (e.g., aspect_ratio_ids)
-    IntTensor { data: Vec<i64>, shape: Vec<usize> },
-
-    /// A tensor of unsigned integers (e.g., image_grid_thw)
-    UintTensor { data: Vec<u32>, shape: Vec<usize> },
-
-    /// Simple integer value
-    Int(i64),
-
-    /// Simple float value
-    Float(f64),
-
-    /// List of integers
-    IntVec(Vec<i64>),
-
-    /// List of unsigned integers
-    UintVec(Vec<u32>),
-
-    /// List of floats
-    FloatVec(Vec<f32>),
-
-    /// List of tuples (e.g., image sizes)
-    TupleVec(Vec<(u32, u32)>),
-
-    /// Boolean flag
-    Bool(bool),
-}
-
-impl ModelSpecificValue {
-    /// Create a 1D uint tensor from a vector.
-    pub fn uint_1d(data: Vec<u32>) -> Self {
-        let len = data.len();
-        Self::UintTensor {
-            data,
-            shape: vec![len],
-        }
-    }
-
-    /// Create a 2D uint tensor.
-    pub fn uint_2d(data: Vec<u32>, rows: usize, cols: usize) -> Self {
-        Self::UintTensor {
-            data,
-            shape: vec![rows, cols],
-        }
-    }
-
-    /// Create a 1D int tensor from a vector.
-    pub fn int_1d(data: Vec<i64>) -> Self {
-        let len = data.len();
-        Self::IntTensor {
-            data,
-            shape: vec![len],
-        }
-    }
-
-    /// Create a 2D int tensor.
-    pub fn int_2d(data: Vec<i64>, rows: usize, cols: usize) -> Self {
-        Self::IntTensor {
-            data,
-            shape: vec![rows, cols],
-        }
-    }
-
-    /// Get the first dimension of a tensor variant, if applicable.
-    pub fn first_dim(&self) -> Option<usize> {
-        match self {
-            Self::Tensor { shape, .. }
-            | Self::IntTensor { shape, .. }
-            | Self::UintTensor { shape, .. } => shape.first().copied(),
-            _ => None,
-        }
-    }
-}
-
-/// Preprocessed images ready for model consumption.
+/// Preprocessed videos ready for model consumption.
 ///
 /// This struct contains all the outputs needed by the SGLang scheduler
 /// to construct `MultimodalInputs` for the model.
 #[derive(Debug, Clone)]
-pub struct PreprocessedImages {
+pub struct PreprocessedVideos {
     /// Pixel values as a dynamic-dimensional float32 tensor.
     ///
-    /// This is the primary input to the vision encoder.
-    /// Shape varies by model:
-    /// - Standard: [B, C, H, W] (4D)
-    /// - Phi3-Vision: [B, num_crops+1, C, H, W] (5D)
+    /// This is the primary input to the vision encoder. For Qwen-VL family
+    /// models it is patchified to 2D `[total_patches, patch_features]`, where
+    /// patches from every video in the batch are concatenated along axis 0.
     pub pixel_values: ArrayD<f32>,
 
     /// Number of video tokens per video in the batch.
     ///
     /// Used to expand placeholder tokens in the text input.
-    /// For example, LLaVA with 336x336 and patch_size=14 produces 576 tokens.
     pub num_video_tokens: Vec<usize>,
 
     /// Original video sizes as (width, height, frames) before preprocessing.
@@ -144,9 +51,9 @@ pub struct PreprocessedImages {
 }
 
 impl PreprocessedVideos {
-    /// Create a new PreprocessedVideos with required fields (4D pixel values).
+    /// Create a new PreprocessedVideos from a patchified 2D pixel-values tensor.
     pub fn new(
-        pixel_values: Array4<f32>,
+        pixel_values: Array2<f32>,
         num_video_tokens: Vec<usize>,
         video_sizes: Vec<(u32, u32, u32)>,
     ) -> Self {
@@ -159,8 +66,6 @@ impl PreprocessedVideos {
     }
 
     /// Create a new PreprocessedVideos with dynamic-dimensional pixel values.
-    ///
-    /// Use this for models like Phi3-Vision that have 5D tensors.
     pub fn new_dynamic(
         pixel_values: ArrayD<f32>,
         num_video_tokens: Vec<usize>,
@@ -178,11 +83,6 @@ impl PreprocessedVideos {
     pub fn with_extra(mut self, key: impl Into<String>, value: ModelSpecificValue) -> Self {
         self.model_specific.insert(key.into(), value);
         self
-    }
-
-    /// Get the batch size.
-    pub fn batch_size(&self) -> usize {
-        self.pixel_values.shape()[0]
     }
 
     /// Get the number of dimensions of pixel_values.
@@ -238,8 +138,8 @@ impl PreprocessedVideos {
 
 /// Trait for model-specific video preprocessors.
 ///
-/// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
-/// to provide the correct preprocessing pipeline.
+/// Each vision model that supports video input (Qwen2-VL, Qwen2.5-VL, etc.)
+/// implements this trait to provide the correct preprocessing pipeline.
 pub trait VideoPreProcessor: Send + Sync {
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
@@ -250,14 +150,14 @@ pub trait VideoPreProcessor: Send + Sync {
     /// Preprocess a batch of videos.
     ///
     /// # Arguments
-    /// * `videos` - Input videos to preprocess
+    /// * `videos` - Batch of videos; each video is an ordered slice of frames.
     /// * `config` - Preprocessor configuration from HuggingFace
     ///
     /// # Returns
     /// Preprocessed videos ready for the model, or an error.
     fn preprocess(
         &self,
-        videos: &[DynamicImage],
+        videos: &[Vec<DynamicImage>],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedVideos, TransformError>;
 
@@ -267,11 +167,17 @@ pub trait VideoPreProcessor: Send + Sync {
     /// in the text input before the video has been fully processed.
     ///
     /// # Arguments
-    /// * `width` - Video width after preprocessing
-    /// * `height` - Video height after preprocessing
-    /// * `num_frames` - Number of frames in the video after preprocessing
+    /// * `width` - Frame width before preprocessing
+    /// * `height` - Frame height before preprocessing
+    /// * `num_frames` - Number of sampled frames in the video
     /// * `config` - Preprocessor configuration
-    fn calculate_num_tokens(&self, width: u32, height: u32, num_frames: u32, config: &PreProcessorConfig) -> usize;
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        num_frames: u32,
+        config: &PreProcessorConfig,
+    ) -> usize;
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;
@@ -326,53 +232,16 @@ impl Default for VideoProcessorRegistry {
 }
 
 impl VideoProcessorRegistry {
-    /// Create a registry with all built-in processors registered.
+    /// Create a registry with all built-in video processors registered.
     ///
     /// Currently registers:
-    /// - `llava-next` -> LlavaNextProcessor
-    /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
-    /// - `qwen2-vl` -> Qwen2VLProcessor
-    /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
+    /// - `qwen2-vl` / `qwen2_vl` -> Qwen2VLProcessor
+    /// - `qwen2.5-vl` / `qwen2_5-vl` / `qwen2_5_vl` -> Qwen2VLProcessor
+    ///   (Qwen2.5-VL uses identical video preprocessing to Qwen2-VL)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
-        // LLaVA-NeXT (v1.6+, anyres multi-crop)
-        registry.register(
-            "llava-next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava_next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.6",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-
-        // Standard LLaVA (v1.5, single-patch).
-        // Use specific patterns so they don't accidentally match LLaVA-NeXT
-        // model IDs like "llava-v1.6-*".
-        registry.register(
-            "llava-1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-
-        // Register Qwen3-VL first (more specific pattern - must match before qwen2)
-        registry.register(
-            "qwen3-vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
+        // Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
         registry.register(
             "qwen2-vl",
             Box::new(super::processors::Qwen2VLProcessor::new()),
@@ -382,7 +251,7 @@ impl VideoProcessorRegistry {
             Box::new(super::processors::Qwen2VLProcessor::new()),
         );
 
-        // Register Qwen2.5-VL (uses identical preprocessing to Qwen2-VL)
+        // Qwen2.5-VL (identical preprocessing to Qwen2-VL)
         registry.register(
             "qwen2.5-vl",
             Box::new(super::processors::Qwen2VLProcessor::new()),
@@ -394,40 +263,6 @@ impl VideoProcessorRegistry {
         registry.register(
             "qwen2_5_vl",
             Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-
-        // Register Phi3-Vision
-        registry.register(
-            "phi-3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3_v",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-
-        // Register LLaMA 4 Vision
-        registry.register(
-            "llama-4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-        registry.register(
-            "llama4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-
-        // Register Kimi-K2.5 Vision
-        registry.register(
-            "kimi-k2",
-            Box::new(super::processors::KimiK25Processor::new()),
-        );
-        registry.register(
-            "kimi_k2",
-            Box::new(super::processors::KimiK25Processor::new()),
         );
 
         registry

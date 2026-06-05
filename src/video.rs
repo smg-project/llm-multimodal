@@ -9,7 +9,7 @@ use std::path::Path;
 use image::{DynamicImage, RgbImage};
 use opencv::core::Mat;
 use opencv::imgproc;
-use opencv::prelude::VideoCaptureTrait;
+use opencv::prelude::*;
 use opencv::videoio::{self, VideoCapture};
 use tempfile::NamedTempFile;
 

@@ -26,6 +26,7 @@ use crate::vision::{
     image_processor::{ImagePreProcessor, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
     transforms::TransformError,
+    video_processor::{PreprocessedVideos, VideoPreProcessor},
 };
 
 /// CLIP normalization mean values used by Qwen2-VL models.
@@ -227,6 +228,39 @@ impl ImagePreProcessor for Qwen2VLProcessor {
     }
 }
 
+impl VideoPreProcessor for Qwen2VLProcessor {
+    fn default_mean(&self) -> [f64; 3] {
+        self.inner.default_mean()
+    }
+
+    fn default_std(&self) -> [f64; 3] {
+        self.inner.default_std()
+    }
+
+    fn preprocess(
+        &self,
+        videos: &[Vec<DynamicImage>],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedVideos, TransformError> {
+        self.inner.preprocess_video(videos, config)
+    }
+
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        num_frames: u32,
+        _config: &PreProcessorConfig,
+    ) -> usize {
+        self.inner
+            .calculate_num_video_tokens(width, height, num_frames)
+    }
+
+    fn model_name(&self) -> &'static str {
+        self.inner.model_name()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use image::{Rgb, RgbImage};
@@ -364,7 +398,8 @@ mod tests {
         };
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        // Disambiguate: Qwen2VLProcessor implements both Image- and VideoPreProcessor.
+        let result = ImagePreProcessor::preprocess(&processor, &[image], &config).unwrap();
 
         // pixel_values is patchified: [total_patches, patch_features]
         assert_eq!(result.pixel_values.ndim(), 2);
@@ -394,7 +429,7 @@ mod tests {
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = ImagePreProcessor::preprocess(&processor, &images, &config).unwrap();
 
         // Both images processed
         assert_eq!(result.image_sizes.len(), 2);
@@ -460,5 +495,138 @@ mod tests {
         let processor = Qwen2VLProcessor::new();
         assert_eq!(processor.default_mean(), CLIP_MEAN);
         assert_eq!(processor.default_std(), CLIP_STD);
+    }
+
+    fn video_config() -> PreProcessorConfig {
+        PreProcessorConfig {
+            do_resize: Some(true),
+            do_normalize: Some(true),
+            image_mean: Some(CLIP_MEAN.to_vec()),
+            image_std: Some(CLIP_STD.to_vec()),
+            patch_size: Some(PatchSize {
+                height: Some(14),
+                width: Some(14),
+            }),
+            merge_size: Some(2),
+            min_pixels: Some(DEFAULT_MIN_PIXELS),
+            max_pixels: Some(DEFAULT_MAX_PIXELS),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_qwen2_vl_preprocess_video_even_frames() {
+        let processor = Qwen2VLProcessor::new();
+        let config = video_config();
+
+        // 4 frames -> grid_t = 4 / temporal_patch_size(2) = 2
+        let frames: Vec<DynamicImage> = (0..4)
+            .map(|i| create_test_image(448, 448, Rgb([10 * i as u8, 20, 30])))
+            .collect();
+        let result = VideoPreProcessor::preprocess(&processor, &[frames], &config).unwrap();
+
+        // pixel_values is patchified 2D [total_patches, patch_features]
+        assert_eq!(result.pixel_values.ndim(), 2);
+
+        let (gt, gh, gw) = processor.calculate_grid_thw(448, 448, 4);
+        assert_eq!(gt, 2);
+        assert_eq!(result.pixel_values.shape()[0], gt * gh * gw);
+
+        // patch_features = C(3) * temporal(2) * patch(14) * patch(14)
+        assert_eq!(result.pixel_values.shape()[1], 3 * 2 * 14 * 14);
+
+        // video_grid_thw present with shape [num_videos, 3]
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("video_grid_thw")
+        {
+            assert_eq!(shape, &[1, 3]);
+            assert_eq!(data, &[gt as i64, gh as i64, gw as i64]);
+        } else {
+            panic!("Expected video_grid_thw to be IntTensor");
+        }
+
+        // video_sizes records (width, height, frames)
+        assert_eq!(result.video_sizes, vec![(448, 448, 4)]);
+        assert_eq!(result.num_video_tokens.len(), 1);
+        assert_eq!(
+            result.num_video_tokens[0],
+            processor.calculate_tokens_from_grid(gt, gh, gw)
+        );
+    }
+
+    #[test]
+    fn test_qwen2_vl_preprocess_video_odd_frames_padded() {
+        let processor = Qwen2VLProcessor::new();
+        let config = video_config();
+
+        // 3 frames -> padded to 4 -> grid_t = 2
+        let frames: Vec<DynamicImage> = (0..3)
+            .map(|_| create_test_image(448, 448, Rgb([128, 128, 128])))
+            .collect();
+        let result = VideoPreProcessor::preprocess(&processor, &[frames], &config).unwrap();
+
+        if let Some(ModelSpecificValue::IntTensor { data, .. }) =
+            result.model_specific.get("video_grid_thw")
+        {
+            assert_eq!(data[0], 2); // grid_t after padding 3 -> 4
+        } else {
+            panic!("Expected video_grid_thw");
+        }
+
+        // Original frame count is preserved in video_sizes (not the padded count).
+        assert_eq!(result.video_sizes[0].2, 3);
+    }
+
+    #[test]
+    fn test_qwen2_vl_preprocess_video_batch() {
+        let processor = Qwen2VLProcessor::new();
+        let config = video_config();
+
+        let video_a: Vec<DynamicImage> = (0..2)
+            .map(|_| create_test_image(448, 448, Rgb([100, 100, 100])))
+            .collect();
+        let video_b: Vec<DynamicImage> = (0..4)
+            .map(|_| create_test_image(224, 336, Rgb([50, 60, 70])))
+            .collect();
+        let result =
+            VideoPreProcessor::preprocess(&processor, &[video_a, video_b], &config).unwrap();
+
+        assert_eq!(result.num_videos(), 2);
+        assert_eq!(result.num_video_tokens.len(), 2);
+
+        // patches_per_video sums to the total patch rows.
+        if let Some(ModelSpecificValue::IntTensor { data, shape }) =
+            result.model_specific.get("patches_per_video")
+        {
+            assert_eq!(shape, &[2]);
+            let total: i64 = data.iter().sum();
+            assert_eq!(total as usize, result.pixel_values.shape()[0]);
+        } else {
+            panic!("Expected patches_per_video to be IntTensor");
+        }
+    }
+
+    #[test]
+    fn test_qwen2_vl_calculate_num_video_tokens_matches_preprocess() {
+        let processor = Qwen2VLProcessor::new();
+        let config = video_config();
+
+        let frames: Vec<DynamicImage> = (0..5)
+            .map(|_| create_test_image(640, 480, Rgb([128, 128, 128])))
+            .collect();
+        let n_frames = frames.len() as u32;
+        let result = VideoPreProcessor::preprocess(&processor, &[frames], &config).unwrap();
+
+        let predicted =
+            VideoPreProcessor::calculate_num_tokens(&processor, 640, 480, n_frames, &config);
+        assert_eq!(predicted, result.num_video_tokens[0]);
+    }
+
+    #[test]
+    fn test_qwen2_vl_preprocess_video_empty_batch_errors() {
+        let processor = Qwen2VLProcessor::new();
+        let config = video_config();
+        let videos: Vec<Vec<DynamicImage>> = Vec::new();
+        assert!(VideoPreProcessor::preprocess(&processor, &videos, &config).is_err());
     }
 }

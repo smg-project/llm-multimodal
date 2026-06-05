@@ -4,15 +4,10 @@ use tokio::task::JoinHandle;
 
 use super::{
     error::{MultiModalError, MultiModalResult},
-    media::{ImageFetchConfig, MediaConnector, MediaSource},
+    media::{ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
-};
-
-#[cfg(feature = "video")]
-use super::{
-    media::VideoFetchConfig,
     video::UniformSampler,
 };
 
@@ -64,7 +59,6 @@ impl AsyncMultiModalTracker {
             MediaContentPart::ImageEmbeds { .. } => {
                 return Err(MultiModalError::UnsupportedContent("image_embeds"));
             }
-            #[cfg(feature = "video")]
             MediaContentPart::VideoUrl { url, uuid } => {
                 let source = match url::Url::parse(&url) {
                     Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
@@ -73,7 +67,6 @@ impl AsyncMultiModalTracker {
                 let fetch_cfg = VideoFetchConfig::new(UniformSampler { num_frames: 8 });
                 self.enqueue_video(source, fetch_cfg, uuid);
             }
-            #[cfg(feature = "video")]
             MediaContentPart::VideoData {
                 data,
                 mime_type: _,
@@ -122,7 +115,6 @@ impl AsyncMultiModalTracker {
         self.pending.entry(modality).or_default().push(handle);
     }
 
-    #[cfg(feature = "video")]
     fn enqueue_video(
         &mut self,
         source: MediaSource,

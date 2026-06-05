@@ -1,7 +1,6 @@
 //! Video decoding and frame sampling.
 //!
 //! Provides OpenCV-based video decoding with pluggable frame sampling strategies.
-//! All types and functions are gated behind the `video` feature flag.
 
 use std::collections::HashSet;
 use std::io::Write;

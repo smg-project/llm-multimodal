@@ -28,7 +28,6 @@ pub enum MediaConnectorError {
     Image(#[from] image::ImageError),
     #[error("media fetch timed out after {0:?}")]
     Timeout(Duration),
-    #[cfg(feature = "video")]
     #[error("video decode error: {0}")]
     Video(#[from] crate::video::VideoDecodeError),
 }

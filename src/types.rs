@@ -4,7 +4,6 @@ use image::DynamicImage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[cfg(feature = "video")]
 pub use crate::video::VideoMetadata;
 
 /// Supported multimodal modalities.
@@ -66,13 +65,11 @@ pub enum MediaContentPart {
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
-    #[cfg(feature = "video")]
     VideoUrl {
         url: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         uuid: Option<String>,
     },
-    #[cfg(feature = "video")]
     VideoData {
         data: Vec<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,7 +135,6 @@ impl ImageFrame {
 }
 
 /// Video source metadata (useful for hashing & tracing).
-#[cfg(feature = "video")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VideoSource {
@@ -149,7 +145,6 @@ pub enum VideoSource {
 }
 
 /// Concrete video payload captured by the media connector.
-#[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     /// Decoded frames as DynamicImages, ready for vision processor consumption.
@@ -164,7 +159,6 @@ pub struct VideoFrame {
     pub source: VideoSource,
 }
 
-#[cfg(feature = "video")]
 impl VideoFrame {
     pub fn new(
         frames: Vec<DynamicImage>,
@@ -205,9 +199,6 @@ pub enum TrackedMedia {
     Image(Arc<ImageFrame>),
     /// Placeholder variants for future modalities.
     Audio,
-    #[cfg(not(feature = "video"))]
-    Video,
-    #[cfg(feature = "video")]
     Video(Arc<VideoFrame>),
     Embeddings,
 }

@@ -8,12 +8,7 @@ use url::Url;
 
 use super::{
     error::MediaConnectorError,
-    types::{ImageDetail, ImageFrame, ImageSource},
-};
-
-#[cfg(feature = "video")]
-use super::{
-    types::{VideoFrame, VideoSource},
+    types::{ImageDetail, ImageFrame, ImageSource, VideoFrame, VideoSource},
     video::FrameSampler,
 };
 
@@ -47,13 +42,11 @@ impl Default for ImageFetchConfig {
     }
 }
 
-#[cfg(feature = "video")]
 #[derive(Clone)]
 pub struct VideoFetchConfig {
     pub sampler: Arc<dyn FrameSampler>,
 }
 
-#[cfg(feature = "video")]
 impl VideoFetchConfig {
     pub fn new(sampler: impl FrameSampler + 'static) -> Self {
         Self {
@@ -121,7 +114,6 @@ impl MediaConnector {
     // Video fetching
     // -----------------------------------------------------------------------
 
-    #[cfg(feature = "video")]
     pub async fn fetch_video(
         &self,
         source: MediaSource,
@@ -137,7 +129,6 @@ impl MediaConnector {
         }
     }
 
-    #[cfg(feature = "video")]
     async fn resolve_bytes(
         &self,
         source: MediaSource,
@@ -159,7 +150,6 @@ impl MediaConnector {
         }
     }
 
-    #[cfg(feature = "video")]
     async fn fetch_file_video(
         &self,
         path: PathBuf,
@@ -208,7 +198,6 @@ impl MediaConnector {
         )))
     }
 
-    #[cfg(feature = "video")]
     async fn decode_video_bytes(
         &self,
         bytes: Bytes,
@@ -283,7 +272,6 @@ impl MediaConnector {
         Ok(decoded.into())
     }
 
-    #[cfg(feature = "video")]
     async fn fetch_file_bytes(&self, path: &PathBuf) -> Result<Bytes, MediaConnectorError> {
         let allowed_root = self
             .allowed_local_media_path

@@ -5,7 +5,7 @@ use thiserror::Error;
 
 use crate::{
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::image_processor::PreprocessedImages,
+    vision::{image_processor::PreprocessedImages, video_processor::PreprocessedVideos},
 };
 
 #[derive(Debug, Error)]
@@ -107,5 +107,26 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// for the backend to instantiate a Python processor just to query it.
     fn keep_on_cpu_keys(&self) -> Vec<String> {
         vec![]
+    }
+
+    // --- Video support (optional, default = no video) ---
+
+    /// Placeholder token string used for video in the prompt.
+    fn video_placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
+        self.placeholder_token(metadata)
+    }
+
+    /// Token ID of the video placeholder / pad token.
+    fn video_placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+        self.placeholder_token_id(metadata)
+    }
+
+    /// Compute per-video prompt replacement token sequences.
+    fn video_prompt_replacements(
+        &self,
+        _metadata: &ModelMetadata,
+        _preprocessed: &PreprocessedVideos,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        Ok(vec![])
     }
 }

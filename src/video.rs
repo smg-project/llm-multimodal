@@ -192,7 +192,7 @@ fn decode_video_path_inner(
         if !cap.read(&mut mat)? {
             break;
         }
-        if mat.empty()? {
+        if mat.empty() {
             break;
         }
 

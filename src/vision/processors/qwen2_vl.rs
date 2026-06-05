@@ -487,14 +487,16 @@ mod tests {
     #[test]
     fn test_model_name() {
         let processor = Qwen2VLProcessor::new();
-        assert_eq!(processor.model_name(), "qwen2-vl");
+        // Both Image- and VideoPreProcessor define model_name; pick one explicitly.
+        assert_eq!(ImagePreProcessor::model_name(&processor), "qwen2-vl");
+        assert_eq!(VideoPreProcessor::model_name(&processor), "qwen2-vl");
     }
 
     #[test]
     fn test_default_mean_std() {
         let processor = Qwen2VLProcessor::new();
-        assert_eq!(processor.default_mean(), CLIP_MEAN);
-        assert_eq!(processor.default_std(), CLIP_STD);
+        assert_eq!(ImagePreProcessor::default_mean(&processor), CLIP_MEAN);
+        assert_eq!(ImagePreProcessor::default_std(&processor), CLIP_STD);
     }
 
     fn video_config() -> PreProcessorConfig {

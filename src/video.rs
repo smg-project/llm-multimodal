@@ -22,12 +22,6 @@ pub struct VideoMetadata {
     pub total_frames: usize,
     /// Frames per second.
     pub fps: f64,
-    /// Video width in pixels.
-    pub width: u32,
-    /// Video height in pixels.
-    pub height: u32,
-    /// Codec fourcc (e.g., "H264", "XVID").
-    pub codec: String,
 }
 
 /// Errors from video decoding.
@@ -157,28 +151,16 @@ fn decode_video_path_inner(
     // Extract metadata
     let fps = cap.get(videoio::CAP_PROP_FPS)?;
     let total_frames = cap.get(videoio::CAP_PROP_FRAME_COUNT)? as usize;
-    let width = cap.get(videoio::CAP_PROP_FRAME_WIDTH)? as u32;
-    let height = cap.get(videoio::CAP_PROP_FRAME_HEIGHT)? as u32;
     let duration_secs = if fps > 0.0 {
         total_frames as f64 / fps
     } else {
         0.0
     };
-    let fourcc_int = cap.get(videoio::CAP_PROP_FOURCC)? as u32;
-    let codec: String = fourcc_int
-        .to_le_bytes()
-        .iter()
-        .filter(|&&b| b != 0)
-        .map(|&b| b as char)
-        .collect();
 
     let metadata = VideoMetadata {
         duration_secs,
         total_frames: total_frames.max(1),
         fps,
-        width,
-        height,
-        codec,
     };
 
     // Ask sampler which frames to extract
@@ -193,35 +175,17 @@ fn decode_video_path_inner(
     // Read frames sequentially, keep only desired ones
     let mut frames = Vec::with_capacity(desired.len());
     let mut mat = Mat::default();
-    let mut frame_count: usize = 0;
 
-    loop {
-        if !cap.read(&mut mat)? {
-            break;
-        }
-        if mat.empty() {
-            break;
-        }
-
-        if desired.contains(&frame_count) {
-            frames.push((frame_count, mat_to_dynamic_image(&mat)?));
-        }
-
-        frame_count += 1;
-        if frame_count > max_idx || frames.len() == desired.len() {
-            break;
+    // let mut idx: usize = 0;
+    for idx in 0..max_idx + 1 {
+        if let Ok(_) = cap.grab() {
+            if desired.contains(&idx) {
+                cap.retrieve(&mut mat, 0)?;
+                frames.push(mat_to_dynamic_image(&mat)?);
+            }
         }
     }
-
-    // Reorder to match sampler's requested order
-    let mut result = Vec::with_capacity(indices.len());
-    for idx in &indices {
-        if let Some(pos) = frames.iter().position(|(i, _)| i == idx) {
-            result.push(frames[pos].1.clone());
-        }
-    }
-
-    Ok((metadata, result))
+    Ok((metadata, frames))
 }
 
 /// Convert an OpenCV BGR `Mat` to a `DynamicImage` (RGB).

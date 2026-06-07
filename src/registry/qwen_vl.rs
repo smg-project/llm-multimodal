@@ -13,10 +13,10 @@ pub(super) struct QwenVLVisionSpec;
 impl QwenVLVisionSpec {
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
         metadata
-            .config_u32(&["vision_token_id"])
+            .config_u32(&["image_token_id"])
             .map(|v| v as TokenId)
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "vision_token_id".to_string(),
+                field: "image_token_id".to_string(),
             })
     }
 
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn qwen_vision_uses_config_token_ids() {
-        let tokenizer = TestTokenizer::new(&[("<image>", 999)]);
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
         let config = json!({
             "model_type": "qwen2_vl",
             "vision_start_token_id": 151652,
@@ -173,13 +173,13 @@ mod tests {
             .unwrap();
         // Only pad tokens — vision_start/vision_end are already in the chat template
         assert_eq!(replacements[0].tokens.len(), 256);
-        assert_eq!(replacements[0].tokens[0], 151654); // pad (vision_token_id)
-        assert_eq!(*replacements[0].tokens.last().unwrap(), 151654);
+        assert_eq!(replacements[0].tokens[0], 151655); // pad (image_token_id)
+        assert_eq!(*replacements[0].tokens.last().unwrap(), 151655);
     }
 
     #[test]
     fn qwen_vl_matches_alias_via_model_type() {
-        let tokenizer = TestTokenizer::new(&[("<image>", 999)]);
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
         let config = json!({
             "model_type": "qwen2_vl",
             "vision_start_token_id": 151652,

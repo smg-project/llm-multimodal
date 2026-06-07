@@ -180,6 +180,26 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub temporal_patch_size: Option<usize>,
 
+    /// Video processors: whether frame sampling is enabled.
+    #[serde(default)]
+    pub do_sample_frames: Option<bool>,
+
+    /// Video processors: minimum number of sampled frames.
+    #[serde(default)]
+    pub min_frames: Option<usize>,
+
+    /// Video processors: maximum number of sampled frames.
+    #[serde(default)]
+    pub max_frames: Option<usize>,
+
+    /// Video processors: target number of sampled frames.
+    #[serde(default)]
+    pub num_frames: Option<usize>,
+
+    /// Video processors: target sampled frames per second.
+    #[serde(default)]
+    pub fps: Option<f64>,
+
     /// Phi3-Vision: number of image crops
     #[serde(default)]
     pub num_crops: Option<usize>,
@@ -462,6 +482,25 @@ mod tests {
         assert_eq!(config.get_patch_size(0), 14);
         assert_eq!(config.merge_size, Some(2));
         assert!((config.get_rescale_factor() - 1.0 / 255.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_parse_video_sampling_fields() {
+        let json = r#"{
+            "do_sample_frames": true,
+            "min_frames": 4,
+            "max_frames": 768,
+            "num_frames": 8,
+            "fps": 2.0
+        }"#;
+
+        let config = PreProcessorConfig::from_json(json).unwrap();
+
+        assert_eq!(config.do_sample_frames, Some(true));
+        assert_eq!(config.min_frames, Some(4));
+        assert_eq!(config.max_frames, Some(768));
+        assert_eq!(config.num_frames, Some(8));
+        assert_eq!(config.fps, Some(2.0));
     }
 
     #[test]

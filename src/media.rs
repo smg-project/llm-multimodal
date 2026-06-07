@@ -8,8 +8,10 @@ use url::Url;
 
 use super::{
     error::MediaConnectorError,
+    registry::{ModelMetadata, ModelRegistry, RegistryResult},
     types::{ImageDetail, ImageFrame, ImageSource, VideoFrame, VideoSource},
-    video::FrameSampler,
+    video::{FrameSampler, UniformSampler},
+    vision::PreProcessorConfig,
 };
 
 #[derive(Clone)]
@@ -47,11 +49,35 @@ pub struct VideoFetchConfig {
     pub sampler: Arc<dyn FrameSampler>,
 }
 
+impl Default for VideoFetchConfig {
+    fn default() -> Self {
+        Self::new(UniformSampler { num_frames: 8 })
+    }
+}
+
 impl VideoFetchConfig {
     pub fn new(sampler: impl FrameSampler + 'static) -> Self {
         Self {
             sampler: Arc::new(sampler),
         }
+    }
+
+    pub fn from_model(
+        metadata: &ModelMetadata,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Self> {
+        let registry = ModelRegistry::new();
+        let Some(spec) = registry.lookup(metadata) else {
+            return Ok(Self::default());
+        };
+
+        let Some(sampler) = spec.build_video_sampler(metadata, preprocessor_config)? else {
+            return Ok(Self::default());
+        };
+
+        Ok(Self {
+            sampler: Arc::from(sampler),
+        })
     }
 }
 
@@ -61,6 +87,74 @@ pub enum MediaSource {
     DataUrl(String),
     InlineBytes(Vec<u8>),
     File(PathBuf),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::registry::test_helpers::TestTokenizer;
+    use crate::video::VideoMetadata;
+
+    fn sample_video_metadata() -> VideoMetadata {
+        VideoMetadata {
+            duration_secs: 4.0,
+            total_frames: 24,
+            fps: 6.0,
+            width: 640,
+            height: 480,
+            codec: "TEST".into(),
+        }
+    }
+
+    #[test]
+    fn model_specific_video_sampler_uses_qwen2_vl_sampler() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 1), ("<|video_pad|>", 2)]);
+        let config = json!({
+            "model_type": "qwen2_vl",
+            "image_token_id": 151655
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen2-VL-7B",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let preprocessor_config = PreProcessorConfig {
+            do_sample_frames: Some(true),
+            num_frames: Some(5),
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        };
+
+        let fetch_config = VideoFetchConfig::from_model(&metadata, &preprocessor_config).unwrap();
+        let indices = fetch_config
+            .sampler
+            .sample_indices(&sample_video_metadata())
+            .unwrap();
+
+        assert_eq!(indices, vec![0, 6, 12, 18]);
+    }
+
+    #[test]
+    fn model_without_hook_uses_default_uniform_sampler() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({"model_type": "custom"});
+        let metadata = ModelMetadata {
+            model_id: "custom-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+
+        let fetch_config =
+            VideoFetchConfig::from_model(&metadata, &PreProcessorConfig::default()).unwrap();
+        let indices = fetch_config
+            .sampler
+            .sample_indices(&sample_video_metadata())
+            .unwrap();
+
+        assert_eq!(indices, vec![0, 3, 6, 9, 12, 15, 18, 21]);
+    }
 }
 
 #[derive(Clone)]

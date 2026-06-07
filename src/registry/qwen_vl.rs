@@ -5,7 +5,11 @@ use serde_json::{json, Value};
 use crate::{
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::{image_processor::PreprocessedImages, video_processor::PreprocessedVideos},
+    video::FrameSampler,
+    vision::{
+        image_processor::PreprocessedImages, video_processor::PreprocessedVideos,
+        PreProcessorConfig, Qwen2VLFrameSampler,
+    },
 };
 
 pub(super) struct QwenVLVisionSpec;
@@ -138,6 +142,16 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             })
             .collect())
     }
+
+    fn build_video_sampler(
+        &self,
+        _metadata: &ModelMetadata,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Option<Box<dyn FrameSampler>>> {
+        let sampler = Qwen2VLFrameSampler::from_preprocessor_config(preprocessor_config)
+            .map_err(|err| ModelRegistryError::InvalidVideoSampling(err.to_string()))?;
+        Ok(Some(Box::new(sampler)))
+    }
 }
 
 #[cfg(test)]
@@ -147,7 +161,7 @@ mod tests {
     use crate::{
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
         types::{ImageSize, Modality},
-        vision::video_processor::PreprocessedVideos,
+        vision::{video_processor::PreprocessedVideos, PreProcessorConfig},
     };
 
     #[test]
@@ -293,5 +307,48 @@ mod tests {
         let limits = spec.modality_limits(&metadata).unwrap();
         assert_eq!(limits.get(&Modality::Image), Some(&10));
         assert_eq!(limits.get(&Modality::Video), Some(&10));
+    }
+
+    #[test]
+    fn qwen_vl_builds_qwen2_video_sampler() {
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151654)]);
+        let config = json!({
+            "model_type": "qwen2_vl",
+            "vision_token_id": 151654,
+            "image_token_id": 151655
+        });
+        let metadata = ModelMetadata {
+            model_id: "Qwen2-VL-7B",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("qwen spec");
+
+        let sampler = spec
+            .build_video_sampler(
+                &metadata,
+                &PreProcessorConfig {
+                    do_sample_frames: Some(true),
+                    num_frames: Some(5),
+                    temporal_patch_size: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .expect("sampler");
+
+        let indices = sampler
+            .sample_indices(&crate::video::VideoMetadata {
+                duration_secs: 4.0,
+                total_frames: 24,
+                fps: 6.0,
+                width: 640,
+                height: 480,
+                codec: "TEST".into(),
+            })
+            .unwrap();
+
+        assert_eq!(indices, vec![0, 6, 12, 18]);
     }
 }

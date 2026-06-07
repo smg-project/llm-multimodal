@@ -5,7 +5,11 @@ use thiserror::Error;
 
 use crate::{
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::{image_processor::PreprocessedImages, video_processor::PreprocessedVideos},
+    video::FrameSampler,
+    vision::{
+        image_processor::PreprocessedImages, video_processor::PreprocessedVideos,
+        PreProcessorConfig,
+    },
 };
 
 #[derive(Debug, Error)]
@@ -16,6 +20,8 @@ pub enum ModelRegistryError {
     TokenNotFound { token: String },
     #[error("missing config field '{field}'")]
     MissingConfigField { field: String },
+    #[error("invalid video sampling configuration: {0}")]
+    InvalidVideoSampling(String),
 }
 
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
@@ -128,5 +134,14 @@ pub trait ModelProcessorSpec: Send + Sync {
         _preprocessed: &PreprocessedVideos,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         Ok(vec![])
+    }
+
+    /// Build a model-specific video sampler when the model needs custom frame sampling.
+    fn build_video_sampler(
+        &self,
+        _metadata: &ModelMetadata,
+        _preprocessor_config: &PreProcessorConfig,
+    ) -> RegistryResult<Option<Box<dyn FrameSampler>>> {
+        Ok(None)
     }
 }

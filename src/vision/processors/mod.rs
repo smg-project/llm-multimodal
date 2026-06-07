@@ -31,5 +31,5 @@ pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;
-pub use qwen2_vl::Qwen2VLProcessor;
+pub use qwen2_vl::{Qwen2VLFrameSampler, Qwen2VLProcessor};
 pub use qwen3_vl::Qwen3VLProcessor;

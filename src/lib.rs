@@ -24,6 +24,6 @@ pub use video::{
 // Re-export vision processing components
 pub use vision::{
     ImagePreProcessor, ImageProcessorRegistry, LlavaNextProcessor, LlavaProcessor,
-    ModelSpecificValue, PreProcessorConfig, PreprocessedImages, PreprocessedVideos, TransformError,
-    VideoPreProcessor, VideoProcessorRegistry,
+    ModelSpecificValue, PreProcessorConfig, PreprocessedImages, PreprocessedVideos,
+    Qwen2VLFrameSampler, TransformError, VideoPreProcessor, VideoProcessorRegistry,
 };

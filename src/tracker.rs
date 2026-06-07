@@ -5,10 +5,11 @@ use tokio::task::JoinHandle;
 use super::{
     error::{MultiModalError, MultiModalResult},
     media::{ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
+    registry::ModelMetadata,
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
-    video::UniformSampler,
+    vision::PreProcessorConfig,
 };
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
@@ -21,17 +22,38 @@ pub struct TrackerOutput {
 
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
+    video_fetch_config: VideoFetchConfig,
     pending: HashMap<Modality, Vec<PendingTask>>,
     uuids: MultiModalUUIDs,
 }
 
 impl AsyncMultiModalTracker {
     pub fn new(media_connector: Arc<MediaConnector>) -> Self {
+        Self::with_video_fetch_config(media_connector, VideoFetchConfig::default())
+    }
+
+    pub fn with_video_fetch_config(
+        media_connector: Arc<MediaConnector>,
+        video_fetch_config: VideoFetchConfig,
+    ) -> Self {
         Self {
             media_connector,
+            video_fetch_config,
             pending: HashMap::new(),
             uuids: HashMap::new(),
         }
+    }
+
+    pub fn for_model(
+        media_connector: Arc<MediaConnector>,
+        metadata: &ModelMetadata,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Result<Self, super::registry::ModelRegistryError> {
+        let video_fetch_config = VideoFetchConfig::from_model(metadata, preprocessor_config)?;
+        Ok(Self::with_video_fetch_config(
+            media_connector,
+            video_fetch_config,
+        ))
     }
 
     pub fn push_part(&mut self, part: MediaContentPart) -> MultiModalResult<()> {
@@ -64,7 +86,7 @@ impl AsyncMultiModalTracker {
                     Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
                     _ => MediaSource::Url(url),
                 };
-                let fetch_cfg = VideoFetchConfig::new(UniformSampler { num_frames: 8 });
+                let fetch_cfg = self.video_fetch_config.clone();
                 self.enqueue_video(source, fetch_cfg, uuid);
             }
             MediaContentPart::VideoData {
@@ -72,7 +94,7 @@ impl AsyncMultiModalTracker {
                 mime_type: _,
                 uuid,
             } => {
-                let fetch_cfg = VideoFetchConfig::new(UniformSampler { num_frames: 8 });
+                let fetch_cfg = self.video_fetch_config.clone();
                 self.enqueue_video(MediaSource::InlineBytes(data), fetch_cfg, uuid);
             }
         }

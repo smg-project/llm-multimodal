@@ -22,6 +22,7 @@ use std::ops::Deref;
 use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
+use crate::video::{FrameSampler, VideoDecodeError, VideoMetadata};
 use crate::vision::{
     image_processor::{ImagePreProcessor, PreprocessedImages},
     preprocessor_config::PreProcessorConfig,
@@ -49,6 +50,152 @@ pub const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (for video frames)
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+
+/// Default minimum sampled frames for Qwen2-VL videos.
+pub const DEFAULT_MIN_FRAMES: usize = 4;
+
+/// Default maximum sampled frames for Qwen2-VL videos.
+pub const DEFAULT_MAX_FRAMES: usize = 768;
+
+/// Qwen2-VL-specific frame sampler mirroring transformers' `sample_frames`.
+#[derive(Debug, Clone)]
+pub struct Qwen2VLFrameSampler {
+    pub do_sample_frames: bool,
+    pub temporal_patch_size: usize,
+    pub min_frames: usize,
+    pub max_frames: usize,
+    pub num_frames: Option<usize>,
+    pub fps: Option<f64>,
+}
+
+impl Default for Qwen2VLFrameSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Qwen2VLFrameSampler {
+    pub fn new() -> Self {
+        Self {
+            do_sample_frames: false,
+            temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
+            min_frames: DEFAULT_MIN_FRAMES,
+            max_frames: DEFAULT_MAX_FRAMES,
+            num_frames: None,
+            fps: None,
+        }
+    }
+
+    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Result<Self, VideoDecodeError> {
+        let sampler = Self {
+            do_sample_frames: config.do_sample_frames.unwrap_or(false),
+            temporal_patch_size: config
+                .temporal_patch_size
+                .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
+            min_frames: config.min_frames.unwrap_or(DEFAULT_MIN_FRAMES),
+            max_frames: config.max_frames.unwrap_or(DEFAULT_MAX_FRAMES),
+            num_frames: config.num_frames,
+            fps: config.fps,
+        };
+        sampler.validate()?;
+        Ok(sampler)
+    }
+
+    fn validate(&self) -> Result<(), VideoDecodeError> {
+        if self.temporal_patch_size == 0 {
+            return Err(VideoDecodeError::InvalidSampling(
+                "`temporal_patch_size` must be greater than zero".into(),
+            ));
+        }
+        if self.min_frames > self.max_frames {
+            return Err(VideoDecodeError::InvalidSampling(
+                "`min_frames` must be less than or equal to `max_frames`".into(),
+            ));
+        }
+        if self.num_frames.is_some() && self.fps.is_some() {
+            return Err(VideoDecodeError::InvalidSampling(
+                "`num_frames` and `fps` are mutually exclusive".into(),
+            ));
+        }
+        if matches!(self.fps, Some(fps) if !fps.is_finite() || fps <= 0.0) {
+            return Err(VideoDecodeError::InvalidSampling(
+                "`fps` must be a positive finite number".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn round_to_multiple(value: usize, multiple: usize) -> usize {
+        let quotient = value / multiple;
+        let remainder = value % multiple;
+        let doubled_remainder = remainder * 2;
+
+        let rounded_quotient = if doubled_remainder < multiple {
+            quotient
+        } else if doubled_remainder > multiple {
+            quotient + 1
+        } else if quotient % 2 == 0 {
+            quotient
+        } else {
+            quotient + 1
+        };
+
+        rounded_quotient * multiple
+    }
+}
+
+impl FrameSampler for Qwen2VLFrameSampler {
+    fn sample_indices(&self, meta: &VideoMetadata) -> Result<Vec<usize>, VideoDecodeError> {
+        self.validate()?;
+
+        if meta.total_frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        if !self.do_sample_frames {
+            return Ok((0..meta.total_frames).collect());
+        }
+
+        let total_frames = meta.total_frames;
+        let temporal_patch_size = self.temporal_patch_size;
+
+        let num_frames = if let Some(num_frames) = self.num_frames {
+            let rounded = Self::round_to_multiple(num_frames, temporal_patch_size);
+            if rounded > total_frames {
+                return Err(VideoDecodeError::InvalidSampling(format!(
+                    "inferred `num_frames={rounded}` exceeds `total_num_frames={total_frames}`"
+                )));
+            }
+            rounded
+        } else if let Some(target_fps) = self.fps {
+            if meta.fps <= 0.0 {
+                return Err(VideoDecodeError::InvalidSampling(
+                    "sampling with `fps` requires source video fps metadata".into(),
+                ));
+            }
+
+            let capped_max_frames =
+                (self.max_frames.min(total_frames) / temporal_patch_size) * temporal_patch_size;
+            let inferred = total_frames as f64 / meta.fps * target_fps;
+            let bounded = inferred
+                .max(self.min_frames as f64)
+                .min(capped_max_frames as f64)
+                .min(total_frames as f64);
+            ((bounded / temporal_patch_size as f64).floor() as usize) * temporal_patch_size
+        } else {
+            total_frames
+        };
+
+        if num_frames == 0 {
+            return Ok(Vec::new());
+        }
+
+        let step = total_frames as f64 / num_frames as f64;
+        Ok((0..num_frames)
+            .map(|idx| (idx as f64 * step).floor() as usize)
+            .collect())
+    }
+}
 
 /// Qwen2-VL image processor.
 ///
@@ -516,6 +663,17 @@ mod tests {
         }
     }
 
+    fn sample_video_metadata() -> VideoMetadata {
+        VideoMetadata {
+            duration_secs: 4.0,
+            total_frames: 24,
+            fps: 6.0,
+            width: 640,
+            height: 480,
+            codec: "TEST".into(),
+        }
+    }
+
     #[test]
     fn test_qwen2_vl_preprocess_video_even_frames() {
         let processor = Qwen2VLProcessor::new();
@@ -622,6 +780,60 @@ mod tests {
         let predicted =
             VideoPreProcessor::calculate_num_tokens(&processor, 640, 480, n_frames, &config);
         assert_eq!(predicted, result.num_video_tokens[0]);
+    }
+
+    #[test]
+    fn test_qwen2_vl_frame_sampler_uses_all_frames_by_default() {
+        let sampler = Qwen2VLFrameSampler::new();
+        assert_eq!(
+            sampler.sample_indices(&sample_video_metadata()).unwrap(),
+            (0..24).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_qwen2_vl_frame_sampler_rounds_num_frames_like_transformers() {
+        let sampler = Qwen2VLFrameSampler::from_preprocessor_config(&PreProcessorConfig {
+            do_sample_frames: Some(true),
+            num_frames: Some(5),
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            sampler.sample_indices(&sample_video_metadata()).unwrap(),
+            vec![0, 6, 12, 18]
+        );
+    }
+
+    #[test]
+    fn test_qwen2_vl_frame_sampler_supports_fps_sampling() {
+        let sampler = Qwen2VLFrameSampler::from_preprocessor_config(&PreProcessorConfig {
+            do_sample_frames: Some(true),
+            fps: Some(1.5),
+            temporal_patch_size: Some(2),
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(
+            sampler.sample_indices(&sample_video_metadata()).unwrap(),
+            vec![0, 4, 8, 12, 16, 20]
+        );
+    }
+
+    #[test]
+    fn test_qwen2_vl_frame_sampler_rejects_conflicting_config() {
+        let err = Qwen2VLFrameSampler::from_preprocessor_config(&PreProcessorConfig {
+            do_sample_frames: Some(true),
+            num_frames: Some(8),
+            fps: Some(2.0),
+            ..Default::default()
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, VideoDecodeError::InvalidSampling(_)));
     }
 
     #[test]

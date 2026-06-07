@@ -41,6 +41,8 @@ pub enum VideoDecodeError {
     Io(#[from] std::io::Error),
     #[error("frame conversion failed: {0}")]
     FrameConversion(String),
+    #[error("invalid frame sampling configuration: {0}")]
+    InvalidSampling(String),
 }
 
 /// A frame sampling strategy that decides which frames to extract from a video.
@@ -50,7 +52,7 @@ pub enum VideoDecodeError {
 /// to control temporal resolution.
 pub trait FrameSampler: Send + Sync {
     /// Return the 0-based frame indices to extract.
-    fn sample_indices(&self, meta: &VideoMetadata) -> Vec<usize>;
+    fn sample_indices(&self, meta: &VideoMetadata) -> Result<Vec<usize>, VideoDecodeError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,12 +66,12 @@ pub struct UniformSampler {
 }
 
 impl FrameSampler for UniformSampler {
-    fn sample_indices(&self, meta: &VideoMetadata) -> Vec<usize> {
+    fn sample_indices(&self, meta: &VideoMetadata) -> Result<Vec<usize>, VideoDecodeError> {
         if meta.total_frames == 0 || self.num_frames == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let n = self.num_frames.min(meta.total_frames);
-        (0..n).map(|i| i * meta.total_frames / n).collect()
+        Ok((0..n).map(|i| i * meta.total_frames / n).collect())
     }
 }
 
@@ -80,12 +82,17 @@ pub struct FpsSampler {
 }
 
 impl FrameSampler for FpsSampler {
-    fn sample_indices(&self, meta: &VideoMetadata) -> Vec<usize> {
+    fn sample_indices(&self, meta: &VideoMetadata) -> Result<Vec<usize>, VideoDecodeError> {
+        if self.target_fps <= 0.0 {
+            return Err(VideoDecodeError::InvalidSampling(
+                "`target_fps` must be greater than zero".into(),
+            ));
+        }
         if meta.fps <= 0.0 || meta.total_frames == 0 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let step = (meta.fps / self.target_fps).max(1.0) as usize;
-        (0..meta.total_frames).step_by(step).collect()
+        Ok((0..meta.total_frames).step_by(step).collect())
     }
 }
 
@@ -97,8 +104,8 @@ impl FrameSampler for FpsSampler {
 pub struct AllFramesSampler;
 
 impl FrameSampler for AllFramesSampler {
-    fn sample_indices(&self, meta: &VideoMetadata) -> Vec<usize> {
-        (0..meta.total_frames).collect()
+    fn sample_indices(&self, meta: &VideoMetadata) -> Result<Vec<usize>, VideoDecodeError> {
+        Ok((0..meta.total_frames).collect())
     }
 }
 
@@ -175,7 +182,7 @@ fn decode_video_path_inner(
     };
 
     // Ask sampler which frames to extract
-    let indices = sampler.sample_indices(&metadata);
+    let indices = sampler.sample_indices(&metadata)?;
     if indices.is_empty() {
         return Ok((metadata, Vec::new()));
     }

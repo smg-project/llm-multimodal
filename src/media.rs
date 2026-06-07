@@ -236,7 +236,8 @@ impl MediaConnector {
     // -----------------------------------------------------------------------
 
     async fn fetch_http_bytes(&self, url: &str) -> Result<Bytes, MediaConnectorError> {
-        let parsed = Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+        let parsed =
+            Url::parse(url).map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
         self.ensure_domain_allowed(&parsed)?;
 
         let mut req = self.client.get(parsed.as_str());
@@ -299,12 +300,8 @@ impl MediaConnector {
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         let bytes = self.fetch_http_bytes(&url).await?;
-        self.decode_image(
-            bytes,
-            cfg.detail,
-            ImageSource::Url { url },
-        )
-        .await
+        self.decode_image(bytes, cfg.detail, ImageSource::Url { url })
+            .await
     }
 
     async fn fetch_data_url_image(

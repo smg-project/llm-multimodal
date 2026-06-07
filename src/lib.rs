@@ -8,7 +8,9 @@ pub mod video;
 pub mod vision;
 
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult};
-pub use media::{ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig};
+pub use media::{
+    ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
+};
 pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry, TokenResolver};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{

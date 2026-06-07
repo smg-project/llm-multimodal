@@ -60,7 +60,10 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         &self,
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Ok(HashMap::from([(Modality::Image, 10), (Modality::Video, 10)]))
+        Ok(HashMap::from([
+            (Modality::Image, 10),
+            (Modality::Video, 10),
+        ]))
     }
 
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
@@ -198,10 +201,7 @@ mod tests {
 
     #[test]
     fn qwen_vl_video_prompt_replacements() {
-        let tokenizer = TestTokenizer::new(&[
-            ("<|image_pad|>", 151654),
-            ("<|video_pad|>", 151657),
-        ]);
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151654), ("<|video_pad|>", 151657)]);
         let config = json!({
             "model_type": "qwen2_vl",
             "vision_start_token_id": 151652,

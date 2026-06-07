@@ -527,12 +527,7 @@ impl QwenVLProcessorBase {
     /// Mirrors the temporal padding of [`preprocess_video`](Self::preprocess_video):
     /// the frame count is rounded up to a multiple of `temporal_patch_size`
     /// before computing `grid_t`.
-    pub fn calculate_num_video_tokens(
-        &self,
-        width: u32,
-        height: u32,
-        num_frames: u32,
-    ) -> usize {
+    pub fn calculate_num_video_tokens(&self, width: u32, height: u32, num_frames: u32) -> usize {
         let (new_height, new_width) = match self.smart_resize(height as usize, width as usize) {
             Ok((h, w)) => (h, w),
             Err(_) => {

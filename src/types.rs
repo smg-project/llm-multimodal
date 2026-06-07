@@ -189,7 +189,9 @@ impl VideoFrame {
     }
 
     pub fn size(&self) -> Option<ImageSize> {
-        self.frames.first().map(|f| ImageSize::new(f.width(), f.height()))
+        self.frames
+            .first()
+            .map(|f| ImageSize::new(f.width(), f.height()))
     }
 }
 

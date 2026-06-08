@@ -51,7 +51,7 @@ pub struct VideoFetchConfig {
 
 impl Default for VideoFetchConfig {
     fn default() -> Self {
-        Self::new(UniformSampler { num_frames: 8 })
+        Self::new(UniformSampler { num_frames: 32 })
     }
 }
 

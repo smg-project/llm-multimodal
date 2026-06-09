@@ -36,11 +36,19 @@ pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 /// CLIP normalization std values used by Qwen2-VL models.
 pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
-/// Default minimum pixels (256 * 28 * 28 = 200,704)
+/// Default minimum pixels for images (256 * 28 * 28 = 200,704)
 pub const DEFAULT_MIN_PIXELS: usize = 256 * 28 * 28;
 
-/// Default maximum pixels (1280 * 28 * 28 = 1,003,520)
+/// Default maximum pixels for images (1280 * 28 * 28 = 1,003,520)
 pub const DEFAULT_MAX_PIXELS: usize = 1280 * 28 * 28;
+
+/// Default minimum pixels for video frames (128 * 28 * 28 = 100,352).
+/// Matches the Qwen2VLVideoProcessor class-level default in transformers.
+pub const VIDEO_DEFAULT_MIN_PIXELS: usize = 128 * 28 * 28;
+
+/// Default maximum pixels for video frames (768 * 28 * 28 = 602,112).
+/// Matches the Qwen2VLVideoProcessor class-level default in transformers.
+pub const VIDEO_DEFAULT_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// Default patch size
 pub const DEFAULT_PATCH_SIZE: usize = 14;
@@ -216,7 +224,7 @@ impl Default for Qwen2VLProcessor {
 }
 
 impl Qwen2VLProcessor {
-    /// Create a new Qwen2-VL processor with default settings.
+    /// Create a new Qwen2-VL processor with image default pixel bounds.
     ///
     /// Defaults:
     /// - patch_size: 14
@@ -232,6 +240,27 @@ impl Qwen2VLProcessor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 min_pixels: DEFAULT_MIN_PIXELS,
                 max_pixels: DEFAULT_MAX_PIXELS,
+                temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
+                mean: CLIP_MEAN,
+                std: CLIP_STD,
+                model_name: "qwen2-vl",
+            }),
+        }
+    }
+
+    /// Create a new Qwen2-VL processor with video default pixel bounds.
+    ///
+    /// Uses tighter pixel bounds than the image processor, matching the
+    /// `Qwen2VLVideoProcessor` class-level defaults in transformers:
+    /// - min_pixels: 100,352 (128 * 28 * 28)
+    /// - max_pixels: 602,112 (768 * 28 * 28)
+    pub fn video_default() -> Self {
+        Self {
+            inner: QwenVLProcessorBase::new(QwenVLConfig {
+                patch_size: DEFAULT_PATCH_SIZE,
+                merge_size: DEFAULT_MERGE_SIZE,
+                min_pixels: VIDEO_DEFAULT_MIN_PIXELS,
+                max_pixels: VIDEO_DEFAULT_MAX_PIXELS,
                 temporal_patch_size: DEFAULT_TEMPORAL_PATCH_SIZE,
                 mean: CLIP_MEAN,
                 std: CLIP_STD,
@@ -397,10 +426,10 @@ impl VideoPreProcessor for Qwen2VLProcessor {
         width: u32,
         height: u32,
         num_frames: u32,
-        _config: &PreProcessorConfig,
+        config: &PreProcessorConfig,
     ) -> usize {
         self.inner
-            .calculate_num_video_tokens(width, height, num_frames)
+            .calculate_num_video_tokens(width, height, num_frames, config)
     }
 
     fn model_name(&self) -> &'static str {

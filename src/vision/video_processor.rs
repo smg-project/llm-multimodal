@@ -244,25 +244,25 @@ impl VideoProcessorRegistry {
         // Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
         registry.register(
             "qwen2-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
+            Box::new(super::processors::Qwen2VLProcessor::video_default()),
         );
         registry.register(
             "qwen2_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
+            Box::new(super::processors::Qwen2VLProcessor::video_default()),
         );
 
         // Qwen2.5-VL (identical preprocessing to Qwen2-VL)
         registry.register(
             "qwen2.5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
+            Box::new(super::processors::Qwen2VLProcessor::video_default()),
         );
         registry.register(
             "qwen2_5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
+            Box::new(super::processors::Qwen2VLProcessor::video_default()),
         );
         registry.register(
             "qwen2_5_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
+            Box::new(super::processors::Qwen2VLProcessor::video_default()),
         );
 
         registry

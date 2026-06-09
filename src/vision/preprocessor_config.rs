@@ -168,13 +168,23 @@ pub struct PreProcessorConfig {
     #[serde(default)]
     pub merge_size: Option<usize>,
 
-    /// Qwen-VL: minimum total pixels
+    /// Qwen-VL: minimum total pixels (applies to images)
     #[serde(default)]
     pub min_pixels: Option<usize>,
 
-    /// Qwen-VL: maximum total pixels
+    /// Qwen-VL: maximum total pixels (applies to images)
     #[serde(default)]
     pub max_pixels: Option<usize>,
+
+    /// Qwen-VL: minimum total pixels for video frames.
+    /// When present, overrides `min_pixels` for video preprocessing.
+    #[serde(default)]
+    pub video_min_pixels: Option<usize>,
+
+    /// Qwen-VL: maximum total pixels for video frames.
+    /// When present, overrides `max_pixels` for video preprocessing.
+    #[serde(default)]
+    pub video_max_pixels: Option<usize>,
 
     /// Qwen-VL: temporal patch size for video
     #[serde(default)]

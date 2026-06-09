@@ -145,6 +145,16 @@ impl QwenVLProcessorBase {
         height: usize,
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
+        self.smart_resize_with_bounds(height, width, self.config.min_pixels, self.config.max_pixels)
+    }
+
+    pub fn smart_resize_with_bounds(
+        &self,
+        height: usize,
+        width: usize,
+        min_pixels: usize,
+        max_pixels: usize,
+    ) -> Result<(usize, usize), TransformError> {
         let factor = self.get_factor();
 
         // Validate non-zero dimensions
@@ -177,8 +187,8 @@ impl QwenVLProcessorBase {
         w_bar = w_bar.max(factor);
 
         // Scale down if exceeding max_pixels
-        if h_bar * w_bar > self.config.max_pixels {
-            let beta = ((height * width) as f64 / self.config.max_pixels as f64).sqrt();
+        if h_bar * w_bar > max_pixels {
+            let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
             h_bar = ((height as f64 / beta / factor as f64).floor() as usize) * factor;
             w_bar = ((width as f64 / beta / factor as f64).floor() as usize) * factor;
             // Ensure minimum size after scaling down
@@ -186,8 +196,8 @@ impl QwenVLProcessorBase {
             w_bar = w_bar.max(factor);
         }
         // Scale up if below min_pixels
-        else if h_bar * w_bar < self.config.min_pixels {
-            let beta = (self.config.min_pixels as f64 / (height * width) as f64).sqrt();
+        else if h_bar * w_bar < min_pixels {
+            let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
             h_bar = ((height as f64 * beta / factor as f64).ceil() as usize) * factor;
             w_bar = ((width as f64 * beta / factor as f64).ceil() as usize) * factor;
         }
@@ -433,6 +443,17 @@ impl QwenVLProcessorBase {
         let temporal_patch_size = self.config.temporal_patch_size;
         let patch_features = 3 * temporal_patch_size * patch_size * patch_size;
 
+        // Video-specific pixel bounds: prefer explicit video_min/max_pixels, then the shared
+        // min/max_pixels, then fall back to the processor's own (image-centric) defaults.
+        let video_min_pixels = config
+            .video_min_pixels
+            .or(config.min_pixels)
+            .unwrap_or(self.config.min_pixels);
+        let video_max_pixels = config
+            .video_max_pixels
+            .or(config.max_pixels)
+            .unwrap_or(self.config.max_pixels);
+
         let mut all_patches: Vec<f32> = Vec::new();
         let mut patches_per_video: Vec<i64> = Vec::with_capacity(videos.len());
         let mut grid_thw_data: Vec<i64> = Vec::with_capacity(videos.len() * 3);
@@ -449,7 +470,8 @@ impl QwenVLProcessorBase {
             video_sizes.push((w0, h0, frames.len() as u32));
 
             // Common target size for every frame in this video.
-            let (target_h, target_w) = self.smart_resize(h0 as usize, w0 as usize)?;
+            let (target_h, target_w) =
+                self.smart_resize_with_bounds(h0 as usize, w0 as usize, video_min_pixels, video_max_pixels)?;
             let (tw32, th32) = (target_w as u32, target_h as u32);
 
             // Resize + normalize each frame to [C, H, W].
@@ -527,14 +549,29 @@ impl QwenVLProcessorBase {
     /// Mirrors the temporal padding of [`preprocess_video`](Self::preprocess_video):
     /// the frame count is rounded up to a multiple of `temporal_patch_size`
     /// before computing `grid_t`.
-    pub fn calculate_num_video_tokens(&self, width: u32, height: u32, num_frames: u32) -> usize {
-        let (new_height, new_width) = match self.smart_resize(height as usize, width as usize) {
-            Ok((h, w)) => (h, w),
-            Err(_) => {
-                let factor = self.get_factor();
-                (factor, factor)
-            }
-        };
+    pub fn calculate_num_video_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        num_frames: u32,
+        config: &PreProcessorConfig,
+    ) -> usize {
+        let min_pixels = config
+            .video_min_pixels
+            .or(config.min_pixels)
+            .unwrap_or(self.config.min_pixels);
+        let max_pixels = config
+            .video_max_pixels
+            .or(config.max_pixels)
+            .unwrap_or(self.config.max_pixels);
+        let (new_height, new_width) =
+            match self.smart_resize_with_bounds(height as usize, width as usize, min_pixels, max_pixels) {
+                Ok((h, w)) => (h, w),
+                Err(_) => {
+                    let factor = self.get_factor();
+                    (factor, factor)
+                }
+            };
 
         // Round frame count up to a temporal_patch_size multiple (min one patch).
         let tps = self.config.temporal_patch_size;

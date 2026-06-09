@@ -644,7 +644,7 @@ mod tests {
         let registry = ImageProcessorRegistry::with_defaults();
 
         let processor = registry
-            .find("/models/qwen3.5-0.8b-th-mtp", None)
+            .find("Qwen/Qwen3.5-0.8B", None)
             .expect("qwen3.5 processor by model_id");
         assert_eq!(processor.model_name(), "qwen3-vl");
     }

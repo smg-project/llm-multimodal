@@ -1,17 +1,18 @@
-//! Image processor trait and output types.
+//! Vision processor trait and encoder-output types.
 //!
-//! This module defines the interface for model-specific image processors
-//! and the common output format for preprocessed images.
+//! This module defines the interface for model-specific vision processors
+//! and the common output format for preprocessed encoder inputs.
 
 use std::{borrow::Cow, collections::HashMap};
 
+use anyhow::{Context, Result as AnyhowResult};
 use image::DynamicImage;
 use ndarray::{Array4, ArrayD};
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 use crate::types::FieldLayout;
 
-/// Helper to extract a dimension from pixel_values given an ndim-dependent axis index.
+/// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
 fn dim_for_ndim(
     ndim: usize,
@@ -23,7 +24,7 @@ fn dim_for_ndim(
         4 => Ok(shape[axis_4d]),
         5 => Ok(shape[axis_5d]),
         _ => Err(TransformError::InvalidShape {
-            expected: format!("4D or 5D pixel_values tensor, got {ndim}D"),
+            expected: format!("4D or 5D encoder_input tensor, got {ndim}D"),
             actual: shape.to_vec(),
         }),
     }
@@ -31,7 +32,7 @@ fn dim_for_ndim(
 
 /// Model-specific output values that vary by architecture.
 ///
-/// Different vision models require different auxiliary outputs beyond pixel_values.
+/// Different vision models require different auxiliary outputs beyond encoder_input.
 /// This enum captures the common types of such outputs.
 #[derive(Debug, Clone)]
 pub enum ModelSpecificValue {
@@ -110,69 +111,163 @@ impl ModelSpecificValue {
             _ => None,
         }
     }
+
+    /// Interpret this value as per-item flat sizes.
+    pub fn as_flat_sizes(&self) -> AnyhowResult<Vec<usize>> {
+        match self {
+            Self::IntTensor { data, .. } => data
+                .iter()
+                .map(|&v| usize::try_from(v).context("negative flat size"))
+                .collect(),
+            Self::UintTensor { data, .. } => Ok(data.iter().map(|&v| v as usize).collect()),
+            Self::IntVec(values) => values
+                .iter()
+                .map(|&v| usize::try_from(v).context("negative flat size"))
+                .collect(),
+            Self::UintVec(values) => Ok(values.iter().map(|&v| v as usize).collect()),
+            _ => Err(anyhow::anyhow!("unsupported flat sizes value type")),
+        }
+    }
+
+    /// Slice item-batched metadata along the first dimension.
+    pub fn slice_first_dim(&self, start: usize, len: usize) -> AnyhowResult<Self> {
+        match self {
+            Self::Tensor { data, shape } => {
+                let (data, shape) = slice_tensor_first_dim(data, shape, start, len)?;
+                Ok(Self::Tensor { data, shape })
+            }
+            Self::IntTensor { data, shape } => {
+                let (data, shape) = slice_tensor_first_dim(data, shape, start, len)?;
+                Ok(Self::IntTensor { data, shape })
+            }
+            Self::UintTensor { data, shape } => {
+                let (data, shape) = slice_tensor_first_dim(data, shape, start, len)?;
+                Ok(Self::UintTensor { data, shape })
+            }
+            Self::IntVec(values) => Ok(Self::IntVec(slice_1d(values, start, len)?.to_vec())),
+            Self::UintVec(values) => Ok(Self::UintVec(slice_1d(values, start, len)?.to_vec())),
+            Self::FloatVec(values) => Ok(Self::FloatVec(slice_1d(values, start, len)?.to_vec())),
+            Self::TupleVec(values) => Ok(Self::TupleVec(slice_1d(values, start, len)?.to_vec())),
+            _ => Ok(self.clone()),
+        }
+    }
 }
 
-/// Preprocessed images ready for model consumption.
+fn slice_tensor_first_dim<T: Clone>(
+    data: &[T],
+    shape: &[usize],
+    start: usize,
+    len: usize,
+) -> AnyhowResult<(Vec<T>, Vec<usize>)> {
+    let first_dim = *shape
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("cannot slice scalar tensor"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("tensor slice range overflow"))?;
+    anyhow::ensure!(
+        end <= first_dim,
+        "tensor first-dimension slice {start}..{end} exceeds {first_dim}"
+    );
+    let row_width = shape[1..]
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+        .ok_or_else(|| anyhow::anyhow!("tensor row width overflow"))?;
+    let data_start = start
+        .checked_mul(row_width)
+        .ok_or_else(|| anyhow::anyhow!("tensor data start overflow"))?;
+    let data_len = len
+        .checked_mul(row_width)
+        .ok_or_else(|| anyhow::anyhow!("tensor data length overflow"))?;
+    let data_end = data_start
+        .checked_add(data_len)
+        .ok_or_else(|| anyhow::anyhow!("tensor data end overflow"))?;
+    anyhow::ensure!(
+        data_end <= data.len(),
+        "tensor slice data range {data_start}..{data_end} exceeds {}",
+        data.len()
+    );
+    let mut new_shape = shape.to_vec();
+    new_shape[0] = len;
+    Ok((data[data_start..data_end].to_vec(), new_shape))
+}
+
+fn slice_1d<T>(values: &[T], start: usize, len: usize) -> AnyhowResult<&[T]> {
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("slice range overflow"))?;
+    values
+        .get(start..end)
+        .ok_or_else(|| anyhow::anyhow!("slice range {start}..{end} exceeds {}", values.len()))
+}
+
+/// Preprocessed encoder inputs ready for model consumption.
 ///
-/// This struct contains all the outputs needed by the SGLang scheduler
-/// to construct `MultimodalInputs` for the model.
+/// This struct contains the processor outputs needed by serving backends to
+/// construct `MultimodalInputs` for the model. Vision processors currently
+/// produce this from images or sampled video frames; future modality processors
+/// can reuse the same output contract for audio features or other encoder inputs.
 #[derive(Debug, Clone)]
-pub struct PreprocessedImages {
-    /// Pixel values as a dynamic-dimensional float32 tensor.
+pub struct PreprocessedEncoderInputs {
+    /// Primary encoder input as a dynamic-dimensional float32 tensor.
     ///
-    /// This is the primary input to the vision encoder.
-    /// Shape varies by model:
+    /// For vision models this is typically the preprocessed image/video tensor.
+    /// Shape varies by model and modality:
     /// - Standard: [B, C, H, W] (4D)
     /// - Phi3-Vision: [B, num_crops+1, C, H, W] (5D)
-    pub pixel_values: ArrayD<f32>,
+    pub encoder_input: ArrayD<f32>,
 
-    /// Number of image tokens per image in the batch.
+    /// Number of encoder feature tokens per media item in the batch.
     ///
-    /// Used to expand placeholder tokens in the text input.
+    /// Used to expand placeholder tokens in the text input. For vision this is
+    /// usually an image patch or video patch count; for audio this could be an
+    /// audio feature-frame count.
     /// For example, LLaVA with 336x336 and patch_size=14 produces 576 tokens.
-    pub num_img_tokens: Vec<usize>,
+    pub feature_token_counts: Vec<usize>,
 
-    /// Original image sizes as (width, height) before preprocessing.
+    /// Modality-specific item size metadata before preprocessing.
     ///
-    /// Some models need this for proper attention masking or position encoding.
-    pub image_sizes: Vec<(u32, u32)>,
+    /// Vision processors use this for image/frame dimensions, but the exact
+    /// tuple order follows each processor/model contract. Model-specific shape
+    /// tensors that need a fixed order should also be emitted in `model_specific`.
+    pub item_sizes: Vec<(u32, u32)>,
 
     /// Model-specific auxiliary outputs.
     ///
     /// Examples:
     /// - Qwen-VL: `image_grid_thw` for rotary position encoding
     /// - LLaMA-Vision: `aspect_ratio_ids`, `aspect_ratio_mask`
-    /// - Phi3-Vision: `num_img_tokens` per crop
+    /// - Phi3-Vision: `num_img_tokens` auxiliary metadata
     pub model_specific: HashMap<String, ModelSpecificValue>,
 }
 
-impl PreprocessedImages {
-    /// Create a new PreprocessedImages with required fields (4D pixel values).
+impl PreprocessedEncoderInputs {
+    /// Create a new PreprocessedEncoderInputs with required fields (4D encoder input).
     pub fn new(
-        pixel_values: Array4<f32>,
-        num_img_tokens: Vec<usize>,
-        image_sizes: Vec<(u32, u32)>,
+        encoder_input: Array4<f32>,
+        feature_token_counts: Vec<usize>,
+        item_sizes: Vec<(u32, u32)>,
     ) -> Self {
         Self {
-            pixel_values: pixel_values.into_dyn(),
-            num_img_tokens,
-            image_sizes,
+            encoder_input: encoder_input.into_dyn(),
+            feature_token_counts,
+            item_sizes,
             model_specific: HashMap::new(),
         }
     }
 
-    /// Create a new PreprocessedImages with dynamic-dimensional pixel values.
+    /// Create a new PreprocessedEncoderInputs with dynamic-dimensional encoder input.
     ///
     /// Use this for models like Phi3-Vision that have 5D tensors.
     pub fn new_dynamic(
-        pixel_values: ArrayD<f32>,
-        num_img_tokens: Vec<usize>,
-        image_sizes: Vec<(u32, u32)>,
+        encoder_input: ArrayD<f32>,
+        feature_token_counts: Vec<usize>,
+        item_sizes: Vec<(u32, u32)>,
     ) -> Self {
         Self {
-            pixel_values,
-            num_img_tokens,
-            image_sizes,
+            encoder_input,
+            feature_token_counts,
+            item_sizes,
             model_specific: HashMap::new(),
         }
     }
@@ -183,9 +278,9 @@ impl PreprocessedImages {
         self
     }
 
-    /// Get the batch size.
+    /// Get the number of media items represented by this preprocessed batch.
     pub fn batch_size(&self) -> usize {
-        self.pixel_values.shape()[0]
+        self.item_sizes.len()
     }
 
     /// Get the number of channels.
@@ -194,9 +289,9 @@ impl PreprocessedImages {
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
     ///
     /// # Errors
-    /// Returns `TransformError::InvalidShape` if pixel_values is not 4D or 5D.
+    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
     pub fn channels(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.pixel_values.ndim(), 1, 2, self.pixel_values.shape())
+        dim_for_ndim(self.encoder_input.ndim(), 1, 2, self.encoder_input.shape())
     }
 
     /// Get the height of processed images.
@@ -205,9 +300,9 @@ impl PreprocessedImages {
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
     ///
     /// # Errors
-    /// Returns `TransformError::InvalidShape` if pixel_values is not 4D or 5D.
+    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
     pub fn height(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.pixel_values.ndim(), 2, 3, self.pixel_values.shape())
+        dim_for_ndim(self.encoder_input.ndim(), 2, 3, self.encoder_input.shape())
     }
 
     /// Get the width of processed images.
@@ -216,37 +311,37 @@ impl PreprocessedImages {
     /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
     ///
     /// # Errors
-    /// Returns `TransformError::InvalidShape` if pixel_values is not 4D or 5D.
+    /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
     pub fn width(&self) -> Result<usize, TransformError> {
-        dim_for_ndim(self.pixel_values.ndim(), 3, 4, self.pixel_values.shape())
+        dim_for_ndim(self.encoder_input.ndim(), 3, 4, self.encoder_input.shape())
     }
 
-    /// Get the number of dimensions of pixel_values.
+    /// Get the number of dimensions of encoder_input.
     pub fn ndim(&self) -> usize {
-        self.pixel_values.ndim()
+        self.encoder_input.ndim()
     }
 
-    /// Get total number of image tokens across all images.
-    pub fn total_tokens(&self) -> usize {
-        self.num_img_tokens.iter().sum()
+    /// Get total number of encoder feature tokens across all media items.
+    pub fn total_feature_tokens(&self) -> usize {
+        self.feature_token_counts.iter().sum()
     }
 
-    /// Get pixel values as a flat f32 slice without copying if possible.
-    pub fn pixel_values_flat(&self) -> Cow<'_, [f32]> {
-        match self.pixel_values.as_slice() {
+    /// Get the primary encoder input as a flat f32 slice without copying if possible.
+    pub fn encoder_input_flat(&self) -> Cow<'_, [f32]> {
+        match self.encoder_input.as_slice() {
             Some(slice) => Cow::Borrowed(slice),
-            None => Cow::Owned(self.pixel_values.iter().copied().collect()),
+            None => Cow::Owned(self.encoder_input.iter().copied().collect()),
         }
     }
 
-    /// Get the shape of pixel values as a vector.
-    pub fn pixel_values_shape(&self) -> Vec<usize> {
-        self.pixel_values.shape().to_vec()
+    /// Get the shape of the primary encoder input as a vector.
+    pub fn encoder_input_shape(&self) -> Vec<usize> {
+        self.encoder_input.shape().to_vec()
     }
 
-    /// Number of images in this batch.
-    pub fn num_images(&self) -> usize {
-        self.image_sizes.len()
+    /// Number of media items in this batch.
+    pub fn num_media_items(&self) -> usize {
+        self.item_sizes.len()
     }
 
     /// Extract batched tensor keys from explicit field layout declarations.
@@ -272,11 +367,11 @@ impl PreprocessedImages {
     }
 }
 
-/// Trait for model-specific image preprocessors.
+/// Trait for model-specific vision preprocessors.
 ///
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline.
-pub trait ImagePreProcessor: Send + Sync {
+pub trait VisionPreProcessor: Send + Sync {
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -290,14 +385,30 @@ pub trait ImagePreProcessor: Send + Sync {
     /// * `config` - Preprocessor configuration from HuggingFace
     ///
     /// # Returns
-    /// Preprocessed images ready for the model, or an error.
+    /// Preprocessed encoder inputs ready for the model, or an error.
     fn preprocess(
         &self,
         images: &[DynamicImage],
         config: &PreProcessorConfig,
-    ) -> Result<PreprocessedImages, TransformError>;
+    ) -> Result<PreprocessedEncoderInputs, TransformError>;
 
-    /// Calculate the number of image tokens for a given image size.
+    /// Preprocess one decoded video clip represented as sampled frames.
+    ///
+    /// Implementations that support video should emit the same primary
+    /// `encoder_input` tensor shape used by the image path, plus video-specific
+    /// model metadata such as `video_grid_thw`.
+    fn preprocess_video(
+        &self,
+        _frames: &[DynamicImage],
+        _config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        Err(TransformError::ShapeError(format!(
+            "{} does not support video preprocessing",
+            self.model_name()
+        )))
+    }
+
+    /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert
     /// in the text input before the image has been fully processed.
@@ -319,12 +430,12 @@ pub trait ImagePreProcessor: Send + Sync {
     }
 }
 
-/// Registry of available image processors.
-pub struct ImageProcessorRegistry {
-    processors: HashMap<String, Box<dyn ImagePreProcessor>>,
+/// Registry of available vision processors.
+pub struct VisionProcessorRegistry {
+    processors: HashMap<String, Box<dyn VisionPreProcessor>>,
 }
 
-impl ImageProcessorRegistry {
+impl VisionProcessorRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
         Self {
@@ -333,19 +444,23 @@ impl ImageProcessorRegistry {
     }
 
     /// Register a processor for a model pattern.
-    pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn ImagePreProcessor>) {
+    pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
         self.processors.insert(pattern.into(), processor);
     }
 
     /// Find a processor for the given model ID, falling back to model_type.
     ///
     /// Matches by substring containment (case-insensitive).
-    pub fn find(&self, model_id: &str, model_type: Option<&str>) -> Option<&dyn ImagePreProcessor> {
+    pub fn find(
+        &self,
+        model_id: &str,
+        model_type: Option<&str>,
+    ) -> Option<&dyn VisionPreProcessor> {
         self.find_in_candidate(model_id)
             .or_else(|| model_type.and_then(|mt| self.find_in_candidate(mt)))
     }
 
-    fn find_in_candidate(&self, candidate: &str) -> Option<&dyn ImagePreProcessor> {
+    fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
         for (pattern, processor) in &self.processors {
             if candidate.contains(&pattern.to_lowercase()) {
@@ -361,13 +476,13 @@ impl ImageProcessorRegistry {
     }
 }
 
-impl Default for ImageProcessorRegistry {
+impl Default for VisionProcessorRegistry {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ImageProcessorRegistry {
+impl VisionProcessorRegistry {
     /// Create a registry with all built-in processors registered.
     ///
     /// Currently registers:
@@ -505,30 +620,33 @@ mod tests {
     use crate::vision::processors::LlavaProcessor;
 
     #[test]
-    fn test_preprocessed_images_accessors() {
-        let pixel_values = Array4::<f32>::zeros((2, 3, 336, 336));
-        let images =
-            PreprocessedImages::new(pixel_values, vec![576, 576], vec![(640, 480), (800, 600)]);
+    fn test_preprocessed_encoder_inputs_accessors() {
+        let encoder_input = Array4::<f32>::zeros((2, 3, 336, 336));
+        let inputs = PreprocessedEncoderInputs::new(
+            encoder_input,
+            vec![576, 576],
+            vec![(640, 480), (800, 600)],
+        );
 
-        assert_eq!(images.batch_size(), 2);
-        assert_eq!(images.channels().unwrap(), 3);
-        assert_eq!(images.height().unwrap(), 336);
-        assert_eq!(images.width().unwrap(), 336);
-        assert_eq!(images.total_tokens(), 1152);
+        assert_eq!(inputs.batch_size(), 2);
+        assert_eq!(inputs.channels().unwrap(), 3);
+        assert_eq!(inputs.height().unwrap(), 336);
+        assert_eq!(inputs.width().unwrap(), 336);
+        assert_eq!(inputs.total_feature_tokens(), 1152);
     }
 
     #[test]
-    fn test_preprocessed_images_with_extra() {
-        let pixel_values = Array4::<f32>::zeros((1, 3, 224, 224));
-        let images = PreprocessedImages::new(pixel_values, vec![196], vec![(224, 224)])
+    fn test_preprocessed_encoder_inputs_with_extra() {
+        let encoder_input = Array4::<f32>::zeros((1, 3, 224, 224));
+        let inputs = PreprocessedEncoderInputs::new(encoder_input, vec![196], vec![(224, 224)])
             .with_extra(
                 "image_grid_thw",
                 ModelSpecificValue::uint_1d(vec![1, 16, 16]),
             )
             .with_extra("aspect_ratio_id", ModelSpecificValue::Int(0));
 
-        assert!(images.model_specific.contains_key("image_grid_thw"));
-        assert!(images.model_specific.contains_key("aspect_ratio_id"));
+        assert!(inputs.model_specific.contains_key("image_grid_thw"));
+        assert!(inputs.model_specific.contains_key("aspect_ratio_id"));
     }
 
     #[test]
@@ -571,22 +689,22 @@ mod tests {
     }
 
     #[test]
-    fn test_pixel_values_flat() {
-        let mut pixel_values = Array4::<f32>::zeros((1, 1, 2, 2));
-        pixel_values[[0, 0, 0, 0]] = 1.0;
-        pixel_values[[0, 0, 0, 1]] = 2.0;
-        pixel_values[[0, 0, 1, 0]] = 3.0;
-        pixel_values[[0, 0, 1, 1]] = 4.0;
+    fn test_encoder_input_flat() {
+        let mut encoder_input = Array4::<f32>::zeros((1, 1, 2, 2));
+        encoder_input[[0, 0, 0, 0]] = 1.0;
+        encoder_input[[0, 0, 0, 1]] = 2.0;
+        encoder_input[[0, 0, 1, 0]] = 3.0;
+        encoder_input[[0, 0, 1, 1]] = 4.0;
 
-        let images = PreprocessedImages::new(pixel_values, vec![4], vec![(2, 2)]);
-        let flat = images.pixel_values_flat();
+        let inputs = PreprocessedEncoderInputs::new(encoder_input, vec![4], vec![(2, 2)]);
+        let flat = inputs.encoder_input_flat();
 
         assert_eq!(flat, vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
     fn test_registry_with_defaults() {
-        let registry = ImageProcessorRegistry::with_defaults();
+        let registry = VisionProcessorRegistry::with_defaults();
 
         // Should find LLaVA processor
         assert!(registry.find("llava-hf/llava-1.5-7b-hf", None).is_some());
@@ -607,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_registry_find() {
-        let mut registry = ImageProcessorRegistry::new();
+        let mut registry = VisionProcessorRegistry::new();
 
         // Create a mock processor using LlavaProcessor
         registry.register("test-model", Box::new(LlavaProcessor::new()));
@@ -619,7 +737,7 @@ mod tests {
 
     #[test]
     fn test_registry_find_falls_back_to_model_type() {
-        let registry = ImageProcessorRegistry::with_defaults();
+        let registry = VisionProcessorRegistry::with_defaults();
 
         assert!(registry.find("custom-model", None).is_none());
 
@@ -631,7 +749,7 @@ mod tests {
 
     #[test]
     fn test_registry_find_preserves_fast_path() {
-        let registry = ImageProcessorRegistry::with_defaults();
+        let registry = VisionProcessorRegistry::with_defaults();
 
         let processor = registry
             .find("Qwen3-VL-30B-A3B-Instruct", Some("qwen2_vl"))
@@ -641,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_registry_find_phi3_model_type_fallback() {
-        let registry = ImageProcessorRegistry::with_defaults();
+        let registry = VisionProcessorRegistry::with_defaults();
 
         let processor = registry
             .find("custom-model", Some("phi3_v"))

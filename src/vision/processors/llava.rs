@@ -441,10 +441,6 @@ impl LlavaNextProcessor {
     }
 
     /// Calculate unpad dimensions based on original aspect ratio.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
     pub fn calculate_unpad(&self, grid_shape: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
         calculate_unpad(grid_shape, original_size)
     }

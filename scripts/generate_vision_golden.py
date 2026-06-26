@@ -6,14 +6,14 @@ that are used to verify the Rust image preprocessors produce identical results.
 
 Usage:
     # Generate all golden outputs
-    python crates/multimodal/scripts/generate_vision_golden.py
+    python scripts/generate_vision_golden.py
 
     # Generate for specific model
-    python crates/multimodal/scripts/generate_vision_golden.py --model llava
+    python scripts/generate_vision_golden.py --model llava
 
     # Use specific image
-    python crates/multimodal/scripts/generate_vision_golden.py \
-        --image crates/multimodal/tests/fixtures/images/square.jpg
+    python scripts/generate_vision_golden.py \
+        --image tests/fixtures/images/square.jpg
 """
 
 import argparse
@@ -76,16 +76,16 @@ MODELS = {
 
 # Default test images
 DEFAULT_IMAGES = [
-    "crates/multimodal/tests/fixtures/images/square.jpg",
-    "crates/multimodal/tests/fixtures/images/tall.jpg",
-    "crates/multimodal/tests/fixtures/images/wide.jpg",
-    "crates/multimodal/tests/fixtures/images/small.jpg",
-    "crates/multimodal/tests/fixtures/images/tiny.jpg",
-    "crates/multimodal/tests/fixtures/images/very_tall.jpg",
-    "crates/multimodal/tests/fixtures/images/very_wide.jpg",
-    "crates/multimodal/tests/fixtures/images/large.jpg",
-    "crates/multimodal/tests/fixtures/images/odd_dims.jpg",
-    "crates/multimodal/tests/fixtures/images/grayscale.jpg",
+    "tests/fixtures/images/square.jpg",
+    "tests/fixtures/images/tall.jpg",
+    "tests/fixtures/images/wide.jpg",
+    "tests/fixtures/images/small.jpg",
+    "tests/fixtures/images/tiny.jpg",
+    "tests/fixtures/images/very_tall.jpg",
+    "tests/fixtures/images/very_wide.jpg",
+    "tests/fixtures/images/large.jpg",
+    "tests/fixtures/images/odd_dims.jpg",
+    "tests/fixtures/images/grayscale.jpg",
 ]
 
 
@@ -231,8 +231,8 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     Default parameters:
     - patch_size: 14
     - merge_size: 2
-    - min_pixels: 256 * 28 * 28 = 200,704
-    - max_pixels: 1280 * 28 * 28 = 1,003,520
+    - min_pixels: 4 * 28 * 28 = 3,136
+    - max_pixels: 16,384 * 28 * 28 = 12,845,056
     - temporal_patch_size: 2
     """
     try:
@@ -254,8 +254,8 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     patch_size = processor.patch_size
     merge_size = processor.merge_size
     temporal_patch_size = getattr(processor, "temporal_patch_size", 2)
-    min_pixels = processor.min_pixels
-    max_pixels = processor.max_pixels
+    min_pixels = getattr(processor, "min_pixels", None)
+    max_pixels = getattr(processor, "max_pixels", None)
 
     # Calculate number of tokens
     # tokens = (T * H * W) / merge_size²
@@ -656,7 +656,7 @@ def main():
     parser.add_argument(
         "--output-dir",
         "-o",
-        default="crates/multimodal/tests/fixtures/golden",
+        default="tests/fixtures/golden",
         help="Output directory for golden files",
     )
     args = parser.parse_args()

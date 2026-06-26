@@ -1,0 +1,74 @@
+name: Golden Fixtures
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  vision:
+    name: ${{ matrix.model }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - model: llava
+            test_filter: test_llava_golden
+            extra_filter: test_llava_token_count
+          - model: llava_pad
+            test_filter: test_llava_pad_golden
+            extra_filter: ""
+          - model: qwen2_vl
+            test_filter: test_qwen2_vl_golden
+            extra_filter: ""
+          - model: qwen3_vl
+            test_filter: test_qwen3_vl_golden
+            extra_filter: ""
+          - model: phi3_vision
+            test_filter: test_phi3_vision_golden
+            extra_filter: ""
+          - model: phi4_vision
+            test_filter: test_phi4_vision_golden
+            extra_filter: ""
+          - model: pixtral
+            test_filter: test_pixtral_golden
+            extra_filter: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/golden-fixtures-requirements.txt
+
+      - name: Install golden fixture dependencies
+        run: python -m pip install -r .github/golden-fixtures-requirements.txt
+
+      - name: Generate vision golden fixtures
+        run: python scripts/generate_vision_golden.py --model ${{ matrix.model }}
+
+      - name: Run vision golden tests
+        timeout-minutes: 20
+        env:
+          LLM_MULTIMODAL_REQUIRE_GOLDEN: "1"
+        run: |
+          cargo test --test vision_golden_tests ${{ matrix.test_filter }}
+          if [ -n "${{ matrix.extra_filter }}" ]; then
+            cargo test --test vision_golden_tests ${{ matrix.extra_filter }}
+          fi

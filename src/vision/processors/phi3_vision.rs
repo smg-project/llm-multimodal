@@ -222,10 +222,6 @@ impl Phi3VisionProcessor {
     /// Calculate number of image tokens for given HD size.
     ///
     /// Formula: `((h//336)*(w//336)+1)*144 + 1 + (h//336+1)*12`
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
     pub fn calculate_num_tokens(&self, h: usize, w: usize) -> usize {
         let grid_h = h / TILE_SIZE as usize;
         let grid_w = w / TILE_SIZE as usize;

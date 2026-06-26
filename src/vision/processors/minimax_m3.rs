@@ -1,23 +1,10 @@
 //! MiniMax-M3 VL image processor.
 //!
-//! Ported from HuggingFace `MiniMaxM3VLImageProcessor`. The model documents this
-//! as "Copied from Qwen2VLImageProcessorFast with resize changed to vLLM style":
-//! the patchify pipeline (rescale → normalize → reshape into
-//! `[grid_t, grid_h, grid_w, ...]` patches) is identical to Qwen2-VL, so we reuse
-//! [`QwenVLProcessorBase`] for it. The only difference is the resize step.
+//! Ported from HuggingFace `MiniMaxM3VLImageProcessor`. The patchify pipeline
+//! (rescale → normalize → reshape into `[grid_t, grid_h, grid_w, ...]` patches)
+//! is identical to Qwen2-VL, so we reuse [`QwenVLProcessorBase`] for it.
 //!
-//! # vLLM-style resize (`get_hw_multiple_of`)
-//!
-//! Unlike Qwen's smart-resize (which targets a min/max *pixel* budget), MiniMax:
-//!
-//! 1. Rounds each dimension **up** to a multiple of `patch_size * merge_size`.
-//! 2. If either dimension exceeds `max_size` (width, height), scales the image
-//!    down to fit while preserving aspect ratio, then re-aligns (rounds up) to
-//!    the factor.
-//!
-//! There is no lower (min-pixels) bound. `max_size` is inferred from the
-//! processor's `size` (default `{height: 672, width: 672}`) and must itself be
-//! divisible by the factor.
+//! MiniMax-M3 uses Qwen-style smart resize with `max_pixels = 672 * 672`.
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
 
@@ -43,40 +30,19 @@ pub const DEFAULT_MERGE_SIZE: usize = 2;
 /// Default temporal patch size (for video frames; images repeat the single frame).
 pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
-/// The `size`-derived resize bound `(max_width, max_height)` from the HF source
-/// (`size = {"height": 672, "width": 672}`). Must be divisible by the factor
-/// (`patch_size * merge_size`); 672 / 28 = 24.
-///
-/// NOTE: under current `transformers`, the model's `_further_process_kwargs`
-/// hook (which would feed this into the resize) is not invoked, so the live HF
-/// processor runs with `max_size = None` (no clamping). The default constructor
-/// matches that observed behavior; pass `Some(MINIMAX_M3_SIZE_BOUND)` to enforce
-/// the source's intended 672 clamp.
-pub const MINIMAX_M3_SIZE_BOUND: (usize, usize) = (672, 672);
+/// Default minimum pixels (4 * 28 * 28 = 3,136).
+pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 
-/// Round `x` up to the nearest multiple of `multiple`.
-#[inline]
-fn ceil_to_multiple(x: usize, multiple: usize) -> usize {
-    if multiple == 0 || x.is_multiple_of(multiple) {
-        x
-    } else {
-        x + (multiple - x % multiple)
-    }
-}
+/// Default maximum pixels (672 * 672 = 451,584).
+pub const DEFAULT_MAX_PIXELS: usize = 672 * 672;
 
 /// MiniMax-M3 VL image processor.
 ///
-/// Wraps [`QwenVLProcessorBase`] for the shared patchify/grid logic and overrides
-/// the resize with the vLLM-style [`Self::vllm_resize`].
+/// Wraps [`QwenVLProcessorBase`] for the shared smart-resize, patchify, and grid
+/// logic.
 #[derive(Debug, Clone)]
 pub struct MiniMaxM3Processor {
     inner: QwenVLProcessorBase,
-    /// Optional vLLM-style resize bound as `(max_width, max_height)`.
-    ///
-    /// `None` means no upper bound (each dimension is only rounded up to the
-    /// alignment factor) — this matches the live HF processor's behavior.
-    /// `Some((w, h))` clamps the image to fit within `(w, h)` before re-aligning.
-    max_size: Option<(usize, usize)>,
 }
 
 impl Default for MiniMaxM3Processor {
@@ -92,14 +58,16 @@ impl MiniMaxM3Processor {
     /// - patch_size: 14
     /// - merge_size: 2
     /// - temporal_patch_size: 2
-    /// - max_size: `None` (no clamp — matches the live HF processor)
+    /// - min_pixels: 3,136
+    /// - max_pixels: 451,584
     /// - normalization: CLIP mean/std
     pub fn new() -> Self {
         Self::with_config(
             DEFAULT_PATCH_SIZE,
             DEFAULT_MERGE_SIZE,
             DEFAULT_TEMPORAL_PATCH_SIZE,
-            None,
+            DEFAULT_MIN_PIXELS,
+            DEFAULT_MAX_PIXELS,
         )
     }
 
@@ -108,35 +76,39 @@ impl MiniMaxM3Processor {
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
-        max_size: Option<(usize, usize)>,
+        min_pixels: usize,
+        max_pixels: usize,
     ) -> Self {
         Self {
-            // min_pixels / max_pixels are unused: MiniMax never calls smart_resize.
             inner: QwenVLProcessorBase::new(QwenVLConfig {
                 patch_size,
                 merge_size,
-                min_pixels: 0,
-                max_pixels: usize::MAX,
+                min_pixels,
+                max_pixels,
                 temporal_patch_size,
                 mean: MINIMAX_M3_MEAN,
                 std: MINIMAX_M3_STD,
                 model_name: "minimax-m3",
             }),
-            max_size,
         }
     }
 
     /// Create a processor from a HuggingFace preprocessor config.
-    ///
-    /// `max_size` is left unset (`None`) to match the live HF processor, which
-    /// runs without the `size`-derived clamp under current `transformers`.
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         let patch_size = config.get_patch_size(DEFAULT_PATCH_SIZE);
         let merge_size = config.merge_size.unwrap_or(DEFAULT_MERGE_SIZE);
         let temporal_patch_size = config
             .temporal_patch_size
             .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE);
-        Self::with_config(patch_size, merge_size, temporal_patch_size, None)
+        let min_pixels = config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS);
+        let max_pixels = config.max_pixels.unwrap_or(DEFAULT_MAX_PIXELS);
+        Self::with_config(
+            patch_size,
+            merge_size,
+            temporal_patch_size,
+            min_pixels,
+            max_pixels,
+        )
     }
 
     /// Get the patch size.
@@ -154,9 +126,14 @@ impl MiniMaxM3Processor {
         self.inner.temporal_patch_size()
     }
 
-    /// Get the optional vLLM-style resize bound as `(max_width, max_height)`.
-    pub fn max_size(&self) -> Option<(usize, usize)> {
-        self.max_size
+    /// Get the minimum pixels.
+    pub fn min_pixels(&self) -> usize {
+        self.inner.min_pixels()
+    }
+
+    /// Get the maximum pixels.
+    pub fn max_pixels(&self) -> usize {
+        self.inner.max_pixels()
     }
 
     /// Get the factor for dimension alignment (`patch_size * merge_size`).
@@ -165,35 +142,13 @@ impl MiniMaxM3Processor {
         self.inner.get_factor()
     }
 
-    /// Compute the target `(new_width, new_height)`, both multiples of `factor`.
-    /// When `max_size` is set, the image is scaled down to fit within it while
-    /// preserving aspect ratio, then re-aligned. Mirrors HF `get_hw_multiple_of`
-    /// (the `(max_w, max_h)` tuple / `None` cases).
-    fn get_hw_multiple_of(&self, width: usize, height: usize, factor: usize) -> (usize, usize) {
-        let mut new_w = ceil_to_multiple(width, factor);
-        let mut new_h = ceil_to_multiple(height, factor);
-
-        if let Some((max_w, max_h)) = self.max_size {
-            if new_w > max_w || new_h > max_h {
-                // Scale down to fit within max_size while maintaining aspect ratio.
-                // (new_w * max_w) // new_w == max_w, kept explicit to match HF.
-                let new_w_ = max_w.min(new_w * max_h / new_h);
-                let new_h_ = (new_h * max_w / new_w).min(max_h);
-                // Re-align (round up) to the factor.
-                new_w = ceil_to_multiple(new_w_, factor);
-                new_h = ceil_to_multiple(new_h_, factor);
-            }
-        }
-
-        (new_w, new_h)
-    }
-
-    /// vLLM-style resize. Returns `(new_height, new_width)`, both multiples of the
-    /// alignment factor and (when `max_size` is set) bounded by it.
-    pub fn vllm_resize(&self, height: usize, width: usize) -> (usize, usize) {
-        let factor = self.get_factor();
-        let (new_w, new_h) = self.get_hw_multiple_of(width, height, factor);
-        (new_h, new_w)
+    /// Smart resize. Returns `(new_height, new_width)`.
+    pub fn smart_resize(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        self.inner.smart_resize(height, width)
     }
 
     /// Calculate the grid dimensions `(grid_t, grid_h, grid_w)` for an image.
@@ -257,7 +212,7 @@ impl ImagePreProcessor for MiniMaxM3Processor {
 
         for image in images {
             let (w, h) = image.dimensions();
-            let (target_h, target_w) = self.vllm_resize(h as usize, w as usize);
+            let (target_h, target_w) = self.smart_resize(h as usize, w as usize)?;
 
             // Resize to the image's own target size (skip if dimensions match).
             let (tw32, th32) = (target_w as u32, target_h as u32);
@@ -299,8 +254,8 @@ impl ImagePreProcessor for MiniMaxM3Processor {
             ndarray::Array2::from_shape_vec((total_patches, patch_features), all_patches).map_err(
                 |e| {
                     TransformError::ShapeError(format!(
-                        "Failed to create patchified pixel_values [{total_patches}, {patch_features}]: {e}"
-                    ))
+                "Failed to create patchified pixel_values [{total_patches}, {patch_features}]: {e}"
+            ))
                 },
             )?;
 
@@ -319,7 +274,12 @@ impl ImagePreProcessor for MiniMaxM3Processor {
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
-        let (new_height, new_width) = self.vllm_resize(height as usize, width as usize);
+        let (new_height, new_width) = self
+            .smart_resize(height as usize, width as usize)
+            .unwrap_or_else(|_| {
+                let factor = self.get_factor();
+                (factor, factor)
+            });
         let (grid_t, grid_h, grid_w) = self.calculate_grid_thw(new_height, new_width, 1);
         self.calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
@@ -352,8 +312,8 @@ mod tests {
         assert_eq!(p.merge_size(), 2);
         assert_eq!(p.temporal_patch_size(), 2);
         assert_eq!(p.get_factor(), 28); // 14 * 2
-        // No clamp by default — matches the live HF processor (max_size=None).
-        assert_eq!(p.max_size(), None);
+        assert_eq!(p.min_pixels(), DEFAULT_MIN_PIXELS);
+        assert_eq!(p.max_pixels(), DEFAULT_MAX_PIXELS);
     }
 
     #[test]
@@ -371,8 +331,8 @@ mod tests {
     #[test]
     fn test_resize_within_bounds_aligns_up() {
         let p = MiniMaxM3Processor::new();
-        // 100x100 -> ceil to 28 multiples -> 112x112 (no scaling, under 672).
-        let (h, w) = p.vllm_resize(100, 100);
+        // 100x100 -> rounded to 28 multiples -> 112x112.
+        let (h, w) = p.smart_resize(100, 100).unwrap();
         assert_eq!(h, 112);
         assert_eq!(w, 112);
         assert_eq!(h % 28, 0);
@@ -382,7 +342,7 @@ mod tests {
     #[test]
     fn test_resize_exact_max_size() {
         let p = MiniMaxM3Processor::new();
-        let (h, w) = p.vllm_resize(672, 672);
+        let (h, w) = p.smart_resize(672, 672).unwrap();
         assert_eq!((h, w), (672, 672));
         // Sanity: 672x672 -> grid 48x48 -> 576 tokens == config image_seq_length.
         let (t, gh, gw) = p.calculate_grid_thw(h, w, 1);
@@ -390,44 +350,27 @@ mod tests {
     }
 
     #[test]
-    fn test_resize_default_no_clamp() {
-        // Default (max_size=None) matches the live HF processor: dimensions are
-        // only rounded up to the factor, never scaled down. These values were
-        // verified against HF transformers golden output.
+    fn test_resize_scales_down_by_max_pixels() {
         let p = MiniMaxM3Processor::new();
 
         // 500x500 -> 504x504 -> grid 36x36 -> 324 tokens.
-        assert_eq!(p.vllm_resize(500, 500), (504, 504));
-        // 4000x3000 (w x h): ceil-aligned, NOT clamped -> grid 216x286.
-        let (h, w) = p.vllm_resize(3000, 4000);
-        assert_eq!((h, w), (3024, 4004));
+        assert_eq!(p.smart_resize(500, 500).unwrap(), (504, 504));
+        // 4000x3000 (w x h): scaled by max_pixels -> grid 40x54.
+        let (h, w) = p.smart_resize(3000, 4000).unwrap();
+        assert_eq!((h, w), (560, 756));
         let (t, gh, gw) = p.calculate_grid_thw(h, w, 1);
-        assert_eq!((gh, gw), (216, 286));
-        assert_eq!(p.calculate_tokens_from_grid(t, gh, gw), 15444);
-    }
-
-    #[test]
-    fn test_resize_with_clamp_scales_down() {
-        // With an explicit bound, large images are scaled down (the source's
-        // intended `size`-derived behavior).
-        let p = MiniMaxM3Processor::with_config(14, 2, 2, Some((672, 672)));
-        // 800x600 (w x h). ceil -> 812x616, exceeds max_w=672 -> scale down.
-        let (h, w) = p.vllm_resize(600, 800);
-        assert_eq!((h, w), (532, 672));
-        assert!(w <= 672 && h <= 672);
-        assert_eq!(h % 28, 0);
-        assert_eq!(w % 28, 0);
+        assert_eq!((gh, gw), (40, 54));
+        assert_eq!(p.calculate_tokens_from_grid(t, gh, gw), 540);
     }
 
     #[test]
     fn test_calculate_num_tokens() {
         let config = PreProcessorConfig::default();
-        // Default (no clamp): 500x500 -> 324 tokens (verified against HF).
+        // 500x500 -> 324 tokens (verified against HF).
         let p = MiniMaxM3Processor::new();
         assert_eq!(p.calculate_num_tokens(500, 500, &config), 324);
-        // With clamp: 800x600 -> grid 38x48 -> (38*48)/4 = 456.
-        let pc = MiniMaxM3Processor::with_config(14, 2, 2, Some((672, 672)));
-        assert_eq!(pc.calculate_num_tokens(800, 600, &config), 456);
+        // 4000x3000 -> grid 40x54 -> (40*54)/4 = 540.
+        assert_eq!(p.calculate_num_tokens(4000, 3000, &config), 540);
     }
 
     #[test]
@@ -506,7 +449,6 @@ mod tests {
         let p = MiniMaxM3Processor::from_preprocessor_config(&config);
         assert_eq!(p.patch_size(), 14);
         assert_eq!(p.merge_size(), 2);
-        // No clamp by default — matches the live HF processor.
-        assert_eq!(p.max_size(), None);
+        assert_eq!(p.max_pixels(), DEFAULT_MAX_PIXELS);
     }
 }

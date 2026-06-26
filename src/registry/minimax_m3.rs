@@ -125,7 +125,7 @@ mod tests {
         ]);
         let config = json!({ "model_type": "minimax_m3_vl" });
         let metadata = ModelMetadata {
-            model_id: "MiniMaxAI/Minimax-M3-preview",
+            model_id: "MiniMaxAI/MiniMax-M3",
             tokenizer: &tokenizer,
             config: &config,
         };
@@ -143,7 +143,7 @@ mod tests {
         ]);
         let config = json!({ "model_type": "minimax_m3_vl" });
         let metadata = ModelMetadata {
-            model_id: "MiniMaxAI/Minimax-M3-preview",
+            model_id: "MiniMaxAI/MiniMax-M3",
             tokenizer: &tokenizer,
             config: &config,
         };

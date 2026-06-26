@@ -8,7 +8,7 @@
 //! - `llava_pad/` - Expand-to-square mode (liuhaotian/llava-* models, image_aspect_ratio=pad)
 //! - `qwen2_vl/` - Dynamic resolution with smart resize (Qwen/Qwen2-VL-* models)
 //! - `qwen3_vl/` - Dynamic resolution with patch_size=16 and [0.5,0.5,0.5] norm (Qwen/Qwen3-VL-* models)
-//! - `minimax_m3/` - Qwen2-VL patchify with vLLM-style resize (MiniMaxAI/Minimax-M3-* models)
+//! - `minimax_m3/` - Qwen2-VL patchify with MiniMax smart resize (MiniMaxAI/MiniMax-M3 models)
 //!
 //! To regenerate golden outputs:
 //! ```bash
@@ -634,17 +634,15 @@ fn test_qwen3_vl_golden_grayscale() {
 /// 3. Pixel values match after patchification
 ///
 /// MiniMax-M3 shares Qwen2-VL's patchify pipeline (patch_size=14, merge_size=2,
-/// CLIP normalization) but uses vLLM-style resize bounded by `max_size` instead
-/// of Qwen's min/max-pixel smart resize.
+/// CLIP normalization) with MiniMax's max-pixel smart resize setting.
 fn run_minimax_m3_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/minimax_m3");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/minimax_m3");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for minimax_m3/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model minimax_m3"
+        skip_missing_fixture(
+            format!("Golden test fixtures for minimax_m3/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model minimax_m3",
         );
         return;
     }

@@ -73,9 +73,9 @@ MODELS = {
         "description": "Dynamic resolution with CLIP normalization and bicubic resize",
     },
     "minimax_m3": {
-        "model_id": "MiniMaxAI/Minimax-M3-preview",
+        "model_id": "MiniMaxAI/MiniMax-M3",
         "processor_class": "MiniMaxM3VLImageProcessor",
-        "description": "Qwen2-VL patchify with vLLM-style resize (max_size bound), CLIP normalization",
+        "description": "Qwen2-VL patchify with MiniMax smart resize, CLIP normalization",
     },
 }
 
@@ -615,12 +615,10 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
 def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
     """Generate golden output for MiniMax-M3 VL.
 
-    MiniMax-M3 is "Qwen2VLImageProcessorFast with resize changed to vLLM style":
-    the patchify pipeline is identical to Qwen2-VL, but instead of smart-resize
-    (a min/max pixel budget) it uses ``get_hw_multiple_of``:
-    1. Round each dimension up to a multiple of (patch_size * merge_size)
-    2. If a dimension exceeds max_size (width, height), scale down preserving
-       aspect ratio, then re-align (round up) to the factor
+    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
+    defaults:
+    1. Smart resize to fit within min/max pixel bounds
+    2. Align dimensions to (patch_size * merge_size) boundary
     3. Normalize with CLIP mean/std
     4. Returns image_grid_thw for position encoding
 
@@ -628,15 +626,17 @@ def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
     - patch_size: 14
     - merge_size: 2
     - temporal_patch_size: 2
-    - max_size: (672, 672)  (inferred from size = {height: 672, width: 672})
+    - min_pixels: 4 * 28 * 28 = 3,136
+    - max_pixels: 672 * 672 = 451,584
     """
     from transformers import AutoImageProcessor
 
     # The image processor is registered under AutoImageProcessor in the model's
     # auto_map; instantiate it directly to avoid the tokenizer dependency of the
-    # full AutoProcessor. Set MINIMAX_M3_MODEL_PATH to load from a local snapshot
-    # (e.g. for offline generation).
-    img_processor = AutoImageProcessor.from_pretrained("MiniMaxAI/Minimax-M3-preview", trust_remote_code=True)
+    # full AutoProcessor.
+    img_processor = AutoImageProcessor.from_pretrained(
+        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
+    )
     image = Image.open(image_path).convert("RGB")
     original_size = image.size
 
@@ -678,7 +678,8 @@ def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
         "patch_size": patch_size,
         "merge_size": merge_size,
         "temporal_patch_size": temporal_patch_size,
-        "max_size": getattr(img_processor, "max_size", None),
+        "min_pixels": getattr(img_processor, "min_pixels", None),
+        "max_pixels": getattr(img_processor, "max_pixels", None),
     }
 
     return result

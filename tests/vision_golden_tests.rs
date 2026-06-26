@@ -11,7 +11,7 @@
 //!
 //! To regenerate golden outputs:
 //! ```bash
-//! python crates/multimodal/scripts/generate_vision_golden.py
+//! python scripts/generate_vision_golden.py
 //! ```
 
 #![expect(
@@ -122,19 +122,28 @@ fn load_golden_num_tokens(path: &Path) -> usize {
     data[0] as usize
 }
 
+fn skip_missing_fixture(message: String, command: &str) {
+    if std::env::var_os("LLM_MULTIMODAL_REQUIRE_GOLDEN").is_some() {
+        panic!("{message}. Run: {command}");
+    }
+    eprintln!("{message}, skipping test");
+    eprintln!("Run: {command}");
+}
+
 /// Run a golden test for a specific mode and image.
 ///
 /// # Arguments
 /// * `mode` - Either "llava" (standard CLIP) or "llava_pad" (expand-to-square mode)
 /// * `image_name` - Name of the test image (e.g., "square", "tall", "wide", "small")
 fn run_golden_test(mode: &str, image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden").join(mode);
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden").join(mode);
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for {mode}/{image_name} not found, skipping test");
-        eprintln!("Run: python crates/multimodal/scripts/generate_vision_golden.py");
+        skip_missing_fixture(
+            format!("Golden test fixtures for {mode}/{image_name} not found"),
+            "python scripts/generate_vision_golden.py",
+        );
         return;
     }
 
@@ -279,10 +288,13 @@ fn test_llava_pad_golden_grayscale() {
 
 #[test]
 fn test_llava_token_count() {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llava");
+    let golden_dir = Path::new("tests/fixtures/golden/llava");
 
     if !golden_dir.exists() {
-        eprintln!("Golden test fixtures not found, skipping test");
+        skip_missing_fixture(
+            "Golden test fixtures not found".to_string(),
+            "python scripts/generate_vision_golden.py --model llava",
+        );
         return;
     }
 
@@ -326,14 +338,13 @@ fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
 /// 2. num_tokens calculation is correct
 /// 3. Pixel values match after reshaping to patch format
 fn run_qwen2_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen2_vl");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/qwen2_vl");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for qwen2_vl/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen2_vl"
+        skip_missing_fixture(
+            format!("Golden test fixtures for qwen2_vl/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model qwen2_vl",
         );
         return;
     }
@@ -477,14 +488,13 @@ fn test_qwen2_vl_golden_grayscale() {
 /// - factor: 32 (vs 28)
 /// - normalization: [0.5, 0.5, 0.5] (vs CLIP)
 fn run_qwen3_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen3_vl");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/qwen3_vl");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for qwen3_vl/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen3_vl"
+        skip_missing_fixture(
+            format!("Golden test fixtures for qwen3_vl/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model qwen3_vl",
         );
         return;
     }
@@ -739,14 +749,13 @@ fn find_max_diff_location_5d(
 /// 3. num_img_tokens matches HuggingFace output
 /// 4. Pixel values match within tolerance
 fn run_phi3_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi3_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/phi3_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for phi3_vision/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi3_vision"
+        skip_missing_fixture(
+            format!("Golden test fixtures for phi3_vision/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model phi3_vision",
         );
         return;
     }
@@ -942,14 +951,13 @@ fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
 /// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
 /// - Default dynamic_hd: 36 (vs 16)
 fn run_phi4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi4_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/phi4_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for phi4_vision/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi4_vision"
+        skip_missing_fixture(
+            format!("Golden test fixtures for phi4_vision/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model phi4_vision",
         );
         return;
     }
@@ -1148,14 +1156,13 @@ fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
 /// - Normalization: [0.5, 0.5, 0.5] mean/std
 /// - Global tile added when num_tiles > 1
 fn run_llama4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llama4_vision");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/llama4_vision");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for llama4_vision/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model llama4_vision"
+        skip_missing_fixture(
+            format!("Golden test fixtures for llama4_vision/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model llama4_vision",
         );
         return;
     }
@@ -1333,14 +1340,13 @@ fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
 /// - Normalization: CLIP mean/std
 /// - No tiling - single output per image
 fn run_pixtral_golden_test(image_name: &str) {
-    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/pixtral");
-    let image_path =
-        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("tests/fixtures/golden/pixtral");
+    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        eprintln!("Golden test fixtures for pixtral/{image_name} not found, skipping test");
-        eprintln!(
-            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model pixtral"
+        skip_missing_fixture(
+            format!("Golden test fixtures for pixtral/{image_name} not found"),
+            "python scripts/generate_vision_golden.py --model pixtral",
         );
         return;
     }

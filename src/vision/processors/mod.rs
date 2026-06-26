@@ -14,10 +14,12 @@
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
+//! - **MiniMax-M3** (`minimax_m3`): Qwen2-VL patchify with MiniMax smart resize
 
 pub mod kimi_k25;
 pub mod llama4_vision;
 pub mod llava;
+pub mod minimax_m3;
 pub mod phi3_vision;
 pub mod phi4_vision;
 pub mod pixtral;
@@ -28,6 +30,7 @@ pub mod qwen_vl_base;
 pub use kimi_k25::KimiK25Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
+pub use minimax_m3::MiniMaxM3Processor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

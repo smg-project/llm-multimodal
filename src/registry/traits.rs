@@ -37,6 +37,11 @@ pub trait TokenResolver: Send + Sync {
 
     /// Return the token string for a token ID, if the tokenizer knows it.
     fn id_to_token(&self, id: u32) -> Option<String>;
+
+    /// Encode plain text into token IDs when the caller can provide tokenizer-backed encoding.
+    fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+        None
+    }
 }
 
 /// Metadata about the current model used to derive tokenizer/config dependent fields.

@@ -7,8 +7,36 @@ use std::collections::HashMap;
 
 use image::imageops::FilterType;
 use serde::{Deserialize, Deserializer};
+use serde_with::{serde_as, TryFromInto};
 
 use super::transforms;
+
+/// Deserialization shape for HF size fields.
+///
+/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
+/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum SizeRepr {
+    Map(HashMap<String, u32>),
+    Array([u32; 2]),
+}
+
+impl TryFrom<SizeRepr> for HashMap<String, u32> {
+    type Error = &'static str;
+
+    fn try_from(value: SizeRepr) -> Result<Self, Self::Error> {
+        match value {
+            SizeRepr::Map(size) => Ok(size),
+            SizeRepr::Array([height, width]) => {
+                let mut size = HashMap::new();
+                size.insert("height".to_string(), height);
+                size.insert("width".to_string(), width);
+                Ok(size)
+            }
+        }
+    }
+}
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -101,6 +129,7 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
+#[serde_as]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
@@ -148,11 +177,13 @@ pub struct PreProcessorConfig {
     pub resampling: Option<usize>,
 
     /// Target size for resizing
-    /// Can be {"height": H, "width": W} or {"shortest_edge": S}
+    /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
+    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
     #[serde(default)]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
+    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
     #[serde(default)]
     pub crop_size: Option<HashMap<String, u32>>,
 
@@ -492,6 +523,11 @@ mod tests {
         let json2 = r#"{"size": {"shortest_edge": 224}}"#;
         let config2 = PreProcessorConfig::from_json(json2).unwrap();
         assert_eq!(config2.get_target_size(), Some((224, 224)));
+
+        // Array format [height, width] (e.g. MiniMax M3)
+        let json3 = r#"{"size": [672, 672]}"#;
+        let config3 = PreProcessorConfig::from_json(json3).unwrap();
+        assert_eq!(config3.get_target_size(), Some((672, 672)));
     }
 
     #[test]

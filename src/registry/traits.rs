@@ -25,31 +25,29 @@ pub enum ModelRegistryError {
 
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
-/// Resolves token strings and token IDs used by model-specific multimodal specs.
+/// Minimal tokenizer surface used by model-specific multimodal specs.
 ///
 /// The multimodal crate only needs this narrow lookup surface to translate
 /// placeholder tokens declared by chat templates or model configs. Callers can
-/// adapt any tokenizer implementation to this trait without depending on a
-/// particular tokenizer crate.
-pub trait TokenResolver: Send + Sync {
+/// adapt their tokenizer implementation to this local trait without depending
+/// on a particular tokenizer crate.
+pub trait Tokenizer: Send + Sync {
     /// Return the token ID for a token string, if the tokenizer knows it.
     fn token_to_id(&self, token: &str) -> Option<u32>;
 
     /// Return the token string for a token ID, if the tokenizer knows it.
     fn id_to_token(&self, id: u32) -> Option<String>;
 
-    /// Encode plain text into token IDs when the caller can provide tokenizer-backed encoding.
-    fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
-        None
-    }
+    /// Encode plain text into token IDs.
+    fn encode_text(&self, text: &str) -> Option<Vec<u32>>;
 }
 
 /// Metadata about the current model used to derive tokenizer/config dependent fields.
 pub struct ModelMetadata<'a> {
     /// Model identifier used for family matching.
     pub model_id: &'a str,
-    /// Token resolver used for multimodal placeholder and structural token IDs.
-    pub tokenizer: &'a dyn TokenResolver,
+    /// Tokenizer used for multimodal placeholder and structural token IDs.
+    pub tokenizer: &'a dyn Tokenizer,
     /// Model `config.json` content used for architecture-specific fields.
     pub config: &'a Value,
 }

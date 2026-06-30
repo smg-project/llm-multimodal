@@ -17,7 +17,7 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, TokenResolver,
+    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, Tokenizer,
 };
 
 pub struct ModelRegistry {
@@ -80,7 +80,7 @@ pub(super) mod test_helpers {
     use std::collections::HashMap;
 
     use crate::{
-        registry::TokenResolver,
+        registry::Tokenizer,
         types::ImageSize,
         vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs},
     };
@@ -99,7 +99,7 @@ pub(super) mod test_helpers {
         }
     }
 
-    impl TokenResolver for TestTokenizer {
+    impl Tokenizer for TestTokenizer {
         fn token_to_id(&self, token: &str) -> Option<u32> {
             self.vocab.get(token).copied()
         }
@@ -109,6 +109,10 @@ pub(super) mod test_helpers {
                 .iter()
                 .find(|(_, &v)| v == id)
                 .map(|(k, _)| k.clone())
+        }
+
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            Some(Vec::new())
         }
     }
 

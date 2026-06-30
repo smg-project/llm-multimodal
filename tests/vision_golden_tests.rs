@@ -32,8 +32,8 @@
 use std::{fs::File, io::Read, path::Path};
 
 use llm_multimodal::vision::{
-    MiniMaxM3Processor, Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor,
-    Llama4VisionProcessor, LlavaProcessor, ModelSpecificValue, PreProcessorConfig,
+    Llama4VisionProcessor, LlavaProcessor, MiniMaxM3Processor, ModelSpecificValue,
+    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig,
     Qwen2VLProcessor, Qwen3VLProcessor, VisionPreProcessor,
 };
 use ndarray::{Array4, Array5};

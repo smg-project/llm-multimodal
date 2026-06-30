@@ -471,11 +471,11 @@ mod tests {
     fn test_calculate_num_tokens_honors_config_max_pixels() {
         let processor = Qwen2VLProcessor::new();
 
-        // A 1400x1400 image clamps to max_pixels before the grid is computed,
-        // so a lower config max_pixels must yield fewer tokens.
+        // A 1400x1400 image fits below the default max_pixels, while a lower
+        // config max_pixels must still yield fewer tokens.
         let default_tokens =
             processor.calculate_num_tokens(1400, 1400, &PreProcessorConfig::default());
-        assert_eq!(default_tokens, 1225); // resized to 980x980 -> (70*70)/4
+        assert_eq!(default_tokens, 2500); // 1400x1400 -> (100*100)/4
 
         let config = PreProcessorConfig {
             max_pixels: Some(512 * 28 * 28), // 401,408, below the 1,003,520 default

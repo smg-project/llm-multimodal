@@ -48,6 +48,6 @@ pub use processor::{
 pub use processors::{
     Llama4VisionProcessor, LlavaNextProcessor, LlavaProcessor, MiniMaxM3Processor,
     Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
-    Qwen3OmniVisionProcessor, Qwen3VLProcessor,
+    Qwen3OmniVisionProcessor, Qwen3VLProcessor, TmlImageProcessor,
 };
 pub use transforms::TransformError;

@@ -21,7 +21,10 @@ impl ModelProcessorSpec for TmlVisionSpec {
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
-        id.contains("tml") || metadata.config_model_type().is_some_and(|mt| mt == "tml")
+        id.contains("tml")
+            || metadata
+                .config_model_type()
+                .is_some_and(|mt| mt == "tml" || mt == "tml_mm_model")
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -87,6 +90,22 @@ mod tests {
         let config = json!({"model_type": "tml"});
         let metadata = ModelMetadata {
             model_id: "test-model",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+
+        let registry = ModelRegistry::new();
+        let spec = registry.lookup(&metadata).expect("tml spec");
+
+        assert_eq!(spec.name(), "tml");
+    }
+
+    #[test]
+    fn tml_matches_mm_model_type() {
+        let tokenizer = TestTokenizer::new(&[(super::IMAGE_MARKER_TOKEN, 200005)]);
+        let config = json!({"model_type": "tml_mm_model"});
+        let metadata = ModelMetadata {
+            model_id: "thinkingmachineslabinc/tml-model-share",
             tokenizer: &tokenizer,
             config: &config,
         };

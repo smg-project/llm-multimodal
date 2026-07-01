@@ -55,9 +55,8 @@ impl ModelProcessorSpec for TmlVisionSpec {
             .feature_token_counts
             .iter()
             .map(|&num_tokens| {
-                let mut tokens = Vec::with_capacity(num_tokens + 1);
-                tokens.push(IMAGE_MARKER_ID);
-                tokens.extend(std::iter::repeat(IMAGE_TOKEN_ID).take(num_tokens));
+                let mut tokens = vec![IMAGE_TOKEN_ID; num_tokens + 1];
+                tokens[0] = IMAGE_MARKER_ID;
                 PromptReplacement::sequence(Modality::Image, IMAGE_MARKER_TOKEN, tokens)
             })
             .collect())

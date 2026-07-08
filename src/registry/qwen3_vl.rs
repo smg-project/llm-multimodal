@@ -54,14 +54,6 @@ impl Qwen3VLVisionSpec {
             })
     }
 
-    fn is_qwen3_5(metadata: &ModelMetadata) -> bool {
-        let id = metadata.model_id.to_ascii_lowercase();
-        let model_type = metadata.config_model_type();
-        id.contains("qwen3.5")
-            || id.contains("qwen3.6")
-            || model_type.is_some_and(|mt| mt == "qwen3_5" || mt == "qwen3_5_moe")
-    }
-
     fn video_grid_t(preprocessed: &PreprocessedEncoderInputs) -> Option<usize> {
         match preprocessed.model_specific.get("video_grid_thw") {
             Some(ModelSpecificValue::IntTensor { data, shape })
@@ -81,7 +73,7 @@ impl Qwen3VLVisionSpec {
             .unwrap_or_default()
     }
 
-    fn qwen3_5_video_replacement_tokens(
+    fn qwen3_video_replacement_tokens(
         metadata: &ModelMetadata,
         pad_token_id: TokenId,
         num_tokens: usize,
@@ -93,7 +85,7 @@ impl Qwen3VLVisionSpec {
         let vision_start = Self::vision_start_token_id(metadata)?;
         let vision_end = Self::vision_end_token_id(metadata)?;
         let tokens_per_grid = num_tokens / grid_t;
-        let mut tokens = Vec::with_capacity(num_tokens + (grid_t.saturating_sub(1)) * 8);
+        let mut tokens = Vec::with_capacity(num_tokens + grid_t * 8);
         let temporal_patch_size = metadata
             .config_u32(&["vision_config", "temporal_patch_size"])
             .unwrap_or(2) as f64;
@@ -106,17 +98,13 @@ impl Qwen3VLVisionSpec {
             let seconds = (grid_idx as f64 * temporal_patch_size
                 + (temporal_patch_size - 1.0) / 2.0)
                 / sample_fps;
-            if grid_idx > 0 {
-                tokens.push(vision_end);
-            }
             tokens.extend(Self::encode_plain_text(
                 metadata,
                 &format!("<{seconds:.1} seconds>"),
             ));
-            if grid_idx > 0 {
-                tokens.push(vision_start);
-            }
+            tokens.push(vision_start);
             tokens.extend(std::iter::repeat_n(pad_token_id, tokens_per_grid));
+            tokens.push(vision_end);
         }
 
         Some(tokens)
@@ -235,20 +223,16 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
                     .feature_token_counts
                     .iter()
                     .map(|&num_tokens| {
-                        let tokens = if Self::is_qwen3_5(metadata) {
-                            video_grid_t
-                                .and_then(|grid_t| {
-                                    Self::qwen3_5_video_replacement_tokens(
-                                        metadata,
-                                        pad_token_id,
-                                        num_tokens,
-                                        grid_t,
-                                    )
-                                })
-                                .unwrap_or_else(|| vec![pad_token_id; num_tokens])
-                        } else {
-                            vec![pad_token_id; num_tokens]
-                        };
+                        let tokens = video_grid_t
+                            .and_then(|grid_t| {
+                                Self::qwen3_video_replacement_tokens(
+                                    metadata,
+                                    pad_token_id,
+                                    num_tokens,
+                                    grid_t,
+                                )
+                            })
+                            .unwrap_or_else(|| vec![pad_token_id; num_tokens]);
                         PromptReplacement::sequence(Modality::Video, &placeholder_token, tokens)
                     })
                     .collect())
@@ -351,7 +335,7 @@ mod tests {
     }
 
     #[test]
-    fn qwen3_5_video_replacement_splits_temporal_grid() {
+    fn qwen3_video_replacement_splits_temporal_grid() {
         let tokenizer = TestTokenizer::new(&[
             ("<|video_pad|>", 151656),
             ("<|vision_start|>", 151652),
@@ -381,11 +365,21 @@ mod tests {
             .unwrap();
 
         let tokens = &replacements[0].tokens;
-        assert_eq!(tokens.len(), 162);
-        assert!(tokens[..80].iter().all(|&token| token == 151656));
-        assert_eq!(tokens[80], 151653);
-        assert_eq!(tokens[81], 151652);
-        assert!(tokens[82..].iter().all(|&token| token == 151656));
+        assert_eq!(tokens.len(), 164);
+        assert_eq!(tokens.iter().filter(|&&token| token == 151652).count(), 2);
+        assert_eq!(tokens.iter().filter(|&&token| token == 151653).count(), 2);
+
+        let first_start = tokens.iter().position(|&token| token == 151652).unwrap();
+        let first_end = tokens.iter().position(|&token| token == 151653).unwrap();
+        assert!(tokens[first_start + 1..first_end]
+            .iter()
+            .all(|&token| token == 151656));
+
+        let second_start = tokens.iter().rposition(|&token| token == 151652).unwrap();
+        let second_end = tokens.iter().rposition(|&token| token == 151653).unwrap();
+        assert!(tokens[second_start + 1..second_end]
+            .iter()
+            .all(|&token| token == 151656));
     }
 
     #[test]

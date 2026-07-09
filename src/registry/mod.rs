@@ -1,3 +1,4 @@
+mod inkling;
 mod kimi_k25;
 mod llama4;
 mod llava;
@@ -7,9 +8,9 @@ mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
-mod tml;
 mod traits;
 
+use inkling::InklingVisionSpec;
 use kimi_k25::KimiK25VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
@@ -20,7 +21,6 @@ use qwen3_asr::Qwen3AsrSpec;
 use qwen3_omni::Qwen3OmniSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
-use tml::TmlVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
     ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, Tokenizer,
@@ -46,7 +46,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
                 LazySpec::new(|| Box::new(QwenVLVisionSpec)),
                 LazySpec::new(|| Box::new(Phi3VisionSpec)),
-                LazySpec::new(|| Box::new(TmlVisionSpec)),
+                LazySpec::new(|| Box::new(InklingVisionSpec)),
             ],
         }
     }

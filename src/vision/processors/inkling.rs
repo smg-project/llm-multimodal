@@ -1,6 +1,6 @@
-//! TML Titan image processor.
+//! Inkling image processor.
 //!
-//! Matches the vendored vLLM `TmlImageProcessor` image path. Each image is
+//! Matches the vendored vLLM `InklingImageProcessor` image path. Each image is
 //! split into normalized NHWC patches with one extra patch column, then each
 //! patch is duplicated along the temporal axis to produce
 //! `vision_patches_bthwc` shaped `[num_patches, 2, patch, patch, 3]`.
@@ -14,24 +14,24 @@ use crate::vision::{
     transforms::{self, TransformError},
 };
 
-pub const TML_IMAGE_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-pub const TML_IMAGE_STD: [f64; 3] = [0.26862954, 0.2613026, 0.2757771];
+pub const INKLING_IMAGE_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub const INKLING_IMAGE_STD: [f64; 3] = [0.26862954, 0.2613026, 0.2757771];
 pub const DEFAULT_PATCH_SIZE: usize = 40;
 
 const PAD_RAW_VALUE: f32 = -1.0 / 255.0;
 
 #[derive(Debug, Clone)]
-pub struct TmlImageProcessor {
+pub struct InklingImageProcessor {
     patch_size: usize,
 }
 
-impl Default for TmlImageProcessor {
+impl Default for InklingImageProcessor {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl TmlImageProcessor {
+impl InklingImageProcessor {
     pub fn new() -> Self {
         Self {
             patch_size: DEFAULT_PATCH_SIZE,
@@ -118,13 +118,13 @@ impl TmlImageProcessor {
     }
 }
 
-impl VisionPreProcessor for TmlImageProcessor {
+impl VisionPreProcessor for InklingImageProcessor {
     fn default_mean(&self) -> [f64; 3] {
-        TML_IMAGE_MEAN
+        INKLING_IMAGE_MEAN
     }
 
     fn default_std(&self) -> [f64; 3] {
-        TML_IMAGE_STD
+        INKLING_IMAGE_STD
     }
 
     fn preprocess(
@@ -137,8 +137,8 @@ impl VisionPreProcessor for TmlImageProcessor {
         }
 
         let processor = self.with_preprocessor_config(config);
-        let mean = config.image_mean_3().unwrap_or(TML_IMAGE_MEAN);
-        let std = config.image_std_3().unwrap_or(TML_IMAGE_STD);
+        let mean = config.image_mean_3().unwrap_or(INKLING_IMAGE_MEAN);
+        let std = config.image_std_3().unwrap_or(INKLING_IMAGE_STD);
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
 
         let mut patches = Vec::new();
@@ -166,7 +166,7 @@ impl VisionPreProcessor for TmlImageProcessor {
             .collect::<Vec<_>>();
 
         Ok(
-            PreprocessedEncoderInputs::new_dynamic(encoder_input, num_patches, item_sizes)
+            PreprocessedEncoderInputs::new(encoder_input, num_patches, item_sizes)
                 .with_extra(
                     "vision_patches_bthwc",
                     ModelSpecificValue::Tensor {
@@ -187,7 +187,7 @@ impl VisionPreProcessor for TmlImageProcessor {
     }
 
     fn model_name(&self) -> &'static str {
-        "tml"
+        "inkling"
     }
 
     fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
@@ -195,12 +195,12 @@ impl VisionPreProcessor for TmlImageProcessor {
     }
 }
 
-trait TmlConfigExt {
+trait InklingConfigExt {
     fn image_mean_3(&self) -> Option<[f64; 3]>;
     fn image_std_3(&self) -> Option<[f64; 3]>;
 }
 
-impl TmlConfigExt for PreProcessorConfig {
+impl InklingConfigExt for PreProcessorConfig {
     fn image_mean_3(&self) -> Option<[f64; 3]> {
         self.image_mean.as_deref().and_then(slice_to_three)
     }
@@ -229,8 +229,8 @@ mod tests {
     }
 
     #[test]
-    fn preprocess_outputs_tml_patch_shape() {
-        let processor = TmlImageProcessor::new();
+    fn preprocess_outputs_inkling_patch_shape() {
+        let processor = InklingImageProcessor::new();
         let result = processor
             .preprocess(
                 &[image(80, 40, Rgb([128, 128, 128]))],
@@ -252,7 +252,7 @@ mod tests {
 
     #[test]
     fn preprocess_multiple_images_are_flattened_by_patch_count() {
-        let processor = TmlImageProcessor::new();
+        let processor = InklingImageProcessor::new();
         let result = processor
             .preprocess(
                 &[
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn patch_size_can_come_from_preprocessor_config() {
-        let processor = TmlImageProcessor::new();
+        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(20),
@@ -286,8 +286,8 @@ mod tests {
     }
 
     #[test]
-    fn padding_uses_tml_raw_pad_value_before_normalization() {
-        let processor = TmlImageProcessor::new();
+    fn padding_uses_inkling_raw_pad_value_before_normalization() {
+        let processor = InklingImageProcessor::new();
         let result = processor
             .preprocess(
                 &[image(1, 1, Rgb([255, 255, 255]))],
@@ -295,11 +295,12 @@ mod tests {
             )
             .unwrap();
         let flat = result.encoder_input_flat();
-        let pad = TmlImageProcessor::normalized_padding(&TML_IMAGE_MEAN, &TML_IMAGE_STD);
+        let pad =
+            InklingImageProcessor::normalized_padding(&INKLING_IMAGE_MEAN, &INKLING_IMAGE_STD);
 
         assert!(flat.iter().any(|&v| (v - pad[0]).abs() < 1e-6));
-        assert!(flat.iter().any(|&v| (v - 1.0 / TML_IMAGE_STD[0] as f32
-            + TML_IMAGE_MEAN[0] as f32 / TML_IMAGE_STD[0] as f32)
+        assert!(flat.iter().any(|&v| (v - 1.0 / INKLING_IMAGE_STD[0] as f32
+            + INKLING_IMAGE_MEAN[0] as f32 / INKLING_IMAGE_STD[0] as f32)
             .abs()
             < 1e-6));
     }

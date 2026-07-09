@@ -12,19 +12,17 @@ const IMAGE_MARKER_TOKEN: &str = "<|content_image|>";
 const IMAGE_MARKER_ID: TokenId = 200005;
 const IMAGE_TOKEN_ID: TokenId = 200007;
 
-pub(super) struct TmlVisionSpec;
+pub(super) struct InklingVisionSpec;
 
-impl ModelProcessorSpec for TmlVisionSpec {
+impl ModelProcessorSpec for InklingVisionSpec {
     fn name(&self) -> &'static str {
-        "tml"
+        "inkling"
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        let id = metadata.model_id.to_ascii_lowercase();
-        id.contains("tml")
-            || metadata
-                .config_model_type()
-                .is_some_and(|mt| mt == "tml" || mt == "tml_mm_model")
+        metadata
+            .config_model_type()
+            .is_some_and(|mt| mt == "inkling_mm_model")
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -84,9 +82,9 @@ mod tests {
     };
 
     #[test]
-    fn tml_matches_model_type() {
+    fn inkling_matches_model_type() {
         let tokenizer = TestTokenizer::new(&[(super::IMAGE_MARKER_TOKEN, 200005)]);
-        let config = json!({"model_type": "tml"});
+        let config = json!({"model_type": "inkling_mm_model"});
         let metadata = ModelMetadata {
             model_id: "test-model",
             tokenizer: &tokenizer,
@@ -94,38 +92,36 @@ mod tests {
         };
 
         let registry = ModelRegistry::new();
-        let spec = registry.lookup(&metadata).expect("tml spec");
+        let spec = registry.lookup(&metadata).expect("inkling spec");
 
-        assert_eq!(spec.name(), "tml");
+        assert_eq!(spec.name(), "inkling");
     }
 
     #[test]
-    fn tml_matches_mm_model_type() {
+    fn inkling_does_not_match_model_id_without_model_type() {
         let tokenizer = TestTokenizer::new(&[(super::IMAGE_MARKER_TOKEN, 200005)]);
-        let config = json!({"model_type": "tml_mm_model"});
+        let config = json!({"model_type": "unknown"});
         let metadata = ModelMetadata {
-            model_id: "thinkingmachineslabinc/tml-model-share",
+            model_id: "example/model-share",
             tokenizer: &tokenizer,
             config: &config,
         };
 
         let registry = ModelRegistry::new();
-        let spec = registry.lookup(&metadata).expect("tml spec");
-
-        assert_eq!(spec.name(), "tml");
+        assert!(registry.lookup(&metadata).is_none());
     }
 
     #[test]
-    fn tml_prompt_replacement_keeps_marker_and_flags_placeholders() {
+    fn inkling_prompt_replacement_keeps_marker_and_flags_placeholders() {
         let tokenizer = TestTokenizer::new(&[(super::IMAGE_MARKER_TOKEN, 200005)]);
-        let config = json!({"model_type": "tml"});
+        let config = json!({"model_type": "inkling_mm_model"});
         let metadata = ModelMetadata {
             model_id: "test-model",
             tokenizer: &tokenizer,
             config: &config,
         };
         let registry = ModelRegistry::new();
-        let spec = registry.lookup(&metadata).expect("tml spec");
+        let spec = registry.lookup(&metadata).expect("inkling spec");
 
         let replacements = spec
             .prompt_replacements(

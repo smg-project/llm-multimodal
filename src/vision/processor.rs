@@ -330,8 +330,11 @@ impl VisionProcessorRegistry {
             Box::new(super::processors::KimiK25Processor::new()),
         );
 
-        // Register TML Titan Vision
-        registry.register("tml", Box::new(super::processors::TmlImageProcessor::new()));
+        // Register Inkling vision.
+        registry.register(
+            "inkling_mm_model",
+            Box::new(super::processors::InklingImageProcessor::new()),
+        );
 
         // Register MiniMax-M3 VL
         registry.register(

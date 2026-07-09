@@ -18,6 +18,7 @@
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **MiniMax-M3** (`minimax_m3`): Qwen2-VL patchify with MiniMax smart resize
 
+pub mod inkling;
 pub mod kimi_k25;
 pub mod llama4_vision;
 pub mod llava;
@@ -29,8 +30,8 @@ pub mod qwen2_vl;
 pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
-pub mod tml;
 
+pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
@@ -41,4 +42,3 @@ pub use pixtral::PixtralProcessor;
 pub use qwen2_vl::Qwen2VLProcessor;
 pub use qwen3_omni_vision::Qwen3OmniVisionProcessor;
 pub use qwen3_vl::Qwen3VLProcessor;
-pub use tml::TmlImageProcessor;

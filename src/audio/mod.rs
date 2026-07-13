@@ -7,4 +7,7 @@ pub(crate) mod transforms;
 
 pub use decode::{decode_audio_mono_f32, DecodedAudio};
 pub use processor::AudioPreProcessor;
-pub use processors::{Qwen3AudioParams, Qwen3AudioProcessor};
+pub use processors::{
+    InklingAudioParams, InklingAudioProcessor, Qwen3AudioParams, Qwen3AudioProcessor,
+    MAX_AUDIO_TOKENS,
+};

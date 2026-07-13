@@ -10,7 +10,7 @@ mod qwen3_vl;
 mod qwen_vl;
 mod traits;
 
-use inkling::InklingVisionSpec;
+use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
@@ -46,7 +46,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
                 LazySpec::new(|| Box::new(QwenVLVisionSpec)),
                 LazySpec::new(|| Box::new(Phi3VisionSpec)),
-                LazySpec::new(|| Box::new(InklingVisionSpec)),
+                LazySpec::new(|| Box::new(InklingSpec)),
             ],
         }
     }

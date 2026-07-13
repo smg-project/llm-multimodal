@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Maximum number of dMel frames accepted for one clip (~10 minutes at 20 Hz).
-pub const MAX_AUDIO_TOKENS: usize = 12_000;
+const MAX_AUDIO_TOKENS: usize = 12_000;
 
 /// Parameters used to convert decoded audio into Inkling dMel bins.
 #[derive(Debug, Clone, PartialEq)]

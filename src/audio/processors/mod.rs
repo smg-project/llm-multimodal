@@ -3,5 +3,5 @@
 mod inkling;
 mod qwen3_audio;
 
-pub use inkling::{InklingAudioParams, InklingAudioProcessor, MAX_AUDIO_TOKENS};
+pub use inkling::{InklingAudioParams, InklingAudioProcessor};
 pub use qwen3_audio::{Qwen3AudioParams, Qwen3AudioProcessor};

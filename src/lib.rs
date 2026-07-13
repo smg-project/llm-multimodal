@@ -13,7 +13,7 @@ pub mod tracker;
 pub mod types;
 pub mod vision;
 
-pub use audio::{AudioPreProcessor, InklingAudioParams, InklingAudioProcessor};
+pub use audio::AudioPreProcessor;
 pub use encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, TransformError};
 pub use media::{

@@ -151,6 +151,14 @@ impl InklingAudioProcessor {
         &self,
         clips: Vec<DecodedAudio>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let clips = clips.iter().collect::<Vec<_>>();
+        self.preprocess_decoded_clip_refs(&clips)
+    }
+
+    fn preprocess_decoded_clip_refs(
+        &self,
+        clips: &[&DecodedAudio],
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.params.validate()?;
         if clips.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -161,16 +169,37 @@ impl InklingAudioProcessor {
         let mut token_counts = Vec::with_capacity(clips.len());
         let mut item_sizes = Vec::with_capacity(clips.len());
 
-        for (index, clip) in clips.into_iter().enumerate() {
+        for (index, clip) in clips.iter().copied().enumerate() {
+            if clip.sample_rate == 0 {
+                return Err(shape_error("decoded audio sample rate must be positive"));
+            }
+            if clip.samples.iter().any(|sample| !sample.is_finite()) {
+                return Err(shape_error("decoded audio contains a non-finite sample"));
+            }
+            let predicted_num_frames = resampled_frame_count(
+                clip.samples.len(),
+                clip.sample_rate,
+                self.params.sample_rate,
+                hop_length,
+            )?;
+            validate_audio_token_limit(index, predicted_num_frames)?;
+
+            let resampled;
             let samples = if clip.sample_rate == self.params.sample_rate {
-                clip.samples
+                clip.samples.as_slice()
             } else {
-                bandlimited_resample(&clip.samples, clip.sample_rate, self.params.sample_rate)?
+                resampled = bandlimited_resample(
+                    clip.samples.as_slice(),
+                    clip.sample_rate,
+                    self.params.sample_rate,
+                )?;
+                resampled.as_slice()
             };
             let num_frames = frame_count(samples.len(), hop_length);
+            debug_assert_eq!(num_frames, predicted_num_frames);
             validate_audio_token_limit(index, num_frames)?;
 
-            let dmel = dmel_bins(&samples, &self.params)?;
+            let dmel = dmel_bins(samples, &self.params)?;
             debug_assert_eq!(dmel.num_frames, num_frames);
             all_bins.extend(dmel.bins);
             token_counts.push(num_frames);
@@ -212,7 +241,8 @@ impl AudioPreProcessor for InklingAudioProcessor {
         &self,
         clips: &[Arc<AudioClip>],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_decoded_clips(clips.iter().map(|clip| clip.decoded().clone()).collect())
+        let decoded = clips.iter().map(|clip| clip.decoded()).collect::<Vec<_>>();
+        self.preprocess_decoded_clip_refs(&decoded)
     }
 }
 
@@ -297,6 +327,25 @@ fn dmel_bins(audio: &[f32], params: &InklingAudioParams) -> Result<DmelBins, Tra
 
 fn frame_count(sample_count: usize, hop_length: usize) -> usize {
     sample_count.div_ceil(hop_length)
+}
+
+fn resampled_frame_count(
+    sample_count: usize,
+    source_sample_rate: usize,
+    target_sample_rate: usize,
+    hop_length: usize,
+) -> Result<usize, TransformError> {
+    if source_sample_rate == 0 || target_sample_rate == 0 {
+        return Err(shape_error("audio resampling rates must be positive"));
+    }
+
+    let target_samples = (sample_count as u128)
+        .checked_mul(target_sample_rate as u128)
+        .ok_or_else(|| shape_error("resampled audio length overflow"))?
+        .div_ceil(source_sample_rate as u128);
+    let target_samples = usize::try_from(target_samples)
+        .map_err(|_| shape_error("resampled audio length exceeds usize"))?;
+    Ok(frame_count(target_samples, hop_length))
 }
 
 fn validate_audio_token_limit(clip_index: usize, num_frames: usize) -> Result<(), TransformError> {
@@ -442,6 +491,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_clip_before_resampling() {
+        let error = InklingAudioProcessor::new()
+            .preprocess_decoded_clips(vec![decoded(601, 1)])
+            .unwrap_err();
+
+        assert!(error.to_string().contains("12020 tokens"));
+        assert!(error.to_string().contains("12000"));
+    }
+
+    #[test]
+    fn rejects_non_finite_samples() {
+        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let error = InklingAudioProcessor::new()
+                .preprocess_decoded_clips(vec![DecodedAudio {
+                    samples: vec![sample],
+                    sample_rate: 16_000,
+                }])
+                .unwrap_err();
+            assert!(error.to_string().contains("non-finite sample"));
+        }
+    }
+
+    #[test]
+    fn rejects_zero_sample_rate() {
+        let error = InklingAudioProcessor::new()
+            .preprocess_decoded_clips(vec![decoded(1, 0)])
+            .unwrap_err();
+        assert!(error.to_string().contains("sample rate must be positive"));
+    }
+
+    #[test]
     fn reads_nested_audio_config() {
         let processor = InklingAudioProcessor::from_configs(
             &serde_json::json!({
@@ -484,6 +564,7 @@ mod tests {
     struct ParitySynth {
         seed: u32,
         num_samples: usize,
+        sample_rate: usize,
     }
 
     fn synth_samples(seed: u32, num_samples: usize) -> Vec<f32> {
@@ -516,11 +597,13 @@ mod tests {
                 dmel_max_value: case.params.dmel_max_value,
                 ..Default::default()
             };
-            let output = dmel_bins(
-                &synth_samples(case.synth.seed, case.synth.num_samples),
-                &params,
-            )
-            .unwrap();
+            let samples = synth_samples(case.synth.seed, case.synth.num_samples);
+            let samples = if case.synth.sample_rate == params.sample_rate {
+                samples
+            } else {
+                bandlimited_resample(&samples, case.synth.sample_rate, params.sample_rate).unwrap()
+            };
+            let output = dmel_bins(&samples, &params).unwrap();
             let actual = output
                 .bins
                 .iter()

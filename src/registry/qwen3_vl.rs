@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
+    encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::processor::{ModelSpecificValue, PreprocessedEncoderInputs},
 };
 
 pub(super) struct Qwen3VLVisionSpec;
@@ -282,6 +282,7 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
             ("patches_per_image".to_string(), FieldLayout::Batched),
             ("video_grid_thw".to_string(), FieldLayout::Batched),
             ("patches_per_video".to_string(), FieldLayout::Batched),
+            ("video_second_per_grid".to_string(), FieldLayout::Batched),
         ])
     }
 
@@ -295,9 +296,9 @@ mod tests {
     use serde_json::json;
 
     use crate::{
+        encoder_inputs::ModelSpecificValue,
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
         types::ImageSize,
-        vision::processor::ModelSpecificValue,
     };
 
     #[test]

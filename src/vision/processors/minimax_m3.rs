@@ -10,7 +10,7 @@ use std::ops::Deref;
 
 use image::DynamicImage;
 
-use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase};
+use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{PreprocessedEncoderInputs, VisionPreProcessor},
@@ -87,6 +87,9 @@ impl MiniMaxM3Processor {
                 merge_size,
                 min_pixels,
                 max_pixels,
+                video_min_pixels: min_pixels,
+                video_max_pixels: max_pixels,
+                video_resize_mode: QwenVideoResizeMode::TotalVolume,
                 temporal_patch_size,
                 mean: MINIMAX_M3_MEAN,
                 std: MINIMAX_M3_STD,

@@ -4,6 +4,25 @@ use thiserror::Error;
 
 pub type MultiModalResult<T> = Result<T, MultiModalError>;
 
+/// Errors that can occur while transforming media into encoder inputs.
+#[derive(Debug, Error)]
+pub enum TransformError {
+    #[error("Invalid tensor shape: expected {expected}, got {actual:?}")]
+    InvalidShape {
+        expected: String,
+        actual: Vec<usize>,
+    },
+
+    #[error("Empty batch: cannot stack zero tensors")]
+    EmptyBatch,
+
+    #[error("Inconsistent tensor shapes in batch")]
+    InconsistentShapes,
+
+    #[error("Shape error: {0}")]
+    ShapeError(String),
+}
+
 #[derive(Debug, Error)]
 pub enum MediaConnectorError {
     #[error("unsupported media scheme: {0}")]
@@ -22,10 +41,14 @@ pub enum MediaConnectorError {
     Base64Decode(#[from] base64::DecodeError),
     #[error("data URL parse error: {0}")]
     DataUrl(String),
+    #[error("{media} payload exceeds the maximum size of {limit} bytes")]
+    PayloadTooLarge { media: &'static str, limit: usize },
     #[error("media decode task failed: {0}")]
     Blocking(#[from] tokio::task::JoinError),
     #[error("image decode error: {0}")]
     Image(#[from] image::ImageError),
+    #[error("audio decode error: {0}")]
+    AudioDecode(String),
     #[error("video decode error: {0}")]
     VideoDecode(String),
     #[error("media fetch timed out after {0:?}")]

@@ -18,8 +18,8 @@ name = "llm_multimodal"
 [features]
 default = ["native-tls", "hf-hub"]
 hf-hub = ["dep:hf-hub"]
-native-tls = ["reqwest/native-tls"]
-rustls-tls = ["reqwest/rustls-tls"]
+native-tls = ["reqwest/native-tls", "hf-hub?/native-tls"]
+rustls-tls = ["reqwest/rustls", "hf-hub?/rustls-tls"]
 opencv-video = ["dep:opencv"]
 
 [dependencies]
@@ -35,7 +35,7 @@ rayon = "1.12"
 rustfft = "6.4"
 symphonia = { version = "0.6", default-features = false, features = ["all"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgproc", "videoio"], optional = true }
-reqwest = { version = "0.12.8", default-features = false, features = ["stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_with = "3.12"
@@ -46,7 +46,7 @@ tracing = "0.1"
 url = "2.5.8"
 
 anyhow = "1.0"
-blake3 = "1.5"
+blake3 = "1.8"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }

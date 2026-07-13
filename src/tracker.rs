@@ -58,6 +58,20 @@ impl AsyncMultiModalTracker {
             MediaContentPart::ImageEmbeds { .. } => {
                 return Err(MultiModalError::UnsupportedContent("image_embeds"));
             }
+            MediaContentPart::AudioUrl { url, uuid } => {
+                let source = match url::Url::parse(&url) {
+                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
+                    _ => MediaSource::Url(url),
+                };
+                self.enqueue_audio(source, uuid);
+            }
+            MediaContentPart::AudioData {
+                data,
+                mime_type: _,
+                uuid,
+            } => {
+                self.enqueue_audio(MediaSource::InlineBytes(data), uuid);
+            }
             MediaContentPart::VideoUrl { url, uuid } => {
                 let source = match url::Url::parse(&url) {
                     Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
@@ -118,6 +132,19 @@ impl AsyncMultiModalTracker {
                 .fetch_video(source, VideoFetchConfig::default())
                 .await?;
             Ok(TrackedMedia::Video(clip))
+        });
+
+        self.pending.entry(modality).or_default().push(handle);
+    }
+
+    fn enqueue_audio(&mut self, source: MediaSource, uuid: Option<String>) {
+        let modality = Modality::Audio;
+        self.uuids.entry(modality).or_default().push(uuid);
+
+        let connector = Arc::clone(&self.media_connector);
+        let handle = tokio::spawn(async move {
+            let clip = connector.fetch_audio(source).await?;
+            Ok(TrackedMedia::Audio(clip))
         });
 
         self.pending.entry(modality).or_default().push(handle);

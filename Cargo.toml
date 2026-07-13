@@ -16,7 +16,7 @@ categories = ["multimedia::images", "science"]
 name = "llm_multimodal"
 
 [features]
-default = ["native-tls", "hf-hub"]
+default = ["rustls-tls", "hf-hub"]
 hf-hub = ["dep:hf-hub"]
 native-tls = ["reqwest/native-tls", "hf-hub?/native-tls"]
 rustls-tls = ["reqwest/rustls", "hf-hub?/rustls-tls"]

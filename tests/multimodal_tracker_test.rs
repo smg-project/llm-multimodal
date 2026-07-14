@@ -2,15 +2,31 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioProcessorRegistry, AudioSource, ImageFetchConfig, ImageSource,
-    MediaConnector, MediaConnectorConfig, MediaContentPart, MediaSource, Modality,
-    PreProcessorConfig, TrackedMedia,
+    AsyncMultiModalTracker, AudioSource, ImageFetchConfig, ImageSource, MediaConnector,
+    MediaConnectorConfig, MediaContentPart, MediaSource, Modality, ModelMetadata, ModelRegistry,
+    PreProcessorConfig, Tokenizer, TrackedMedia,
 };
 use reqwest::Client;
 use tempfile::tempdir;
 
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+
+struct EmptyTokenizer;
+
+impl Tokenizer for EmptyTokenizer {
+    fn token_to_id(&self, _token: &str) -> Option<u32> {
+        None
+    }
+
+    fn id_to_token(&self, _id: u32) -> Option<String> {
+        None
+    }
+
+    fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+        None
+    }
+}
 
 #[expect(
     clippy::expect_used,
@@ -159,20 +175,25 @@ async fn tracker_audio_flows_into_inkling_preprocessor() {
             other => panic!("expected audio clip, got {other:?}"),
         })
         .collect::<Vec<_>>();
-    let processor = AudioProcessorRegistry::with_defaults()
-        .create(
-            "inkling",
-            &serde_json::json!({
-                "audio_config": {
-                    "decoder_dmodel": 1024,
-                    "n_mel_bins": 80,
-                    "mel_vocab_size": 16,
-                    "dmel_min_value": -7.0,
-                    "dmel_max_value": 2.0
-                }
-            }),
-            &PreProcessorConfig::default(),
-        )
+    let config = serde_json::json!({
+        "model_type": "inkling_mm_model",
+        "audio_config": {
+            "decoder_dmodel": 1024,
+            "n_mel_bins": 80,
+            "mel_vocab_size": 16,
+            "dmel_min_value": -7.0,
+            "dmel_max_value": 2.0
+        }
+    });
+    let metadata = ModelMetadata {
+        model_id: "inkling",
+        tokenizer: &EmptyTokenizer,
+        config: &config,
+    };
+    let registry = ModelRegistry::new();
+    let model_spec = registry.lookup(&metadata).expect("Inkling model spec");
+    let processor = model_spec
+        .audio_processor(&config, &PreProcessorConfig::default())
         .expect("Inkling audio processor");
     let preprocessed = processor.preprocess(&clips).expect("Inkling dMel");
 

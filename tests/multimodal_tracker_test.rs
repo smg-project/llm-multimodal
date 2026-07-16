@@ -3,13 +3,30 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use llm_multimodal::{
     AsyncMultiModalTracker, AudioSource, ImageFetchConfig, ImageSource, MediaConnector,
-    MediaConnectorConfig, MediaContentPart, MediaSource, Modality,
+    MediaConnectorConfig, MediaContentPart, MediaSource, Modality, ModelMetadata, ModelRegistry,
+    PreProcessorConfig, Tokenizer, TrackedMedia,
 };
 use reqwest::Client;
 use tempfile::tempdir;
 
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+
+struct EmptyTokenizer;
+
+impl Tokenizer for EmptyTokenizer {
+    fn token_to_id(&self, _token: &str) -> Option<u32> {
+        None
+    }
+
+    fn id_to_token(&self, _id: u32) -> Option<String> {
+        None
+    }
+
+    fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+        None
+    }
+}
 
 #[expect(
     clippy::expect_used,
@@ -135,6 +152,57 @@ async fn fetch_audio_from_inline_bytes_decodes_samples() {
     assert!((clip.decoded().samples[1] - 0.5).abs() < 1e-4);
     assert!((clip.decoded().samples[2] + 0.5).abs() < 1e-4);
     assert!(matches!(clip.source(), AudioSource::InlineBytes));
+}
+
+#[tokio::test]
+async fn tracker_audio_flows_into_inkling_preprocessor() {
+    let connector = Arc::new(test_connector(None));
+    let mut tracker = AsyncMultiModalTracker::new(connector);
+    tracker
+        .push_part(MediaContentPart::AudioData {
+            data: wav_i16_mono(16_000, &[0; 800]),
+            mime_type: Some("audio/wav".into()),
+            uuid: Some("audio-1".into()),
+        })
+        .expect("audio part");
+
+    let mut output = tracker.finalize().await.expect("tracker finalize");
+    let media = output.data.remove(&Modality::Audio).expect("audio entry");
+    let clips = media
+        .into_iter()
+        .map(|item| match item {
+            TrackedMedia::Audio(clip) => clip,
+            other => panic!("expected audio clip, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    let config = serde_json::json!({
+        "model_type": "inkling_mm_model",
+        "audio_config": {
+            "decoder_dmodel": 1024,
+            "n_mel_bins": 80,
+            "mel_vocab_size": 16,
+            "dmel_min_value": -7.0,
+            "dmel_max_value": 2.0
+        }
+    });
+    let metadata = ModelMetadata {
+        model_id: "inkling",
+        tokenizer: &EmptyTokenizer,
+        config: &config,
+    };
+    let registry = ModelRegistry::new();
+    let model_spec = registry.lookup(&metadata).expect("Inkling model spec");
+    let processor = model_spec
+        .audio_processor(&config, &PreProcessorConfig::default())
+        .expect("Inkling audio processor");
+    let preprocessed = processor.preprocess(&clips).expect("Inkling dMel");
+
+    assert_eq!(preprocessed.encoder_input.shape(), &[1, 80]);
+    assert_eq!(preprocessed.feature_token_counts, vec![1]);
+    assert_eq!(
+        output.uuids.get(&Modality::Audio),
+        Some(&vec![Some("audio-1".into())])
+    );
 }
 
 #[tokio::test]

@@ -11,9 +11,9 @@ use crate::{
 
 const IMAGE_MARKER_TOKEN: &str = "<|content_image|>";
 const IMAGE_MARKER_ID: TokenId = 200005;
-const IMAGE_TOKEN_ID: TokenId = 200053;
+const IMAGE_TOKEN_ID: TokenId = 200054;
 const AUDIO_MARKER_TOKEN: &str = "<|content_audio_input|>";
-const AUDIO_TOKEN_ID: TokenId = 200054;
+const AUDIO_TOKEN_ID: TokenId = 200053;
 
 pub(super) struct InklingSpec;
 
@@ -228,7 +228,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(replacements.len(), 1);
-        assert_eq!(replacements[0].tokens, vec![200005, 200053, 200053, 200053]);
+        assert_eq!(replacements[0].tokens, vec![200005, 200054, 200054, 200054]);
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(
             spec.placeholder_token_id_for(&metadata, Modality::Audio)
                 .unwrap(),
-            200054
+            200053
         );
         let replacements = spec
             .prompt_replacements_for(
@@ -288,7 +288,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(replacements.len(), 1);
-        assert_eq!(replacements[0].tokens, vec![200020, 200054, 200054, 200054]);
+        assert_eq!(replacements[0].tokens, vec![200020, 200053, 200053, 200053]);
     }
 
     #[test]

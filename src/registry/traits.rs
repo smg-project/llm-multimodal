@@ -40,6 +40,15 @@ pub enum ModelRegistryError {
 
 pub type RegistryResult<T> = Result<T, ModelRegistryError>;
 
+/// Ordering of media and text parts when rendering a multipart message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaPartOrder {
+    /// Emit media parts before text (vLLM `interleave_mm_strings=false`).
+    MediaFirst,
+    /// Keep parts in request order; part order is protocol-visible.
+    Authored,
+}
+
 /// Metadata about the current model used to derive tokenizer/config dependent fields.
 pub struct ModelMetadata<'a> {
     pub model_id: &'a str,
@@ -77,6 +86,14 @@ impl<'a> ModelMetadata<'a> {
 pub trait ModelProcessorSpec: Send + Sync {
     fn name(&self) -> &'static str;
     fn matches(&self, metadata: &ModelMetadata) -> bool;
+
+    /// Ordering of media/text parts this model's chat template expects. Most
+    /// models use vLLM-compatible media-first; families whose template renders
+    /// parts positionally override to `Authored`.
+    fn media_part_order(&self) -> MediaPartOrder {
+        MediaPartOrder::MediaFirst
+    }
+
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(

@@ -38,7 +38,7 @@ impl Qwen3OmniSpec {
 
     fn replacements(
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
         modality: Modality,
         field: &str,
         fallback: &str,
@@ -54,6 +54,13 @@ impl Qwen3OmniSpec {
 }
 
 impl ModelProcessorSpec for Qwen3OmniSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::BatchedTensor("image_grid_thw")],
+            parse: super::metadata_only::image_grid,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "qwen3_omni"
     }
@@ -133,12 +140,25 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         )))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        self.prompt_replacements_for(metadata, preprocessed, Modality::Image)
+        if modality != Modality::Image {
+            return Err(ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
+        Self::replacements(
+            metadata,
+            preprocessed,
+            modality,
+            "image_token_id",
+            IMAGE_PAD_TOKEN,
+        )
     }
 
     fn prompt_replacements_for(
@@ -150,21 +170,21 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         match modality {
             Modality::Image => Self::replacements(
                 metadata,
-                preprocessed,
+                preprocessed.as_metadata(),
                 modality,
                 "image_token_id",
                 IMAGE_PAD_TOKEN,
             ),
             Modality::Video => Self::replacements(
                 metadata,
-                preprocessed,
+                preprocessed.as_metadata(),
                 modality,
                 "video_token_id",
                 VIDEO_PAD_TOKEN,
             ),
             Modality::Audio => Self::replacements(
                 metadata,
-                preprocessed,
+                preprocessed.as_metadata(),
                 modality,
                 "audio_token_id",
                 AUDIO_PAD_TOKEN,

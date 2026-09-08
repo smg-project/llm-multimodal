@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
@@ -22,6 +21,13 @@ impl QwenVLVisionSpec {
 }
 
 impl ModelProcessorSpec for QwenVLVisionSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::BatchedTensor("image_grid_thw")],
+            parse: super::metadata_only::qwen_image,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "qwen_vl"
     }
@@ -55,11 +61,18 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         Ok(json!({}))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let pad_token_id = Self::pad_token_id(metadata)?;
         let placeholder_token = self.placeholder_token(metadata)?;
         // The chat template already wraps each image with <|vision_start|> ... <|vision_end|>,

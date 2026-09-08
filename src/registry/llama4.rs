@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+    encoder_inputs::ModelSpecificValue,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
@@ -33,7 +33,7 @@ impl Llama4Spec {
             .unwrap_or(0.5)
     }
 
-    fn tokens_per_tile(metadata: &ModelMetadata) -> usize {
+    pub(super) fn tokens_per_tile(metadata: &ModelMetadata) -> usize {
         let tile = Self::tile_size(metadata) as usize;
         let patch = Self::patch_size(metadata) as usize;
         if patch == 0 {
@@ -50,7 +50,7 @@ impl Llama4Spec {
     /// `aspect_ratios` tensor.  Falls back to deriving tile counts from
     /// the original image sizes when aspect_ratios are unavailable.
     fn extract_aspect_ratios(
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
         tile_size: usize,
     ) -> Vec<(usize, usize)> {
         if let Some(ModelSpecificValue::IntTensor { data, shape }) =
@@ -77,6 +77,13 @@ impl Llama4Spec {
 }
 
 impl ModelProcessorSpec for Llama4Spec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::BatchedTensor("aspect_ratios")],
+            parse: super::metadata_only::llama4_image,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llama4"
     }
@@ -112,11 +119,18 @@ impl ModelProcessorSpec for Llama4Spec {
         Ok(json!({}))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let patch_token_id = self.placeholder_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
         let tokens_per_tile = Self::tokens_per_tile(metadata);

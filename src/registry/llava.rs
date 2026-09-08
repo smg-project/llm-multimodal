@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
@@ -12,6 +11,13 @@ pub(super) struct LlavaSpec;
 pub(super) struct LlavaNextSpec;
 
 impl ModelProcessorSpec for LlavaSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::FeatureTokenCount],
+            parse: super::metadata_only::image_token_count,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llava"
     }
@@ -51,11 +57,18 @@ impl ModelProcessorSpec for LlavaSpec {
         Ok(json!({}))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let token_id = self.placeholder_token_id(metadata)?;
         let token = self.placeholder_token(metadata)?;
         Ok(preprocessed
@@ -67,6 +80,16 @@ impl ModelProcessorSpec for LlavaSpec {
 }
 
 impl ModelProcessorSpec for LlavaNextSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[
+                super::MetadataField::FeatureTokenCount,
+                super::MetadataField::BatchedTensor("image_sizes"),
+            ],
+            parse: super::metadata_only::image_token_count_with_sizes,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llava_next"
     }
@@ -96,11 +119,18 @@ impl ModelProcessorSpec for LlavaNextSpec {
         LlavaSpec.processor_kwargs(metadata)
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         // LLaVA-Next token counts differ from plain LLaVA because of
         // anyres multi-crop + spatial_unpad.  The correct per-image counts
         // are already computed by LlavaNextProcessor::calculate_num_tokens

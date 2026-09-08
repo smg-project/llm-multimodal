@@ -186,6 +186,15 @@ pub struct PreprocessedEncoderInputs {
 }
 
 impl PreprocessedEncoderInputs {
+    /// Borrow the prompt inputs without exposing the primary encoder tensor.
+    pub fn as_metadata(&self) -> crate::registry::EncoderMetadata<'_> {
+        crate::registry::EncoderMetadata {
+            feature_token_counts: &self.feature_token_counts,
+            item_sizes: &self.item_sizes,
+            model_specific: &self.model_specific,
+        }
+    }
+
     /// Create encoder inputs backed by a tensor of any dimensionality.
     pub fn new<D: Dimension>(
         encoder_input: Array<f32, D>,

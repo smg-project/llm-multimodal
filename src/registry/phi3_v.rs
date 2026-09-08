@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
@@ -11,6 +10,16 @@ use crate::{
 pub(super) struct Phi3VisionSpec;
 
 impl ModelProcessorSpec for Phi3VisionSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[
+                super::MetadataField::FeatureTokenCount,
+                super::MetadataField::BatchedTensor("image_sizes"),
+            ],
+            parse: super::metadata_only::image_token_count_with_sizes,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "phi3_v"
     }
@@ -49,11 +58,18 @@ impl ModelProcessorSpec for Phi3VisionSpec {
         ])
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let token_id = self.placeholder_token_id(metadata)?;
         let token = self.placeholder_token(metadata)?;
         Ok(preprocessed

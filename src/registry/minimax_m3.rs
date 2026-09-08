@@ -5,7 +5,6 @@ use serde_json::{json, Value};
 use crate::{
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::processor::PreprocessedEncoderInputs,
 };
 
 pub(super) struct MiniMaxM3VisionSpec;
@@ -17,6 +16,13 @@ impl MiniMaxM3VisionSpec {
 }
 
 impl ModelProcessorSpec for MiniMaxM3VisionSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::BatchedTensor("image_grid_thw")],
+            parse: super::metadata_only::image_grid,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "minimax_m3_vl"
     }
@@ -48,11 +54,18 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         Ok(json!({}))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let image_token_id = metadata.token_id(Self::IMAGE_TOKEN)?;
         let start_token_id = metadata.token_id(Self::VISION_START_TOKEN)?;
         let end_token_id = metadata.token_id(Self::VISION_END_TOKEN)?;

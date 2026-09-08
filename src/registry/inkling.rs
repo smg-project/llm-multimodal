@@ -18,6 +18,33 @@ const AUDIO_TOKEN_ID: TokenId = 200053;
 pub(super) struct InklingSpec;
 
 impl InklingSpec {
+    fn replacements(
+        &self,
+        metadata: &ModelMetadata,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        let (marker_token, marker_id, embed_token_id) = match modality {
+            Modality::Image => (IMAGE_MARKER_TOKEN, IMAGE_MARKER_ID, IMAGE_TOKEN_ID),
+            Modality::Audio => (
+                AUDIO_MARKER_TOKEN,
+                metadata.token_id(AUDIO_MARKER_TOKEN)?,
+                AUDIO_TOKEN_ID,
+            ),
+            Modality::Video | Modality::ImageEmbeds => return Err(self.unsupported(modality)),
+        };
+
+        Ok(preprocessed
+            .feature_token_counts
+            .iter()
+            .map(|&num_tokens| {
+                let mut tokens = vec![embed_token_id; num_tokens + 1];
+                tokens[0] = marker_id;
+                PromptReplacement::sequence(modality, marker_token, tokens)
+            })
+            .collect())
+    }
+
     fn audio_enabled(metadata: &ModelMetadata) -> bool {
         metadata
             .config
@@ -35,6 +62,13 @@ impl InklingSpec {
 }
 
 impl ModelProcessorSpec for InklingSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[super::MetadataField::FeatureTokenCount],
+            parse: super::metadata_only::image_token_count,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "inkling"
     }
@@ -103,12 +137,19 @@ impl ModelProcessorSpec for InklingSpec {
         )))
     }
 
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        self.prompt_replacements_for(metadata, preprocessed, Modality::Image)
+        if modality != Modality::Image {
+            return Err(ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
+        self.replacements(metadata, preprocessed, modality)
     }
 
     fn prompt_replacements_for(
@@ -117,25 +158,7 @@ impl ModelProcessorSpec for InklingSpec {
         preprocessed: &PreprocessedEncoderInputs,
         modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        let (marker_token, marker_id, embed_token_id) = match modality {
-            Modality::Image => (IMAGE_MARKER_TOKEN, IMAGE_MARKER_ID, IMAGE_TOKEN_ID),
-            Modality::Audio => (
-                AUDIO_MARKER_TOKEN,
-                metadata.token_id(AUDIO_MARKER_TOKEN)?,
-                AUDIO_TOKEN_ID,
-            ),
-            Modality::Video | Modality::ImageEmbeds => return Err(self.unsupported(modality)),
-        };
-
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                let mut tokens = vec![embed_token_id; num_tokens + 1];
-                tokens[0] = marker_id;
-                PromptReplacement::sequence(modality, marker_token, tokens)
-            })
-            .collect())
+        self.replacements(metadata, preprocessed.as_metadata(), modality)
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {

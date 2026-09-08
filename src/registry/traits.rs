@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use super::{metadata_only::invalid, EncoderMetadata, MetadataOnlyCodec, PreparedMetadataOnly};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -12,6 +13,13 @@ use crate::{
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelRegistryError {
+    #[error("invalid metadata-only input: {message}")]
+    InvalidMetadata { message: String },
+    #[error("model spec {spec} does not support metadata-only {modality}")]
+    UnsupportedMetadataOnly {
+        spec: &'static str,
+        modality: Modality,
+    },
     #[error("unsupported model: {0}")]
     UnsupportedModel(String),
     #[error("token '{token}' not found in tokenizer vocabulary")]
@@ -94,6 +102,89 @@ impl<'a> ModelMetadata<'a> {
 }
 
 pub trait ModelProcessorSpec: Send + Sync {
+    /// Model-owned publication and consumption contract. Unsupported by default.
+    fn metadata_only_codec(&self, _modality: Modality) -> Option<MetadataOnlyCodec> {
+        None
+    }
+
+    /// Publish per-item metadata from actual preprocessing, never pixels or embeddings.
+    ///
+    /// Items remain in batch order; request identifiers and transport handles
+    /// are attached by the caller, not this library.
+    fn export_metadata(
+        &self,
+        metadata: EncoderMetadata<'_>,
+        modality: Modality,
+    ) -> RegistryResult<Vec<Value>> {
+        self.metadata_only_codec(modality)
+            .ok_or(ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            })?
+            .export(metadata)
+    }
+
+    /// Validate metadata and reuse this model's normal prompt rules.
+    ///
+    /// `max_tokens` bounds the total expanded media tokens before returning.
+    /// The caller still validates the full text-plus-media context length.
+    fn prepare_metadata_only(
+        &self,
+        model: &ModelMetadata,
+        processor: &PreProcessorConfig,
+        modality: Modality,
+        payloads: &[Value],
+        max_tokens: usize,
+    ) -> RegistryResult<PreparedMetadataOnly> {
+        let codec = self.metadata_only_codec(modality).ok_or(
+            ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            },
+        )?;
+        let metadata = (codec.parse)(model, processor, payloads)?;
+        if metadata.feature_token_counts.len() != payloads.len() {
+            return Err(invalid("metadata counts do not match media items"));
+        }
+        metadata
+            .feature_token_counts
+            .iter()
+            .try_fold(0usize, |total, &count| {
+                total
+                    .checked_add(count)
+                    .filter(|&n| count > 0 && n <= max_tokens)
+                    .ok_or_else(|| invalid("feature token count is zero or exceeds token budget"))
+            })?;
+        let replacements =
+            self.prompt_replacements_from_metadata(model, metadata.as_metadata(), modality)?;
+        if replacements.len() != payloads.len() {
+            return Err(invalid("prompt replacements do not match media items"));
+        }
+        replacements.iter().try_fold(0usize, |total, replacement| {
+            total
+                .checked_add(replacement.tokens.len())
+                .filter(|&n| n <= max_tokens)
+                .ok_or_else(|| invalid("prompt replacements exceed token budget"))
+        })?;
+        Ok(PreparedMetadataOnly {
+            metadata,
+            replacements,
+        })
+    }
+
+    /// Shared prompt construction without requiring pixels or embeddings.
+    fn prompt_replacements_from_metadata(
+        &self,
+        _model: &ModelMetadata,
+        _metadata: EncoderMetadata<'_>,
+        modality: Modality,
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        Err(ModelRegistryError::UnsupportedMetadataOnly {
+            spec: self.name(),
+            modality,
+        })
+    }
+
     fn name(&self) -> &'static str;
     fn matches(&self, metadata: &ModelMetadata) -> bool;
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
@@ -199,7 +290,13 @@ pub trait ModelProcessorSpec: Send + Sync {
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
-    ) -> RegistryResult<Vec<PromptReplacement>>;
+    ) -> RegistryResult<Vec<PromptReplacement>> {
+        self.prompt_replacements_from_metadata(
+            metadata,
+            preprocessed.as_metadata(),
+            Modality::Image,
+        )
+    }
     fn prompt_replacements_for(
         &self,
         metadata: &ModelMetadata,

@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
 };
@@ -34,6 +33,16 @@ impl KimiK3VisionSpec {
 }
 
 impl ModelProcessorSpec for KimiK3VisionSpec {
+    fn metadata_only_codec(&self, modality: Modality) -> Option<super::MetadataOnlyCodec> {
+        (modality == Modality::Image).then_some(super::MetadataOnlyCodec {
+            fields: &[
+                super::MetadataField::BatchedTensor("grid_thws"),
+                super::MetadataField::ImageSize,
+            ],
+            parse: super::metadata_only::kimi_k3_image,
+        })
+    }
+
     fn name(&self) -> &'static str {
         "kimi_k3"
     }
@@ -58,17 +67,24 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
         Ok(json!({}))
     }
-    fn prompt_replacements(
+    fn prompt_replacements_from_metadata(
         &self,
         metadata: &ModelMetadata,
-        preprocessed: &PreprocessedEncoderInputs,
+        preprocessed: super::EncoderMetadata<'_>,
+        modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
+        if modality != Modality::Image {
+            return Err(super::ModelRegistryError::UnsupportedMetadataOnly {
+                spec: self.name(),
+                modality,
+            });
+        }
         let pad = Self::pad_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
         Ok(preprocessed
             .item_sizes
             .iter()
-            .zip(&preprocessed.feature_token_counts)
+            .zip(preprocessed.feature_token_counts)
             .map(|(&(width, height), &count)| {
                 let mut tokens = Self::encode_text(
                     metadata,

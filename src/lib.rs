@@ -19,6 +19,7 @@ pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, Transfor
 pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
+pub use registry::{EncoderMetadata, PreparedEncoderMetadata, PreparedMetadataOnly};
 pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{

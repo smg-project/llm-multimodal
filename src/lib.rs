@@ -19,7 +19,9 @@ pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, Transfor
 pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
-pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer};
+pub use registry::{
+    DEEPSEEK_V41_IMAGE_PLACEHOLDER, ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer,
+};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
     AlignmentPad, AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail,

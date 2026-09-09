@@ -26,6 +26,7 @@ use qwen3_omni::Qwen3OmniSpec;
 use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
+pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
 pub use traits::{
     ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, Tokenizer,
 };

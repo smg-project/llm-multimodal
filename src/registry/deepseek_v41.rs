@@ -19,13 +19,15 @@ use crate::{
     vision::processors::deepseek_v41::COMPRESS_PAD_TO,
 };
 
+/// The placeholder text inlined at each image's position; the multimodal
+/// pipeline later expands it into the image span. Public so frontends can
+/// render it without re-resolving the spec (mirrors the Python encoding's
+/// hard-coded `IMAGE_PLACEHOLDER`).
+pub const DEEPSEEK_V41_IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
+
 pub(super) struct DeepseekV41VisionSpec;
 
 impl DeepseekV41VisionSpec {
-    /// The placeholder text inlined at each image's position; the multimodal
-    /// pipeline later expands it into the image span.
-    const IMAGE_PLACEHOLDER: &'static str = "<｜deepseek_image｜>";
-
     /// Reserved in-vocab token borrowed by compressor-alignment pads.
     const IMAGE_PAD_TOKEN_NAME: &'static str = "<|place_holder_mm_span_0436|>";
 
@@ -68,7 +70,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok(Self::IMAGE_PLACEHOLDER.to_string())
+        Ok(DEEPSEEK_V41_IMAGE_PLACEHOLDER.to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {

@@ -234,6 +234,15 @@ pub trait ModelProcessorSpec: Send + Sync {
         EncoderFieldLayouts::from_legacy_fields(self.field_layouts())
     }
 
+    /// Wire key under which the primary encoder input tensor is sent to the
+    /// engine for one modality (e.g. `"patches"` for DeepSeek-V4.1 images).
+    ///
+    /// `None` keeps the caller's per-modality default (`"pixel_values"` for
+    /// images, `"pixel_values_videos"` for videos).
+    fn encoder_input_key_for(&self, _modality: Modality) -> Option<String> {
+        None
+    }
+
     /// Tensor keys that should remain on CPU (not transferred to GPU).
     ///
     /// In vLLM, certain model-specific tensors are marked `keep_on_cpu=True`

@@ -22,12 +22,13 @@ pub use media::{
 pub use registry::{ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer};
 pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
 pub use types::{
-    AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
-    ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
-    PromptReplacement, RgbFrameRef, TokenId, TrackedMedia, VideoClip, VideoSource,
+    AlignmentPad, AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail,
+    ImageFrame, ImageSize, ImageSource, MediaContentPart, Modality, MultiModalData,
+    MultiModalUUIDs, PlaceholderRange, PromptReplacement, RgbFrameRef, TokenId, TrackedMedia,
+    VideoClip, VideoSource,
 };
 // Re-export vision processing components
 pub use vision::{
-    InklingImageProcessor, KimiK3Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionProcessorRegistry,
+    DeepseekV41Processor, InklingImageProcessor, KimiK3Processor, LlavaNextProcessor,
+    LlavaProcessor, PreProcessorConfig, VisionPreProcessor, VisionProcessorRegistry,
 };

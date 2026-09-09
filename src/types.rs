@@ -467,6 +467,32 @@ pub struct PlaceholderRange {
     pub length: usize,
 }
 
+/// Position-dependent alignment padding prepended to a placeholder's
+/// replacement tokens when they are spliced into the final prompt.
+///
+/// The pad count depends on the offset where the replacement lands in the
+/// expanded prompt (`period - 1 - offset % period` copies of `token_id`), so
+/// the replacement always starts at the same phase of a `period`-token group.
+/// This mirrors vLLM's DeepSeek-V4.1 compressor-alignment pad, which is
+/// computed at splice time in `_apply_token_matches_with_placeholders`.
+/// The pad positions are part of the reported [`PlaceholderRange`]; they are
+/// not embed positions as long as `token_id` differs from the modality's
+/// embed token id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlignmentPad {
+    pub token_id: TokenId,
+    pub period: usize,
+}
+
+impl AlignmentPad {
+    /// Number of pad tokens to prepend when the replacement is spliced at
+    /// `offset` in the final prompt.
+    pub fn count_at(&self, offset: usize) -> usize {
+        debug_assert!(self.period > 0);
+        self.period - 1 - offset % self.period
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptReplacement {
     pub modality: Modality,
@@ -481,6 +507,9 @@ pub struct PromptReplacement {
     /// the offset must sit on (or before) the first marker. 0 for the common
     /// case where the range is exactly the replacement.
     pub structural_prefix: usize,
+    /// Optional position-dependent padding prepended at splice time. See
+    /// [`AlignmentPad`].
+    pub alignment_pad: Option<AlignmentPad>,
 }
 
 impl PromptReplacement {
@@ -495,6 +524,7 @@ impl PromptReplacement {
             placeholder_token: placeholder_token.to_string(),
             tokens: vec![token_id; count],
             structural_prefix: 0,
+            alignment_pad: None,
         }
     }
 
@@ -504,6 +534,7 @@ impl PromptReplacement {
             placeholder_token: placeholder_token.to_string(),
             tokens: sequence,
             structural_prefix: 0,
+            alignment_pad: None,
         }
     }
 
@@ -513,6 +544,14 @@ impl PromptReplacement {
     #[must_use]
     pub fn with_structural_prefix(mut self, n: usize) -> Self {
         self.structural_prefix = n;
+        self
+    }
+
+    /// Declare position-dependent alignment padding for this replacement. See
+    /// [`AlignmentPad`].
+    #[must_use]
+    pub fn with_alignment_pad(mut self, token_id: TokenId, period: usize) -> Self {
+        self.alignment_pad = Some(AlignmentPad { token_id, period });
         self
     }
 }

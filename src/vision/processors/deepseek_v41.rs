@@ -355,9 +355,8 @@ impl VisionPreProcessor for DeepseekV41Processor {
         // The engine consumes patches as `(np, 3, p, p)` (see vLLM's
         // `DeepseekV4VLImagePixelInputs`).
         let p = processor.patch_size;
-        let encoder_input =
-            Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
-                .expect("concatenated patch buffer matches its shape by construction");
+        let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
+            .expect("concatenated patch buffer matches its shape by construction");
 
         let n_images = images.len();
         Ok(

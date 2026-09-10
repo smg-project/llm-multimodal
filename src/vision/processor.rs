@@ -220,6 +220,15 @@ impl VisionProcessorRegistry {
             Box::new(super::processors::DeepseekV41Processor::new()),
         );
 
+        registry.register(
+            "glm5_next",
+            Box::new(super::processors::Glm5NextProcessor::new()),
+        );
+        registry.register(
+            "glm-5.3",
+            Box::new(super::processors::Glm5NextProcessor::new()),
+        );
+
         // LLaVA-NeXT (v1.6+, anyres multi-crop)
         registry.register(
             "llava-next",

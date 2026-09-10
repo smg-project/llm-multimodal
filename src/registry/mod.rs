@@ -1,4 +1,5 @@
 mod deepseek_v41;
+mod glm5_next;
 mod inkling;
 mod kimi_k25;
 mod kimi_k3;
@@ -13,6 +14,7 @@ mod qwen_vl;
 mod traits;
 
 use deepseek_v41::DeepseekV41VisionSpec;
+use glm5_next::Glm5NextVisionSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
 use kimi_k3::KimiK3VisionSpec;
@@ -40,6 +42,7 @@ impl ModelRegistry {
         Self {
             specs: vec![
                 LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+                LazySpec::new(|| Box::new(Glm5NextVisionSpec)),
                 LazySpec::new(|| Box::new(KimiK3VisionSpec)),
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),

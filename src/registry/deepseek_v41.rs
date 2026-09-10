@@ -58,7 +58,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         metadata
             .config_model_type()
-            .is_some_and(|model_type| model_type == "deepseek_v4.1")
+            .is_some_and(|model_type| model_type == "deepseek_v41")
             || metadata
                 .model_id
                 .to_ascii_lowercase()
@@ -66,7 +66,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
             || metadata
                 .model_id
                 .to_ascii_lowercase()
-                .contains("deepseek_v4.1")
+                .contains("deepseek_v41")
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -157,7 +157,7 @@ mod tests {
 
     fn metadata<'a>(tokenizer: &'a TestTokenizer, config: &'a Value) -> ModelMetadata<'a> {
         ModelMetadata {
-            model_id: "deepseek-ai/DeepSeek-V4.1",
+            model_id: "/models/local-checkpoint",
             tokenizer,
             config,
         }
@@ -173,8 +173,11 @@ mod tests {
     #[test]
     fn matches_deepseek_v41_model_type() {
         let tokenizer = TestTokenizer::new(&[]);
-        let config = json!({"model_type": "deepseek_v4.1", "image_token_id": IMAGE_TOKEN_ID});
+        let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         assert!(DeepseekV41VisionSpec.matches(&metadata(&tokenizer, &config)));
+        assert!(crate::VisionProcessorRegistry::with_defaults()
+            .find("/models/local-checkpoint", Some("deepseek_v41"))
+            .is_some());
 
         // A text-only DeepSeek model with a neutral model id must not match.
         let other = json!({"model_type": "deepseek_v3"});
@@ -192,7 +195,7 @@ mod tests {
             DeepseekV41VisionSpec::IMAGE_PAD_TOKEN_NAME,
             IMAGE_PAD_TOKEN_ID,
         )]);
-        let config = json!({"model_type": "deepseek_v4.1", "image_token_id": IMAGE_TOKEN_ID});
+        let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         let metadata = metadata(&tokenizer, &config);
 
         let replacements = DeepseekV41VisionSpec
@@ -212,7 +215,7 @@ mod tests {
     #[test]
     fn prompt_replacements_require_pad_token_in_vocab() {
         let tokenizer = TestTokenizer::new(&[]);
-        let config = json!({"model_type": "deepseek_v4.1", "image_token_id": IMAGE_TOKEN_ID});
+        let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         let metadata = metadata(&tokenizer, &config);
 
         let result = DeepseekV41VisionSpec.prompt_replacements(&metadata, &spec_inputs(&[5]));

@@ -205,14 +205,14 @@ impl VisionProcessorRegistry {
     /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
     /// - `qwen4_exp` / `qwen4-exp` -> Qwen3VLProcessor (same vision tower as Qwen3.5)
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
-    /// - `deepseek_v4.1` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
+    /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
 
         // DeepSeek-V4.1 vision variant (patch=14, 3x3 aligner downsample,
         // gray-padded contain fit).
         registry.register(
-            "deepseek_v4.1",
+            "deepseek_v41",
             Box::new(super::processors::DeepseekV41Processor::new()),
         );
         registry.register(

@@ -188,7 +188,7 @@ impl DeepseekV41Processor {
                 .get_extra("downsample_ratio")
                 .unwrap_or(DEFAULT_DOWNSAMPLE_RATIO),
             max_n_token: config
-                .get_extra("max_num_tokens")
+                .get_extra("max_image_tokens")
                 .unwrap_or(DEFAULT_MAX_NUM_TOKENS),
             min_pixels: config.min_pixels.unwrap_or(DEFAULT_MIN_PIXELS),
             max_wh_ratio: config.get_extra("max_wh_ratio"),
@@ -199,7 +199,7 @@ impl DeepseekV41Processor {
         if config.patch_size.is_some()
             || config.min_pixels.is_some()
             || config.extra.contains_key("downsample_ratio")
-            || config.extra.contains_key("max_num_tokens")
+            || config.extra.contains_key("max_image_tokens")
             || config.extra.contains_key("max_wh_ratio")
         {
             Self::from_preprocessor_config(config)
@@ -465,6 +465,16 @@ mod tests {
                 IMAGE_END,
             ]
         );
+    }
+
+    #[test]
+    fn respects_max_image_tokens() {
+        let processor = DeepseekV41Processor::new();
+        let config: PreProcessorConfig =
+            serde_json::from_value(serde_json::json!({"max_image_tokens": 320})).unwrap();
+
+        assert!(processor.calculate_num_tokens(4000, 4000, &config) <= 320);
+        assert!(processor.calculate_num_tokens(4000, 4000, &PreProcessorConfig::default()) > 320);
     }
 
     #[test]

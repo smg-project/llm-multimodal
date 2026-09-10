@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
 use ndarray::{Array2, Array3};
 
 use crate::{
@@ -88,6 +88,12 @@ pub struct QwenVLConfig {
 pub enum QwenVideoResizeMode {
     TotalVolume,
     PerFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenImageResizeMode {
+    QwenResize,
+    GlmPad,
 }
 
 #[derive(Clone)]
@@ -318,12 +324,19 @@ fn resize_dynamic_frame_to_raw(
 #[derive(Debug, Clone)]
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
+    image_resize_mode: QwenImageResizeMode,
 }
 
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration.
     pub fn new(config: QwenVLConfig) -> Self {
         Self { config }
+    }
+
+    /// Override image resize/canvas behavior for model-specific processors.
+    pub fn with_image_resize_mode(mut self, mode: QwenImageResizeMode) -> Self {
+        self.image_resize_mode = mode;
+        self
     }
 
     /// Get the patch size.
@@ -491,6 +504,10 @@ impl QwenVLProcessorBase {
         height: usize,
         width: usize,
     ) -> Result<(usize, usize), TransformError> {
+        if self.image_resize_mode == QwenImageResizeMode::GlmPad {
+            return self.smart_resize_glm(height, width);
+        }
+
         let factor = self.get_factor();
 
         // Validate non-zero dimensions
@@ -539,6 +556,123 @@ impl QwenVLProcessorBase {
         }
 
         Ok((h_bar, w_bar))
+    }
+
+    fn smart_resize_glm(
+        &self,
+        height: usize,
+        width: usize,
+    ) -> Result<(usize, usize), TransformError> {
+        let factor = self.get_factor();
+        let temporal = self.config.temporal_patch_size;
+        if height == 0 || width == 0 || factor == 0 || temporal == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "positive image dimensions and alignment factors".to_string(),
+                actual: vec![height, width, factor, temporal],
+            });
+        }
+        if self.config.min_pixels == 0
+            || self.config.max_pixels == 0
+            || self.config.min_pixels > self.config.max_pixels
+        {
+            return Err(TransformError::ShapeError(format!(
+                "invalid GLM pixel budget: min={} max={}",
+                self.config.min_pixels, self.config.max_pixels
+            )));
+        }
+
+        let ceil_factor = |value: usize| value.div_ceil(factor) * factor;
+        let mut h_bar = ceil_factor(height);
+        let mut w_bar = ceil_factor(width);
+
+        let volume = |h: usize, w: usize| temporal.checked_mul(h).and_then(|v| v.checked_mul(w));
+
+        let fit_within_budget =
+            |source_h: usize, source_w: usize| -> Result<(usize, usize), TransformError> {
+                let minimum = temporal * factor * factor;
+                if self.config.max_pixels < minimum {
+                    return Err(TransformError::ShapeError(format!(
+                        "GLM max_pixels={} is smaller than one aligned patch volume {}",
+                        self.config.max_pixels, minimum
+                    )));
+                }
+                let mut low = 1usize;
+                let mut high = source_h;
+                let mut best_h = factor;
+                let mut best_w = factor;
+                while low <= high {
+                    let content_h = low + (high - low) / 2;
+                    let content_w =
+                        ((source_w as u128 * content_h as u128) / source_h as u128).max(1) as usize;
+                    let aligned_h = ceil_factor(content_h);
+                    let aligned_w = ceil_factor(content_w);
+                    if volume(aligned_h, aligned_w).is_some_and(|v| v <= self.config.max_pixels) {
+                        best_h = aligned_h;
+                        best_w = aligned_w;
+                        low = content_h.saturating_add(1);
+                    } else if content_h == 0 {
+                        break;
+                    } else {
+                        high = content_h - 1;
+                    }
+                }
+                Ok((best_h, best_w))
+            };
+
+        let current = volume(h_bar, w_bar).ok_or_else(|| {
+            TransformError::ShapeError("GLM image canvas volume overflow".to_string())
+        })?;
+        if current > self.config.max_pixels {
+            (h_bar, w_bar) = fit_within_budget(height, width)?;
+        } else if current < self.config.min_pixels {
+            let beta = (self.config.min_pixels as f64
+                / (temporal as f64 * height as f64 * width as f64))
+                .sqrt();
+            h_bar = ceil_factor(((height as f64 * beta).ceil() as usize).max(1));
+            w_bar = ceil_factor(((width as f64 * beta).ceil() as usize).max(1));
+            if volume(h_bar, w_bar).is_some_and(|v| v > self.config.max_pixels) {
+                (h_bar, w_bar) = fit_within_budget(height, width)?;
+            }
+        }
+
+        Ok((h_bar, w_bar))
+    }
+
+    fn glm_resize_or_pad(
+        &self,
+        image: &DynamicImage,
+        target_width: u32,
+        target_height: u32,
+        filter: FilterType,
+    ) -> DynamicImage {
+        let (width, height) = image.dimensions();
+        let allow_upscale =
+            self.config.temporal_patch_size as u128 * height as u128 * (width as u128)
+                < self.config.min_pixels as u128;
+        let mut scale =
+            (target_height as f64 / height as f64).min(target_width as f64 / width as f64);
+        if !allow_upscale {
+            scale = scale.min(1.0);
+        }
+        let content_height = ((height as f64 * scale).floor() as u32)
+            .max(1)
+            .min(target_height);
+        let content_width = ((width as f64 * scale).floor() as u32)
+            .max(1)
+            .min(target_width);
+
+        let content = if content_width != width || content_height != height {
+            if filter == FilterType::CatmullRom {
+                resize_bicubic_pil(image, content_width, content_height).to_rgb8()
+            } else {
+                resize(image, content_width, content_height, filter).to_rgb8()
+            }
+        } else {
+            image.to_rgb8()
+        };
+        let mut canvas = RgbImage::new(target_width, target_height);
+        image::imageops::replace(&mut canvas, &content, 0, 0);
+        DynamicImage::ImageRgb8(canvas)
     }
 
     /// Smart resize for Qwen3-style video processors.
@@ -1150,7 +1284,11 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         for (image, plan) in images.iter().zip(image_plans) {
             // Resize to the image's own target size (skip if dimensions match)
             let resized;
-            let img_ref = if plan.needs_resize {
+            let img_ref = if self.image_resize_mode == QwenImageResizeMode::GlmPad {
+                resized =
+                    self.glm_resize_or_pad(image, plan.target_width, plan.target_height, filter);
+                &resized
+            } else if plan.needs_resize {
                 // BICUBIC (Qwen default) uses the PIL-compatible path; other
                 // filters keep the SIMD path.
                 resized = if filter == FilterType::CatmullRom {

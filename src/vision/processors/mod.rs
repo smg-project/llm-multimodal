@@ -20,6 +20,7 @@
 //! - **DeepSeek-V4.1** (`deepseek_v41`): contain-fit resize with gray padding and 3x3 aligner downsample
 
 pub mod deepseek_v41;
+pub mod glm5_next;
 pub mod inkling;
 pub(crate) mod kimi_base;
 pub mod kimi_k25;
@@ -36,6 +37,7 @@ pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
 pub use deepseek_v41::DeepseekV41Processor;
+pub use glm5_next::Glm5NextProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;
 pub use kimi_k3::KimiK3Processor;

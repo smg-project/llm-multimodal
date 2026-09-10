@@ -828,6 +828,72 @@ pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicIma
     }
 }
 
+/// Python-compatible rounding (banker's rounding / round half to even).
+///
+/// This matches Python's `round()` behavior where 0.5 is rounded to the nearest
+/// even number (e.g. `12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()`
+/// which rounds half away from zero.
+#[inline]
+pub(crate) fn round_half_to_even(x: f64) -> f64 {
+    let rounded = x.round();
+    // Check if we're exactly at a .5 case
+    if (x - x.floor() - 0.5).abs() < 1e-9 {
+        // Round to nearest even
+        if rounded as i64 % 2 != 0 {
+            return rounded - 1.0;
+        }
+    }
+    rounded
+}
+
+/// Pillow-exact `ImageOps.pad` for RGB images with default centering (0.5, 0.5):
+/// aspect-preserving BICUBIC `contain` fit into `(out_w, out_h)`, then a
+/// centered paste onto a `color` canvas. Matches Pillow 12.x source: `contain`
+/// adjusts at most one dimension using Python `round()` (banker's rounding)
+/// and `pad` pastes at `round((size - resized) * 0.5)` along the padded axis.
+pub fn pad_to_size_pil(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    color: Rgb<u8>,
+) -> DynamicImage {
+    let (w, h) = image.dimensions();
+    let (mut target_w, mut target_h) = (out_w, out_h);
+
+    // ImageOps.contain: fit within (out_w, out_h) preserving aspect ratio.
+    let im_ratio = f64::from(w) / f64::from(h);
+    let dest_ratio = f64::from(out_w) / f64::from(out_h);
+    if im_ratio != dest_ratio {
+        if im_ratio > dest_ratio {
+            let new_h = round_half_to_even(f64::from(h) / f64::from(w) * f64::from(out_w)) as u32;
+            if new_h != out_h {
+                target_h = new_h;
+            }
+        } else {
+            let new_w = round_half_to_even(f64::from(w) / f64::from(h) * f64::from(out_h)) as u32;
+            if new_w != out_w {
+                target_w = new_w;
+            }
+        }
+    }
+
+    let resized = resize_bicubic_pil(image, target_w, target_h).to_rgb8();
+    if target_w == out_w && target_h == out_h {
+        return DynamicImage::ImageRgb8(resized);
+    }
+
+    let mut out = RgbImage::from_pixel(out_w, out_h, color);
+    let (resized_w, resized_h) = resized.dimensions();
+    if resized_w != out_w {
+        let x = round_half_to_even(f64::from(out_w - resized_w) * 0.5) as i64;
+        image::imageops::overlay(&mut out, &resized, x, 0);
+    } else {
+        let y = round_half_to_even(f64::from(out_h - resized_h) * 0.5) as i64;
+        image::imageops::overlay(&mut out, &resized, 0, y);
+    }
+    DynamicImage::ImageRgb8(out)
+}
+
 /// Stack multiple [C, H, W] tensors into [B, C, H, W].
 ///
 /// All tensors must have the same shape.
@@ -835,7 +901,6 @@ pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
     if tensors.is_empty() {
         return Err(TransformError::EmptyBatch);
     }
-
     let shape = tensors[0].shape();
     let (c, h, w) = (shape[0], shape[1], shape[2]);
 

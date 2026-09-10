@@ -17,7 +17,9 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **MiniMax-M3** (`minimax_m3`): Qwen2-VL patchify with MiniMax smart resize
+//! - **DeepSeek-V4.1** (`deepseek_v41`): contain-fit resize with gray padding and 3x3 aligner downsample
 
+pub mod deepseek_v41;
 pub mod inkling;
 pub(crate) mod kimi_base;
 pub mod kimi_k25;
@@ -33,6 +35,7 @@ pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
+pub use deepseek_v41::DeepseekV41Processor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;
 pub use kimi_k3::KimiK3Processor;

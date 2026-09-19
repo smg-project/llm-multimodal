@@ -37,6 +37,7 @@ static IMAGE_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
+static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
 #[cfg(feature = "opencv-video")]
 static ACTIVE_OPENCV_DECODES: AtomicUsize = AtomicUsize::new(0);
 #[cfg(feature = "opencv-video")]
@@ -58,7 +59,7 @@ use super::{
     error::MediaConnectorError,
     types::{
         AudioClip, AudioSource, DecodedRgbFrame, DecodedRgbVideo, ImageDetail, ImageFrame,
-        ImageSource, VideoClip, VideoSource,
+        ImageSource, VideoClip, VideoSamplingInfo, VideoSource,
     },
 };
 
@@ -545,12 +546,18 @@ impl MediaConnector {
         let decoded = cap_decoded_frames(decoded, cfg.max_long_side_pixel);
 
         let clip = match decoded {
-            DecodedVideoFrames::Images { frames, sample_fps } => {
-                VideoClip::new_with_sample_fps(frames, bytes, source, hash, sample_fps)
-            }
-            DecodedVideoFrames::Rgb { video, sample_fps } => {
-                VideoClip::new_rgb_with_sample_fps(video, bytes, source, hash, sample_fps)
-            }
+            DecodedVideoFrames::Images {
+                frames,
+                sample_fps,
+                sampling,
+            } => VideoClip::new_with_sample_fps(frames, bytes, source, hash, sample_fps)
+                .with_sampling(sampling),
+            DecodedVideoFrames::Rgb {
+                video,
+                sample_fps,
+                sampling,
+            } => VideoClip::new_rgb_with_sample_fps(video, bytes, source, hash, sample_fps)
+                .with_sampling(sampling),
         };
         Ok(Arc::new(clip))
     }
@@ -673,10 +680,12 @@ enum DecodedVideoFrames {
     Images {
         frames: Vec<image::DynamicImage>,
         sample_fps: f32,
+        sampling: Option<VideoSamplingInfo>,
     },
     Rgb {
         video: DecodedRgbVideo,
         sample_fps: f32,
+        sampling: Option<VideoSamplingInfo>,
     },
 }
 
@@ -823,8 +832,7 @@ async fn decode_video_frames_from_path(
         None => {
             #[cfg(feature = "opencv-video")]
             {
-                // OpenCV samples by frame index while the FFmpeg fallback uses an
-                // fps filter, so the fallback can select a different frame set.
+                // Given a probed frame rate and count, the FFmpeg fallback samples the same indices.
                 let opencv_input_path = input_path.to_path_buf();
                 let opencv_result = task::spawn_blocking(move || {
                     decode_video_with_opencv_logged(&opencv_input_path, input_bytes, cfg)
@@ -1035,7 +1043,7 @@ where
     let fps = capture
         .get(videoio::CAP_PROP_FPS)
         .map_err(opencv_decode_error)?;
-    let frame_indices = opencv_frame_indices(total_frames, fps, cfg);
+    let frame_indices = sampled_frame_indices(total_frames, fps, cfg);
     if frame_indices.is_empty() {
         return Err(MediaConnectorError::VideoDecode(
             "OpenCV video sampling produced no frame indices".to_string(),
@@ -1163,13 +1171,17 @@ where
             MediaConnectorError::VideoDecode("OpenCV produced no RGB output".to_string())
         })?
         .into_bytes();
-    let sample_fps = effective_sample_fps(
-        (fps.is_finite() && fps > 0.0).then_some(total_frames as f64 / fps),
-        cfg,
-    );
+    let source_fps = (fps.is_finite() && fps > 0.0).then_some(fps);
+    let sample_fps = effective_sample_fps(source_fps.map(|fps| total_frames as f64 / fps), cfg);
+    // `frame_indices` keeps its duplicates, so it lines up with `frames` one to one.
+    let sampling = source_fps.map(|source_fps| VideoSamplingInfo {
+        source_fps,
+        frame_indices,
+    });
     Ok(DecodedVideoFrames::Rgb {
         video: DecodedRgbVideo::new(data, frames),
         sample_fps,
+        sampling,
     })
 }
 
@@ -1287,8 +1299,8 @@ fn adaptive_opencv_decoder_threads(available_cpus: usize, active_decodes: usize)
     (decoder_budget.max(1) / active_decodes).clamp(1, max_threads) as i32
 }
 
-#[cfg(feature = "opencv-video")]
-fn opencv_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+/// Source index per output frame, spread evenly over the stream; short clips repeat frames.
+fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let mut target_frames = if fps.is_finite() && fps > 0.0 {
         let duration = total_frames as f64 / fps;
         (duration * cfg.sample_fps as f64).round() as usize
@@ -1308,7 +1320,7 @@ fn opencv_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) ->
         .collect()
 }
 
-#[cfg(feature = "opencv-video")]
+/// Distinct indices in order, each with its repeat count.
 fn counted_frame_indices(frame_indices: &[usize]) -> Vec<(usize, usize)> {
     let mut counts = Vec::new();
     for &idx in frame_indices {
@@ -1333,15 +1345,60 @@ async fn decode_video_with_ffmpeg(
     input_bytes: usize,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
-    if let Ok(metadata) = probe_video_metadata(input_path).await {
+    let metadata = probe_video_metadata(input_path).await.ok();
+    let Some(selection) =
+        metadata.and_then(|metadata| FrameSelection::from_metadata(metadata, cfg))
+    else {
+        return decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
+            .await;
+    };
+    let selected_error = match decode_video_with_ffmpeg_runners(
+        input_path,
+        input_bytes,
+        cfg,
+        metadata,
+        Some(&selection),
+    )
+    .await
+    {
+        Ok(decoded) => return Ok(decoded),
+        Err(error) => error,
+    };
+    // A probed frame count past the stream's end leaves the selection short; resample by rate.
+    if log_video_decode_timing_enabled() {
+        info!(
+            error = %selected_error,
+            "smg_mm_timing video_decode_ffmpeg_select_fallback"
+        );
+    }
+    decode_video_with_ffmpeg_runners(input_path, input_bytes, cfg, metadata, None)
+        .await
+        .map_err(|fallback_error| {
+            MediaConnectorError::VideoDecode(format!(
+                "ffmpeg frame selection failed: {selected_error}; fps resampling fallback failed: {fallback_error}"
+            ))
+        })
+}
+
+/// One pass over the ppm, raw and png runners; `selection` pins the exact source frames.
+async fn decode_video_with_ffmpeg_runners(
+    input_path: &std::path::Path,
+    input_bytes: usize,
+    cfg: VideoFetchConfig,
+    metadata: Option<VideoMetadata>,
+    selection: Option<&FrameSelection>,
+) -> Result<DecodedVideoFrames, MediaConnectorError> {
+    let sampling = selection.map(FrameSelection::sampling_info);
+    if let Some(metadata) = metadata {
         let sample_fps = effective_sample_fps(metadata.duration_seconds, cfg);
         let started = Instant::now();
-        match decode_video_with_ffmpeg_ppm(input_path, cfg, metadata).await {
-            Ok(rgb_video) => {
+        match decode_video_with_ffmpeg_ppm(input_path, cfg, metadata, selection).await {
+            Ok(video) => {
                 log_video_decode_backend_timing("ffmpeg_ppm_file", started, input_bytes, cfg, None);
                 return Ok(DecodedVideoFrames::Rgb {
-                    video: rgb_video,
+                    video,
                     sample_fps,
+                    sampling,
                 });
             }
             Err(error) => {
@@ -1356,12 +1413,13 @@ async fn decode_video_with_ffmpeg(
         }
 
         let started = Instant::now();
-        match decode_video_with_ffmpeg_raw(input_path, cfg, metadata).await {
-            Ok(rgb_video) => {
+        match decode_video_with_ffmpeg_raw(input_path, cfg, metadata, selection).await {
+            Ok(video) => {
                 log_video_decode_backend_timing("ffmpeg_raw_file", started, input_bytes, cfg, None);
                 return Ok(DecodedVideoFrames::Rgb {
-                    video: rgb_video,
+                    video,
                     sample_fps,
+                    sampling,
                 });
             }
             Err(error) => {
@@ -1377,10 +1435,14 @@ async fn decode_video_with_ffmpeg(
     }
 
     let started = Instant::now();
-    match decode_video_with_ffmpeg_png(input_path, cfg).await {
+    match decode_video_with_ffmpeg_png(input_path, cfg, metadata, selection).await {
         Ok((frames, sample_fps)) => {
             log_video_decode_backend_timing("ffmpeg_png_file", started, input_bytes, cfg, None);
-            Ok(DecodedVideoFrames::Images { frames, sample_fps })
+            Ok(DecodedVideoFrames::Images {
+                frames,
+                sample_fps,
+                sampling,
+            })
         }
         Err(error) => {
             log_video_decode_backend_timing(
@@ -1508,11 +1570,14 @@ async fn decode_video_with_ffmpeg_ppm(
     input_path: &std::path::Path,
     cfg: VideoFetchConfig,
     metadata: VideoMetadata,
+    selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let fps_filter = fps_filter_for_metadata(metadata, cfg);
-    let max_frames = cfg.max_frames.to_string();
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = expected_sampled_frame_count(metadata, cfg);
+    let target_frames = selection.map_or_else(
+        || expected_sampled_frame_count(metadata, cfg),
+        FrameSelection::unique_count,
+    );
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes
         .checked_add(target_frames.saturating_mul(64))
@@ -1522,22 +1587,19 @@ async fn decode_video_with_ffmpeg_ppm(
     let mut command = Command::new("ffmpeg");
     command
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(input_path)
-        .args([
-            "-vf",
-            &fps_filter,
-            "-frames:v",
-            &max_frames,
-            "-fs",
-            &output_limit,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "ppm",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]);
+        .arg(input_path);
+    frame_args.apply(&mut command);
+    command.args([
+        "-fs",
+        &output_limit,
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "ppm",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]);
     let output = run_video_command_output(command, "ffmpeg").await?;
 
     if !output.status.success() {
@@ -1547,18 +1609,25 @@ async fn decode_video_with_ffmpeg_ppm(
         )));
     }
 
-    parse_ppm_rgb_video(Bytes::from(output.stdout))
+    let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
+    if let Some(selection) = selection {
+        video.frames = selection.expand(video.frames)?;
+    }
+    Ok(video)
 }
 
 async fn decode_video_with_ffmpeg_raw(
     input_path: &std::path::Path,
     cfg: VideoFetchConfig,
     metadata: VideoMetadata,
+    selection: Option<&FrameSelection>,
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
-    let fps_filter = fps_filter_for_metadata(metadata, cfg);
-    let max_frames = cfg.max_frames.to_string();
+    let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = expected_sampled_frame_count(metadata, cfg);
+    let target_frames = selection.map_or_else(
+        || expected_sampled_frame_count(metadata, cfg),
+        FrameSelection::unique_count,
+    );
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
     let mut command = Command::new("ffmpeg");
@@ -1574,20 +1643,17 @@ async fn decode_video_with_ffmpeg_raw(
             "-noautorotate",
             "-i",
         ])
-        .arg(input_path)
-        .args([
-            "-vf",
-            &fps_filter,
-            "-frames:v",
-            &max_frames,
-            "-fs",
-            &output_limit,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "rgb24",
-            "pipe:1",
-        ]);
+        .arg(input_path);
+    frame_args.apply(&mut command);
+    command.args([
+        "-fs",
+        &output_limit,
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "pipe:1",
+    ]);
     let output = run_video_command_output(command, "ffmpeg").await?;
 
     if !output.status.success() {
@@ -1624,33 +1690,43 @@ async fn decode_video_with_ffmpeg_raw(
             "ffmpeg produced no frames".to_string(),
         ));
     }
+    if let Some(selection) = selection {
+        frames = selection.expand(frames)?;
+    }
     Ok(DecodedRgbVideo::new(Bytes::from(output.stdout), frames))
 }
 
 async fn decode_video_with_ffmpeg_png(
     input_path: &std::path::Path,
     cfg: VideoFetchConfig,
+    metadata: Option<VideoMetadata>,
+    selection: Option<&FrameSelection>,
 ) -> Result<(Vec<image::DynamicImage>, f32), MediaConnectorError> {
-    let (fps_filter, sample_fps) = sampling_filter_for_video(input_path, cfg).await;
-    let max_frames = cfg.max_frames.to_string();
+    let (frame_args, sample_fps) = match selection.zip(metadata) {
+        Some((selection, metadata)) => (
+            FfmpegFrameArgs::selected(selection).await,
+            effective_sample_fps(metadata.duration_seconds, cfg),
+        ),
+        None => {
+            let (fps_filter, sample_fps) = sampling_filter_for_video(input_path, cfg).await;
+            (FfmpegFrameArgs::resampled(fps_filter, cfg), sample_fps)
+        }
+    };
     let output_limit = video_max_decoded_bytes().to_string();
     let mut command = Command::new("ffmpeg");
     command
         .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(input_path)
-        .args([
-            "-vf",
-            &fps_filter,
-            "-frames:v",
-            &max_frames,
-            "-fs",
-            &output_limit,
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "png",
-            "pipe:1",
-        ]);
+        .arg(input_path);
+    frame_args.apply(&mut command);
+    command.args([
+        "-fs",
+        &output_limit,
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "png",
+        "pipe:1",
+    ]);
     let output = run_video_command_output(command, "ffmpeg").await?;
 
     if !output.status.success() {
@@ -1663,6 +1739,7 @@ async fn decode_video_with_ffmpeg_png(
     let pngs = split_png_stream(&output.stdout)?;
     let mut frames = Vec::with_capacity(pngs.len());
     let mut decoded_bytes = 0usize;
+    let mut max_frame_size = 0usize;
     for png in pngs {
         let image = image::load_from_memory(png)?;
         let frame_size = rawvideo_frame_size(image.width(), image.height())?;
@@ -1670,12 +1747,18 @@ async fn decode_video_with_ffmpeg_png(
             MediaConnectorError::VideoDecode("PNG decoded byte size overflow".to_string())
         })?;
         ensure_decoded_byte_limit(decoded_bytes)?;
+        max_frame_size = max_frame_size.max(frame_size);
         frames.push(image);
     }
     if frames.is_empty() {
         return Err(MediaConnectorError::VideoDecode(
             "ffmpeg produced no frames".to_string(),
         ));
+    }
+    if let Some(selection) = selection {
+        // Repeats are pixel copies here, so bound the expanded set before cloning.
+        checked_decoded_rgb_bytes(selection.frame_indices.len(), max_frame_size)?;
+        frames = selection.expand(frames)?;
     }
     Ok((frames, sample_fps))
 }
@@ -1685,6 +1768,8 @@ struct VideoMetadata {
     width: u32,
     height: u32,
     duration_seconds: Option<f64>,
+    source_fps: Option<f64>,
+    total_frames: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1692,6 +1777,8 @@ struct ProbedVideoInfo {
     width: Option<u32>,
     height: Option<u32>,
     duration_seconds: Option<f64>,
+    source_fps: Option<f64>,
+    total_frames: Option<usize>,
 }
 
 async fn probe_video_metadata(
@@ -1708,6 +1795,8 @@ async fn probe_video_metadata(
         width,
         height,
         duration_seconds: info.duration_seconds,
+        source_fps: info.source_fps,
+        total_frames: info.total_frames,
     })
 }
 
@@ -1722,7 +1811,7 @@ async fn probe_video_info(
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,duration,duration_ts,time_base:format=duration",
+            "stream=width,height,duration,duration_ts,time_base,r_frame_rate,avg_frame_rate,nb_frames:format=duration",
             "-of",
             "json",
         ])
@@ -1750,10 +1839,10 @@ fn parse_ffprobe_video_info(stdout: &[u8]) -> Result<ProbedVideoInfo, MediaConne
 
     let width = video_stream
         .and_then(|stream| stream.get("width"))
-        .and_then(json_u32);
+        .and_then(json_uint::<u32>);
     let height = video_stream
         .and_then(|stream| stream.get("height"))
-        .and_then(json_u32);
+        .and_then(json_uint::<u32>);
     let stream_duration = video_stream
         .and_then(|stream| stream.get("duration"))
         .and_then(json_positive_f64);
@@ -1762,7 +1851,7 @@ fn parse_ffprobe_video_info(stdout: &[u8]) -> Result<ProbedVideoInfo, MediaConne
         let time_base = stream
             .get("time_base")
             .and_then(serde_json::Value::as_str)
-            .and_then(parse_time_base)?;
+            .and_then(parse_rational)?;
         let duration = duration_ts * time_base;
         (duration.is_finite() && duration > 0.0).then_some(duration)
     });
@@ -1770,21 +1859,42 @@ fn parse_ffprobe_video_info(stdout: &[u8]) -> Result<ProbedVideoInfo, MediaConne
         .get("format")
         .and_then(|format| format.get("duration"))
         .and_then(json_positive_f64);
+    let duration_seconds = stream_duration
+        .or(stream_time_base_duration)
+        .or(format_duration);
+
+    // ffprobe reports an unknown rate as `0/0`, which parse_rational rejects.
+    let frame_rate = |key: &str| {
+        video_stream
+            .and_then(|stream| stream.get(key))
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_rational)
+    };
+    let source_fps = frame_rate("avg_frame_rate").or_else(|| frame_rate("r_frame_rate"));
+    // nb_frames is absent or `N/A` for many containers; the duration then sizes the stream.
+    let total_frames = video_stream
+        .and_then(|stream| stream.get("nb_frames"))
+        .and_then(json_uint::<usize>)
+        .filter(|frames| *frames > 0)
+        .or_else(|| {
+            let frames = (duration_seconds? * source_fps?).round();
+            (frames.is_finite() && frames >= 1.0).then_some(frames as usize)
+        });
 
     Ok(ProbedVideoInfo {
         width,
         height,
-        duration_seconds: stream_duration
-            .or(stream_time_base_duration)
-            .or(format_duration),
+        duration_seconds,
+        source_fps,
+        total_frames,
     })
 }
 
-fn json_u32(value: &serde_json::Value) -> Option<u32> {
+fn json_uint<T: TryFrom<u64> + std::str::FromStr>(value: &serde_json::Value) -> Option<T> {
     value
         .as_u64()
-        .and_then(|value| u32::try_from(value).ok())
-        .or_else(|| value.as_str()?.parse::<u32>().ok())
+        .and_then(|value| T::try_from(value).ok())
+        .or_else(|| value.as_str()?.parse::<T>().ok())
 }
 
 fn json_positive_f64(value: &serde_json::Value) -> Option<f64> {
@@ -1794,12 +1904,13 @@ fn json_positive_f64(value: &serde_json::Value) -> Option<f64> {
         .filter(|value| value.is_finite() && *value > 0.0)
 }
 
-fn parse_time_base(value: &str) -> Option<f64> {
+/// Parse an ffprobe `num/den` string (time base or frame rate) into a positive finite ratio.
+fn parse_rational(value: &str) -> Option<f64> {
     let (numerator, denominator) = value.split_once('/')?;
     let numerator = numerator.parse::<f64>().ok()?;
     let denominator = denominator.parse::<f64>().ok()?;
-    let time_base = numerator / denominator;
-    (time_base.is_finite() && time_base > 0.0).then_some(time_base)
+    let ratio = numerator / denominator;
+    (ratio.is_finite() && ratio > 0.0).then_some(ratio)
 }
 
 fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> String {
@@ -1831,6 +1942,145 @@ fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) ->
         })
         .filter(|fps| fps.is_finite() && *fps > 0.0)
         .unwrap_or(cfg.sample_fps)
+}
+
+/// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
+#[derive(Debug, Clone, PartialEq)]
+struct FrameSelection {
+    source_fps: f64,
+    /// Source index per output frame, duplicates included.
+    frame_indices: Vec<usize>,
+    /// Distinct indices in stream order, each with its repeat count.
+    unique_frames: Vec<(usize, usize)>,
+}
+
+impl FrameSelection {
+    /// `None` unless ffprobe reported both a frame rate and a frame count.
+    fn from_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<Self> {
+        let source_fps = metadata.source_fps?;
+        let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
+        let frame_indices = sampled_frame_indices(total_frames, source_fps, cfg);
+        let unique_frames = counted_frame_indices(&frame_indices);
+        Some(Self {
+            source_fps,
+            frame_indices,
+            unique_frames,
+        })
+    }
+
+    fn unique_count(&self) -> usize {
+        self.unique_frames.len()
+    }
+
+    /// `select` over the distinct indices; `\,` keeps the filtergraph parser from splitting.
+    fn select_filter(&self) -> String {
+        let terms: Vec<String> = self
+            .unique_frames
+            .iter()
+            .map(|(idx, _)| format!("eq(n\\,{idx})"))
+            .collect();
+        format!("select='{}'", terms.join("+"))
+    }
+
+    /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
+    fn expand<T: Clone>(&self, frames: Vec<T>) -> Result<Vec<T>, MediaConnectorError> {
+        if frames.len() != self.unique_frames.len() {
+            return Err(MediaConnectorError::VideoDecode(format!(
+                "ffmpeg produced {} selected frames, expected {}",
+                frames.len(),
+                self.unique_frames.len()
+            )));
+        }
+        let mut expanded = Vec::with_capacity(self.frame_indices.len());
+        for (frame, &(_, repeat)) in frames.into_iter().zip(&self.unique_frames) {
+            expanded.extend(std::iter::repeat_n(frame, repeat));
+        }
+        Ok(expanded)
+    }
+
+    fn sampling_info(&self) -> VideoSamplingInfo {
+        VideoSamplingInfo {
+            source_fps: self.source_fps,
+            frame_indices: self.frame_indices.clone(),
+        }
+    }
+}
+
+/// Output-side ffmpeg arguments choosing which decoded frames to emit.
+struct FfmpegFrameArgs {
+    filter: String,
+    frames: String,
+    /// Keeps the selected frames' timestamps instead of padding to a constant rate.
+    sync: Option<[&'static str; 2]>,
+}
+
+impl FfmpegFrameArgs {
+    async fn selected(selection: &FrameSelection) -> Self {
+        Self {
+            filter: selection.select_filter(),
+            frames: selection.unique_count().to_string(),
+            sync: Some(ffmpeg_passthrough_flag().await),
+        }
+    }
+
+    fn resampled(fps_filter: String, cfg: VideoFetchConfig) -> Self {
+        Self {
+            filter: fps_filter,
+            frames: cfg.max_frames.to_string(),
+            sync: None,
+        }
+    }
+
+    async fn for_metadata(
+        selection: Option<&FrameSelection>,
+        metadata: VideoMetadata,
+        cfg: VideoFetchConfig,
+    ) -> Self {
+        match selection {
+            Some(selection) => Self::selected(selection).await,
+            None => Self::resampled(fps_filter_for_metadata(metadata, cfg), cfg),
+        }
+    }
+
+    fn apply(&self, command: &mut Command) {
+        command.args(["-vf", &self.filter, "-frames:v", &self.frames]);
+        if let Some(sync) = self.sync {
+            command.args(sync);
+        }
+    }
+}
+
+const FPS_MODE_PASSTHROUGH: [&str; 2] = ["-fps_mode", "passthrough"];
+const VSYNC_PASSTHROUGH: [&str; 2] = ["-vsync", "0"];
+
+/// Probe `ffmpeg -version` once per process; the binary on PATH does not change underneath.
+async fn ffmpeg_passthrough_flag() -> [&'static str; 2] {
+    if let Some(flag) = FFMPEG_PASSTHROUGH_FLAG.get() {
+        return *flag;
+    }
+    let mut command = Command::new("ffmpeg");
+    command.arg("-version");
+    let flag = match run_video_command_output(command, "ffmpeg").await {
+        Ok(output) => passthrough_flag_for_version(&String::from_utf8_lossy(&output.stdout)),
+        Err(_) => VSYNC_PASSTHROUGH,
+    };
+    *FFMPEG_PASSTHROUGH_FLAG.get_or_init(|| flag)
+}
+
+/// ffmpeg 5.1 replaced `-vsync 0` with `-fps_mode passthrough`, which older builds reject.
+fn passthrough_flag_for_version(version_output: &str) -> [&'static str; 2] {
+    match ffmpeg_version(version_output) {
+        Some(version) if version >= (5, 1) => FPS_MODE_PASSTHROUGH,
+        _ => VSYNC_PASSTHROUGH,
+    }
+}
+
+/// `major.minor` from the first line of `ffmpeg -version`; git snapshots carry no such number.
+fn ffmpeg_version(version_output: &str) -> Option<(u32, u32)> {
+    let (_, version) = version_output.lines().next()?.split_once("version ")?;
+    let (major, rest) = version.trim_start_matches('n').split_once('.')?;
+    let minor = rest.split(|c: char| !c.is_ascii_digit()).next()?;
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn fps_filter_for_duration(duration: f64, cfg: VideoFetchConfig) -> Option<String> {
@@ -2182,6 +2432,8 @@ mod tests {
             width: info.width.expect("video width"),
             height: info.height.expect("video height"),
             duration_seconds: info.duration_seconds,
+            source_fps: info.source_fps,
+            total_frames: info.total_frames,
         };
         assert_eq!(expected_sampled_frame_count(metadata, cfg), 4);
         assert_eq!(fps_filter_for_metadata(metadata, cfg), "fps=4.000000");
@@ -2370,16 +2622,15 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(feature = "opencv-video")]
     #[test]
-    fn opencv_sampling_preserves_min_frames_for_short_clips() {
+    fn sampled_frame_indices_preserve_min_frames_for_short_clips() {
         let cfg = VideoFetchConfig {
             min_frames: 4,
             max_frames: 8,
             sample_fps: 2.0,
             max_long_side_pixel: None,
         };
-        let indices = super::opencv_frame_indices(1, 30.0, cfg);
+        let indices = super::sampled_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);
         assert_eq!(super::counted_frame_indices(&indices), vec![(0, 4)]);
     }
@@ -2427,6 +2678,324 @@ mod tests {
                 "cap {value}: unexpected error {err:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod video_sampling_tests {
+    use super::*;
+
+    fn cfg() -> VideoFetchConfig {
+        VideoFetchConfig {
+            min_frames: 4,
+            max_frames: 8,
+            sample_fps: 2.0,
+            max_long_side_pixel: None,
+        }
+    }
+
+    fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {
+        VideoMetadata {
+            width: 64,
+            height: 48,
+            duration_seconds: Some(2.0),
+            source_fps,
+            total_frames,
+        }
+    }
+
+    #[test]
+    fn both_backends_sample_the_same_source_indices() {
+        assert_eq!(sampled_frame_indices(60, 30.0, cfg()), vec![0, 19, 39, 59]);
+        // Long clips clamp to max_frames; short ones repeat frames up to min_frames.
+        assert_eq!(
+            sampled_frame_indices(300, 30.0, cfg()),
+            vec![0, 42, 85, 128, 170, 213, 256, 299]
+        );
+        assert_eq!(sampled_frame_indices(2, 30.0, cfg()), vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn frame_selection_needs_a_frame_rate_and_a_frame_count() {
+        assert_eq!(
+            FrameSelection::from_metadata(metadata(None, Some(60)), cfg()),
+            None
+        );
+        assert_eq!(
+            FrameSelection::from_metadata(metadata(Some(30.0), None), cfg()),
+            None
+        );
+        assert_eq!(
+            FrameSelection::from_metadata(metadata(Some(30.0), Some(0)), cfg()),
+            None
+        );
+
+        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
+            .expect("frame rate and count are known");
+        assert_eq!(selection.frame_indices, vec![0, 19, 39, 59]);
+        assert_eq!(
+            selection.unique_frames,
+            vec![(0, 1), (19, 1), (39, 1), (59, 1)]
+        );
+        assert_eq!(
+            selection.sampling_info(),
+            VideoSamplingInfo {
+                source_fps: 30.0,
+                frame_indices: vec![0, 19, 39, 59],
+            }
+        );
+    }
+
+    #[test]
+    fn select_filter_escapes_commas_and_lists_each_distinct_index_once() {
+        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(2)), cfg())
+            .expect("frame rate and count are known");
+        assert_eq!(selection.frame_indices, vec![0, 0, 0, 1]);
+        assert_eq!(selection.unique_count(), 2);
+        assert_eq!(selection.select_filter(), r"select='eq(n\,0)+eq(n\,1)'");
+
+        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), cfg())
+            .expect("frame rate and count are known");
+        assert_eq!(
+            selection.select_filter(),
+            r"select='eq(n\,0)+eq(n\,19)+eq(n\,39)+eq(n\,59)'"
+        );
+    }
+
+    #[test]
+    fn expanding_selected_frames_repeats_them_to_match_the_indices() {
+        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(2)), cfg())
+            .expect("frame rate and count are known");
+        assert_eq!(
+            selection
+                .expand(vec!['a', 'b'])
+                .expect("one frame per distinct index"),
+            vec!['a', 'a', 'a', 'b']
+        );
+        // A short or long decode fails the runner instead of misaligning the indices.
+        assert!(selection.expand(vec!['a']).is_err());
+        assert!(selection.expand(vec!['a', 'b', 'c']).is_err());
+    }
+
+    #[test]
+    fn passthrough_flag_follows_the_ffmpeg_version() {
+        for version in [
+            "ffmpeg version 6.1.1 Copyright (c) 2000-2023 the FFmpeg developers\nbuilt with gcc",
+            "ffmpeg version 5.1.4-0+deb12u1 Copyright (c) 2000-2023 the FFmpeg developers",
+            "ffmpeg version n7.0.2-6-gabcdef Copyright (c) 2000-2024 the FFmpeg developers",
+            "ffmpeg version 7.1-full_build-www.gyan.dev Copyright (c) 2000-2024",
+        ] {
+            assert_eq!(
+                passthrough_flag_for_version(version),
+                FPS_MODE_PASSTHROUGH,
+                "{version}"
+            );
+        }
+        for version in [
+            "ffmpeg version 5.0.3 Copyright (c) 2000-2022 the FFmpeg developers",
+            "ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright (c) 2000-2021 the FFmpeg developers",
+            "ffmpeg version N-112345-gabcdef Copyright (c) 2000-2023 the FFmpeg developers",
+            "",
+        ] {
+            assert_eq!(
+                passthrough_flag_for_version(version),
+                VSYNC_PASSTHROUGH,
+                "{version}"
+            );
+        }
+    }
+
+    #[test]
+    fn ffprobe_prefers_avg_frame_rate_and_nb_frames() {
+        let output = br#"{
+            "streams": [{
+                "width": 640,
+                "height": 360,
+                "duration": "10.010000",
+                "r_frame_rate": "30/1",
+                "avg_frame_rate": "30000/1001",
+                "nb_frames": "300"
+            }]
+        }"#;
+        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
+        let source_fps = info.source_fps.expect("frame rate");
+        assert!((source_fps - 30000.0 / 1001.0).abs() < 1e-9, "{source_fps}");
+        assert_eq!(info.total_frames, Some(300));
+    }
+
+    #[test]
+    fn ffprobe_falls_back_to_r_frame_rate() {
+        // An unknown average rate is reported as `0/0`.
+        let output = br#"{"streams": [{"width": 640, "height": 360, "r_frame_rate": "25/1", "avg_frame_rate": "0/0"}]}"#;
+        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
+        assert_eq!(info.source_fps, Some(25.0));
+        assert_eq!(info.total_frames, None);
+
+        let output = br#"{"streams": [{"width": 640, "height": 360, "r_frame_rate": "25/1"}]}"#;
+        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
+        assert_eq!(info.source_fps, Some(25.0));
+    }
+
+    #[test]
+    fn ffprobe_derives_the_frame_count_from_the_duration() {
+        for nb_frames in [r#""nb_frames": "N/A","#, r#""nb_frames": "0","#, ""] {
+            let output = format!(
+                r#"{{"streams": [{{"width": 640, "height": 360, "duration": "2.500000", "avg_frame_rate": "24/1", {nb_frames} "time_base": "1/24"}}]}}"#
+            );
+            let info = parse_ffprobe_video_info(output.as_bytes()).expect("valid ffprobe output");
+            assert_eq!(info.total_frames, Some(60), "{nb_frames}");
+        }
+    }
+
+    #[test]
+    fn ffprobe_without_a_frame_rate_reports_nothing() {
+        let output = br#"{"streams": [{"width": 640, "height": 360, "duration": "2.0", "avg_frame_rate": "0/0", "r_frame_rate": "0/0", "nb_frames": "N/A"}]}"#;
+        let info = parse_ffprobe_video_info(output).expect("valid ffprobe output");
+        assert_eq!(info.source_fps, None);
+        assert_eq!(info.total_frames, None);
+    }
+
+    /// Skipped when ffmpeg or ffprobe is not on PATH.
+    #[tokio::test]
+    async fn ffmpeg_path_decodes_exactly_the_sampled_source_frames() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.mp4");
+        let generated = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x48:rate=30:duration=2",
+                "-c:v",
+                "mpeg4",
+                "-pix_fmt",
+                "yuv420p",
+                "-y",
+            ])
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        let probed = Command::new("ffprobe")
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        if !matches!((generated, probed), (Ok(generated), Ok(probed)) if generated.success() && probed.success())
+        {
+            return;
+        }
+
+        let metadata = probe_video_metadata(&path).await.expect("ffprobe metadata");
+        assert_eq!(metadata.total_frames, Some(60));
+        assert_eq!(metadata.source_fps, Some(30.0));
+
+        let input_bytes = fs::read(&path).await.expect("generated clip").len();
+        let decoded = decode_video_with_ffmpeg(&path, input_bytes, cfg())
+            .await
+            .expect("ffmpeg decode");
+        let (frames, sampling): (Vec<Vec<u8>>, _) = match decoded {
+            DecodedVideoFrames::Rgb {
+                video, sampling, ..
+            } => (
+                video
+                    .frame_refs()
+                    .expect("frame refs")
+                    .iter()
+                    .map(|frame| frame.data.to_vec())
+                    .collect(),
+                sampling,
+            ),
+            DecodedVideoFrames::Images {
+                frames, sampling, ..
+            } => (
+                frames
+                    .iter()
+                    .map(|frame| frame.to_rgb8().into_raw())
+                    .collect(),
+                sampling,
+            ),
+        };
+        let sampling = sampling.expect("ffprobe reports the frame rate and count");
+        assert!(
+            (sampling.source_fps - 30.0).abs() < 1e-6,
+            "{}",
+            sampling.source_fps
+        );
+        assert_eq!(
+            sampling.frame_indices,
+            sampled_frame_indices(60, 30.0, cfg())
+        );
+        assert_eq!(sampling.frame_indices, vec![0, 19, 39, 59]);
+        assert_eq!(frames.len(), sampling.frame_indices.len());
+        // Distinct source frames: padding to a constant rate would repeat frame 0 instead.
+        for pair in frames.windows(2) {
+            assert_ne!(pair[0], pair[1]);
+        }
+
+        // A frame count past the stream's end leaves the selection short and fails the runner.
+        let overshoot = VideoMetadata {
+            total_frames: Some(61),
+            ..metadata
+        };
+        let selection =
+            FrameSelection::from_metadata(overshoot, cfg()).expect("frame rate and count");
+        assert_eq!(selection.frame_indices, vec![0, 20, 40, 60]);
+        let error = decode_video_with_ffmpeg_ppm(&path, cfg(), overshoot, Some(&selection))
+            .await
+            .expect_err("frame 60 does not exist");
+        assert!(error.to_string().contains("expected 4"), "{error}");
+    }
+
+    #[cfg(feature = "opencv-video")]
+    #[test]
+    fn opencv_path_reports_the_source_fps_and_one_index_per_frame() {
+        use opencv::core::{Scalar, Size, CV_8UC3};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("clip.avi");
+        let fourcc = videoio::VideoWriter::fourcc('M', 'J', 'P', 'G').expect("fourcc");
+        let mut writer = videoio::VideoWriter::new(
+            path.to_str().expect("utf-8 path"),
+            fourcc,
+            30.0,
+            Size::new(64, 48),
+            true,
+        )
+        .expect("video writer");
+        for shade in 0..60 {
+            let frame = Mat::new_rows_cols_with_default(
+                48,
+                64,
+                CV_8UC3,
+                Scalar::all(f64::from(shade) * 4.0),
+            )
+            .expect("frame");
+            writer.write(&frame).expect("write frame");
+        }
+        writer.release().expect("release writer");
+
+        let decoded = decode_video_with_opencv_file(&path, cfg()).expect("opencv decode");
+        let DecodedVideoFrames::Rgb {
+            video, sampling, ..
+        } = decoded
+        else {
+            panic!("expected RGB");
+        };
+        let sampling = sampling.expect("CAP_PROP_FPS is known");
+        assert!(
+            (sampling.source_fps - 30.0).abs() < 1e-6,
+            "{}",
+            sampling.source_fps
+        );
+        assert_eq!(sampling.frame_indices.len(), video.frames.len());
+        assert_eq!(sampling.frame_indices, vec![0, 19, 39, 59]);
     }
 }
 
@@ -2601,16 +3170,28 @@ fn cap_decoded_frames(
     };
 
     match decoded {
-        DecodedVideoFrames::Images { frames, sample_fps } => {
+        DecodedVideoFrames::Images {
+            frames,
+            sample_fps,
+            sampling,
+        } => {
             // Same policy as the image path — filter, no-upscale rule and
             // rounding all live in one place.
             let frames = frames
                 .into_iter()
                 .map(|frame| apply_max_long_side_pixel(frame, Some(cap)))
                 .collect();
-            DecodedVideoFrames::Images { frames, sample_fps }
+            DecodedVideoFrames::Images {
+                frames,
+                sample_fps,
+                sampling,
+            }
         }
-        DecodedVideoFrames::Rgb { video, sample_fps } => {
+        DecodedVideoFrames::Rgb {
+            video,
+            sample_fps,
+            sampling,
+        } => {
             // Nothing over the cap: keep the original buffer instead of
             // rebuilding it byte-for-byte.
             if video
@@ -2618,7 +3199,11 @@ fn cap_decoded_frames(
                 .iter()
                 .all(|f| capped_dimensions(f.width, f.height, cap).is_none())
             {
-                return DecodedVideoFrames::Rgb { video, sample_fps };
+                return DecodedVideoFrames::Rgb {
+                    video,
+                    sample_fps,
+                    sampling,
+                };
             }
 
             // Size from the capped geometry; the pre-cap length would leave a
@@ -2648,7 +3233,11 @@ fn cap_decoded_frames(
                 else {
                     // A frame that does not slice cleanly is left to the
                     // downstream validation rather than silently reshaped.
-                    return DecodedVideoFrames::Rgb { video, sample_fps };
+                    return DecodedVideoFrames::Rgb {
+                        video,
+                        sample_fps,
+                        sampling,
+                    };
                 };
                 let (width, height, bytes) = match capped_dimensions(frame.width, frame.height, cap)
                 {
@@ -2657,7 +3246,11 @@ fn cap_decoded_frames(
                         let Some(buf) =
                             image::RgbImage::from_raw(frame.width, frame.height, src.to_vec())
                         else {
-                            return DecodedVideoFrames::Rgb { video, sample_fps };
+                            return DecodedVideoFrames::Rgb {
+                                video,
+                                sample_fps,
+                                sampling,
+                            };
                         };
                         let resized = image::DynamicImage::ImageRgb8(buf).resize_exact(
                             w,
@@ -2680,6 +3273,7 @@ fn cap_decoded_frames(
             DecodedVideoFrames::Rgb {
                 video: DecodedRgbVideo::new(Bytes::from(data), frames),
                 sample_fps,
+                sampling,
             }
         }
     }
@@ -2688,6 +3282,13 @@ fn cap_decoded_frames(
 #[cfg(test)]
 mod video_frame_cap_tests {
     use super::*;
+
+    fn sampling(frames: usize) -> VideoSamplingInfo {
+        VideoSamplingInfo {
+            source_fps: 30.0,
+            frame_indices: (0..frames).map(|i| i * 15).collect(),
+        }
+    }
 
     fn rgb_video(width: u32, height: u32, frames: usize) -> DecodedVideoFrames {
         let len = (width * height * 3) as usize;
@@ -2705,6 +3306,28 @@ mod video_frame_cap_tests {
         DecodedVideoFrames::Rgb {
             video: DecodedRgbVideo::new(Bytes::from(data), descs),
             sample_fps: 2.0,
+            sampling: Some(sampling(frames)),
+        }
+    }
+
+    #[test]
+    fn sampling_metadata_survives_the_cap_unchanged() {
+        // Rescaled, left alone, and uncapped: the cap only touches pixels.
+        for (decoded, cap) in [
+            (rgb_video(1920, 1080, 3), Some(504)),
+            (rgb_video(320, 240, 3), Some(1008)),
+            (rgb_video(1920, 1080, 3), None),
+        ] {
+            let DecodedVideoFrames::Rgb {
+                sample_fps,
+                sampling: capped,
+                ..
+            } = cap_decoded_frames(decoded, cap)
+            else {
+                panic!("expected RGB");
+            };
+            assert_eq!(sample_fps, 2.0);
+            assert_eq!(capped, Some(sampling(3)));
         }
     }
 
@@ -2736,6 +3359,7 @@ mod video_frame_cap_tests {
         let decoded = DecodedVideoFrames::Rgb {
             video: DecodedRgbVideo::new(Bytes::from(data), frames),
             sample_fps: 2.0,
+            sampling: None,
         };
 
         let DecodedVideoFrames::Rgb { video, .. } = cap_decoded_frames(decoded, Some(504)) else {
@@ -2816,11 +3440,17 @@ mod video_frame_cap_tests {
         let decoded = DecodedVideoFrames::Images {
             frames: vec![image::DynamicImage::new_rgb8(1920, 1080)],
             sample_fps: 2.0,
+            sampling: Some(sampling(1)),
         };
-        let DecodedVideoFrames::Images { frames, .. } = cap_decoded_frames(decoded, Some(504))
+        let DecodedVideoFrames::Images {
+            frames,
+            sampling: capped,
+            ..
+        } = cap_decoded_frames(decoded, Some(504))
         else {
             panic!("expected images");
         };
         assert_eq!((frames[0].width(), frames[0].height()), (504, 284));
+        assert_eq!(capped, Some(sampling(1)));
     }
 }

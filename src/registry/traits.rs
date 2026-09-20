@@ -354,6 +354,13 @@ pub trait ModelProcessorSpec: Send + Sync {
     fn encoder_input_key_for(&self, _modality: Modality) -> Option<String> {
         None
     }
+
+    /// Frame rate to sample a video at when the request names no `fps`: the
+    /// model's reference processor default, so token counts match it. `None`
+    /// keeps the media connector's default.
+    fn default_video_sample_fps(&self) -> Option<f32> {
+        None
+    }
 }
 
 #[cfg(test)]

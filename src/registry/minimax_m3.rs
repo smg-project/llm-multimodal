@@ -20,6 +20,9 @@ const MAX_IMAGES_PER_REQUEST: usize = 200;
 /// Maximum videos accepted in one request (MiniMax-M3 spec 1.3.6).
 const MAX_VIDEOS_PER_REQUEST: usize = 20;
 
+/// Frame rate the reference `video_processor.py` samples at.
+const DEFAULT_VIDEO_SAMPLE_FPS: f32 = 1.0;
+
 /// MiniMax-M3 vision spec.
 ///
 /// M3's media tokens carry the same `]<]...[>[` namespace framing as its tool
@@ -374,6 +377,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             limits.insert(Modality::Video, MAX_VIDEOS_PER_REQUEST);
         }
         Ok(limits)
+    }
+
+    /// Matching the reference sampling rate keeps a default video request at
+    /// the reference's frame and token counts.
+    fn default_video_sample_fps(&self) -> Option<f32> {
+        Some(DEFAULT_VIDEO_SAMPLE_FPS)
     }
 
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
@@ -1192,6 +1201,11 @@ mod tests {
         assert_eq!(limits.get(&Modality::Video), Some(&MAX_VIDEOS_PER_REQUEST));
         assert_eq!(MAX_VIDEOS_PER_REQUEST, 20);
         assert!(!limits.contains_key(&Modality::Audio));
+    }
+
+    #[test]
+    fn samples_video_at_the_reference_rate_by_default() {
+        assert_eq!(MiniMaxM3VisionSpec.default_video_sample_fps(), Some(1.0));
     }
 
     #[test]

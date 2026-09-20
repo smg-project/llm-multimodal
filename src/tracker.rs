@@ -30,6 +30,9 @@ pub struct AsyncMultiModalTracker {
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
     first_slot: HashMap<[u8; 32], usize>,
+    /// Frame rate to sample a video at when the request names none; `None`
+    /// keeps the connector default.
+    default_video_sample_fps: Option<f32>,
 }
 
 impl AsyncMultiModalTracker {
@@ -39,7 +42,15 @@ impl AsyncMultiModalTracker {
             pending: HashMap::new(),
             uuids: HashMap::new(),
             first_slot: HashMap::new(),
+            default_video_sample_fps: None,
         }
+    }
+
+    /// Sample videos that name no `fps` at this rate (the model's reference
+    /// default) instead of the connector default.
+    pub fn with_default_video_sample_fps(mut self, fps: Option<f32>) -> Self {
+        self.default_video_sample_fps = fps;
+        self
     }
 
     pub fn push_part(&mut self, part: MediaContentPart) -> MultiModalResult<()> {
@@ -196,14 +207,7 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let mut cfg = VideoFetchConfig::default();
-        if let Some(fps) = fps {
-            cfg.sample_fps = validate_sample_fps(fps)? as f32;
-        }
-        if let Some(cap) = max_long_side_pixel {
-            validate_video_long_side_cap(cap)?;
-            cfg.max_long_side_pixel = Some(cap);
-        }
+        let cfg = video_fetch_config(fps, max_long_side_pixel, self.default_video_sample_fps)?;
 
         let modality = Modality::Video;
         self.uuids.entry(modality).or_default().push(uuid);
@@ -293,6 +297,31 @@ fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 3
     hasher.finalize().into()
 }
 
+/// The fetch settings for one video: the request's `fps` when given (and
+/// valid), else the model's default, else the connector default; plus the
+/// long-side cap when given.
+fn video_fetch_config(
+    fps: Option<f64>,
+    max_long_side_pixel: Option<u32>,
+    default_sample_fps: Option<f32>,
+) -> MultiModalResult<VideoFetchConfig> {
+    let mut cfg = VideoFetchConfig::default();
+    match fps {
+        Some(fps) => cfg.sample_fps = validate_sample_fps(fps)? as f32,
+        None => {
+            if let Some(default) = default_sample_fps {
+                validate_sample_fps(f64::from(default))?;
+                cfg.sample_fps = default;
+            }
+        }
+    }
+    if let Some(cap) = max_long_side_pixel {
+        validate_video_long_side_cap(cap)?;
+        cfg.max_long_side_pixel = Some(cap);
+    }
+    Ok(cfg)
+}
+
 /// Lowest sampling rate MiniMax-M3 accepts for a video clip.
 pub const MIN_SAMPLE_FPS: f64 = 0.2;
 /// Highest sampling rate MiniMax-M3 accepts for a video clip.
@@ -336,6 +365,33 @@ fn validate_video_long_side_cap(value: u32) -> MultiModalResult<()> {
 #[cfg(test)]
 mod video_param_tests {
     use super::*;
+
+    #[test]
+    fn a_request_fps_wins_then_the_model_default_then_the_connector_default() {
+        let requested = video_fetch_config(Some(0.5), None, Some(1.0)).unwrap();
+        assert_eq!(requested.sample_fps, 0.5);
+
+        let model_default = video_fetch_config(None, Some(1008), Some(1.0)).unwrap();
+        assert_eq!(model_default.sample_fps, 1.0);
+        assert_eq!(model_default.max_long_side_pixel, Some(1008));
+
+        let connector_default = video_fetch_config(None, None, None).unwrap();
+        assert_eq!(
+            connector_default.sample_fps,
+            VideoFetchConfig::default().sample_fps
+        );
+
+        // A model's own default is held to the same range as a requested one,
+        // right up to the edge of it: nothing reaches sampling unchecked just
+        // because the model named it rather than the caller.
+        assert!(video_fetch_config(Some(100.0), None, Some(1.0)).is_err());
+        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(
+                video_fetch_config(None, None, Some(bad_default)).is_err(),
+                "{bad_default}"
+            );
+        }
+    }
 
     #[test]
     fn accepts_the_documented_fps_range() {

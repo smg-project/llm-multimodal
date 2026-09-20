@@ -462,7 +462,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Mirrors vLLM's `_get_mm_fields_config` for M3: the pixel tensors are
         // flat over patches and sliced per item by the grid product, while the
-        // grid triples are batched one row per item.
+        // grid triples are batched one row per item. The frame spacing the
+        // shared video processor emits is listed too: M3 reads the timing off
+        // its text stamps and never looks at it, but a value with no layout is
+        // one every clip has to agree on, and clips sampled at different rates
+        // do not.
         HashMap::from([
             (
                 "pixel_values".to_string(),
@@ -476,6 +480,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             ),
             ("video_grid_thw".to_string(), FieldLayout::Batched),
             ("patches_per_video".to_string(), FieldLayout::Batched),
+            ("video_second_per_grid".to_string(), FieldLayout::Batched),
         ])
     }
 
@@ -489,6 +494,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
                 HashMap::from([
                     ("video_grid_thw".to_string(), FieldLayout::Batched),
                     ("patches_per_video".to_string(), FieldLayout::Batched),
+                    ("video_second_per_grid".to_string(), FieldLayout::Batched),
                 ]),
             ),
             _ => EncoderFieldLayouts::new(
@@ -1232,6 +1238,51 @@ mod tests {
         assert_eq!(video.encoder_input, FieldLayout::flat("patches_per_video"));
         assert!(video.model_specific.contains_key("video_grid_thw"));
         assert!(!video.model_specific.contains_key("patches_per_image"));
+    }
+
+    #[test]
+    fn clips_sampled_at_different_rates_join_into_one_batch() {
+        let spec = MiniMaxM3VisionSpec;
+        let layouts = spec
+            .encoder_field_layouts_for(Modality::Video)
+            .model_specific;
+
+        let clip = |patches: usize, grid_t: i64, seconds: f32| {
+            PreprocessedEncoderInputs::new(
+                ndarray::Array2::<f32>::zeros((patches, 4)),
+                vec![patches],
+                vec![(224, 224)],
+            )
+            .with_extra(
+                "video_grid_thw",
+                ModelSpecificValue::int_2d(vec![grid_t, 2, 2], 1, 3),
+            )
+            .with_extra(
+                "patches_per_video",
+                ModelSpecificValue::int_1d(vec![patches as i64]),
+            )
+            .with_extra(
+                "video_second_per_grid",
+                ModelSpecificValue::Tensor {
+                    data: vec![seconds],
+                    shape: vec![1],
+                },
+            )
+        };
+
+        let joined =
+            PreprocessedEncoderInputs::concat(vec![clip(8, 2, 1.0), clip(12, 3, 0.5)], &layouts)
+                .expect("clips with their own frame spacing belong in the same batch");
+
+        let spacing = joined.model_specific.get("video_second_per_grid");
+        assert!(
+            matches!(
+                spacing,
+                Some(ModelSpecificValue::Tensor { data, shape })
+                    if data.as_slice() == [1.0, 0.5] && shape.as_slice() == [2]
+            ),
+            "expected one row per clip, got {spacing:?}"
+        );
     }
 
     #[test]

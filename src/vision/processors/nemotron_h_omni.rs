@@ -9,14 +9,6 @@ use crate::vision::{
     transforms, PreProcessorConfig, TransformError, VisionPreProcessor, VisionPreprocessingContext,
 };
 
-const DEFAULT_PATCH_SIZE: usize = 16;
-const DEFAULT_DOWNSAMPLE_RATIO: f64 = 0.5;
-const DEFAULT_MIN_PATCHES: usize = 1024;
-const DEFAULT_MAX_PATCHES: usize = 13312;
-const DEFAULT_MAX_MODEL_LEN: usize = 16384;
-const DEFAULT_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
-const DEFAULT_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
-
 #[derive(Debug, Clone)]
 struct ProcessorConfig {
     patch_size: usize,
@@ -49,10 +41,10 @@ impl NemotronHOmniProcessor {
                     .and_then(|patch| patch.height.or(patch.width))
                     .map(|value| value as usize)
             })
-            .unwrap_or(DEFAULT_PATCH_SIZE);
+            .ok_or_else(|| missing_config_field("patch_size"))?;
         let downsample_ratio = json_f64(model_config, &["downsample_ratio"])
             .or_else(|| config.extra.get("downsample_ratio").and_then(Value::as_f64))
-            .unwrap_or(DEFAULT_DOWNSAMPLE_RATIO);
+            .ok_or_else(|| missing_config_field("downsample_ratio"))?;
         let reduction_factor = (1.0 / downsample_ratio).round() as usize;
         if patch_size == 0
             || downsample_ratio <= 0.0
@@ -68,23 +60,23 @@ impl NemotronHOmniProcessor {
         let min_num_patches =
             json_usize(model_config, &["vision_config", "args", "min_num_patches"])
                 .or_else(|| config_usize(config, "min_num_patches"))
-                .unwrap_or(DEFAULT_MIN_PATCHES);
+                .ok_or_else(|| missing_config_field("vision_config.args.min_num_patches"))?;
         let max_num_patches =
             json_usize(model_config, &["vision_config", "args", "max_num_patches"])
                 .or_else(|| config_usize(config, "max_num_patches"))
-                .unwrap_or(DEFAULT_MAX_PATCHES);
+                .ok_or_else(|| missing_config_field("vision_config.args.max_num_patches"))?;
         let max_model_len = context
             .max_model_len
             .or_else(|| json_usize(model_config, &["max_position_embeddings"]))
             .or_else(|| json_usize(model_config, &["text_config", "max_position_embeddings"]))
             .or_else(|| config_usize(config, "max_model_len"))
-            .unwrap_or(DEFAULT_MAX_MODEL_LEN);
+            .ok_or_else(|| missing_config_field("max_model_len"))?;
         let mean = json_array3(model_config, &["norm_mean"])
             .or_else(|| slice_to_array3(config.image_mean.as_deref()))
-            .unwrap_or(DEFAULT_MEAN);
+            .ok_or_else(|| missing_config_field("norm_mean"))?;
         let std = json_array3(model_config, &["norm_std"])
             .or_else(|| slice_to_array3(config.image_std.as_deref()))
-            .unwrap_or(DEFAULT_STD);
+            .ok_or_else(|| missing_config_field("norm_std"))?;
         if min_num_patches == 0 || max_num_patches < min_num_patches {
             return Err(TransformError::ShapeError(
                 "Nemotron-H Omni patch limits must be positive and ordered".to_string(),
@@ -201,11 +193,11 @@ impl NemotronHOmniProcessor {
 
 impl VisionPreProcessor for NemotronHOmniProcessor {
     fn default_mean(&self) -> [f64; 3] {
-        DEFAULT_MEAN
+        PreProcessorConfig::CLIP_MEAN
     }
 
     fn default_std(&self) -> [f64; 3] {
-        DEFAULT_STD
+        PreProcessorConfig::CLIP_STD
     }
 
     fn preprocess(
@@ -248,6 +240,12 @@ impl VisionPreProcessor for NemotronHOmniProcessor {
     fn model_name(&self) -> &'static str {
         "nemotron_h_omni"
     }
+}
+
+fn missing_config_field(field: &str) -> TransformError {
+    TransformError::ShapeError(format!(
+        "Nemotron-H Omni requires `{field}` from checkpoint or runtime configuration"
+    ))
 }
 
 fn json_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -377,5 +375,31 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("one image"));
+    }
+
+    #[test]
+    fn requires_checkpoint_configuration() {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
+        let error = NemotronHOmniProcessor::new()
+            .preprocess_with_context(
+                &[image],
+                &PreProcessorConfig::default(),
+                &VisionPreprocessingContext::default(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("patch_size"));
+    }
+
+    #[test]
+    fn requires_runtime_max_model_len() {
+        let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
+        let mut context = context(16384, 0);
+        context.max_model_len = None;
+        let error = NemotronHOmniProcessor::new()
+            .preprocess_with_context(&[image], &PreProcessorConfig::default(), &context)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("max_model_len"));
     }
 }

@@ -176,6 +176,55 @@ impl ModelSpecificValue {
             _ => false,
         }
     }
+
+    /// Whether two values carry the same thing. Floats compare by bits so that
+    /// two values that were written from the same source always match.
+    fn same_value(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Tensor {
+                    data: a,
+                    shape: a_shape,
+                },
+                Self::Tensor {
+                    data: b,
+                    shape: b_shape,
+                },
+            ) => a_shape == b_shape && same_floats(a, b),
+            (
+                Self::IntTensor {
+                    data: a,
+                    shape: a_shape,
+                },
+                Self::IntTensor {
+                    data: b,
+                    shape: b_shape,
+                },
+            ) => a_shape == b_shape && a == b,
+            (
+                Self::UintTensor {
+                    data: a,
+                    shape: a_shape,
+                },
+                Self::UintTensor {
+                    data: b,
+                    shape: b_shape,
+                },
+            ) => a_shape == b_shape && a == b,
+            (Self::IntVec(a), Self::IntVec(b)) => a == b,
+            (Self::UintVec(a), Self::UintVec(b)) => a == b,
+            (Self::FloatVec(a), Self::FloatVec(b)) => same_floats(a, b),
+            (Self::TupleVec(a), Self::TupleVec(b)) => a == b,
+            (Self::Int(_) | Self::Float(_) | Self::Bool(_), _) => self.same_scalar(other),
+            _ => false,
+        }
+    }
+}
+
+/// Compare float sequences by bits, so two values written the same way match
+/// and neither NaN nor a signed zero makes them differ by accident.
+fn same_floats(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 /// Concatenate tensors along the first dimension; the other dimensions must agree.
@@ -337,11 +386,14 @@ impl PreprocessedEncoderInputs {
     }
 
     /// Join batches processed one item at a time into the batch a processor
-    /// would have produced from all items at once: the encoder input and every
-    /// per-item value are stacked along their first dimension. `layouts` names
-    /// the values the model reads per item; a value without a layout is still
-    /// stacked when it has an item dimension, and must be identical in every
-    /// part when it is a scalar.
+    /// would have produced from all items at once.
+    ///
+    /// The encoder input always stacks along its first dimension. For the other
+    /// values `layouts` decides: a value the model reads per item is stacked
+    /// the same way, and a value with no layout is one the backend shares
+    /// across the whole batch, so it is kept once and every part has to agree
+    /// on it. Stacking a shared value instead would hand the joined sequence to
+    /// each item.
     pub fn concat(parts: Vec<Self>, layouts: &HashMap<String, FieldLayout>) -> AnyhowResult<Self> {
         anyhow::ensure!(!parts.is_empty(), "cannot join zero batches");
         if parts.len() == 1 {
@@ -365,18 +417,32 @@ impl PreprocessedEncoderInputs {
                     })
                 })
                 .collect::<AnyhowResult<Vec<_>>>()?;
-            let joined = ModelSpecificValue::concat_first_dim(&values)
-                .with_context(|| format!("failed to join model-specific value {key}"))?;
+            let per_item = matches!(
+                layouts.get(&key),
+                Some(FieldLayout::Batched | FieldLayout::Flat { .. })
+            );
+            let joined = if per_item {
+                ModelSpecificValue::concat_first_dim(&values)
+                    .with_context(|| format!("failed to join model-specific value {key}"))?
+            } else {
+                let first = values
+                    .first()
+                    .copied()
+                    .context("cannot join zero batch parts")?;
+                anyhow::ensure!(
+                    values.iter().all(|value| value.same_value(first)),
+                    "model-specific value {key} is shared across the batch but the parts disagree on it"
+                );
+                first.clone()
+            };
             debug_assert!(
-                !matches!(
-                    layouts.get(&key),
-                    Some(FieldLayout::Batched | FieldLayout::Flat { .. })
-                ) || !matches!(
-                    joined,
-                    ModelSpecificValue::Int(_)
-                        | ModelSpecificValue::Float(_)
-                        | ModelSpecificValue::Bool(_)
-                ),
+                !per_item
+                    || !matches!(
+                        joined,
+                        ModelSpecificValue::Int(_)
+                            | ModelSpecificValue::Float(_)
+                            | ModelSpecificValue::Bool(_)
+                    ),
                 "a per-item layout was declared for scalar value {key}"
             );
             model_specific.insert(key, joined);
@@ -518,12 +584,17 @@ mod tests {
         .with_extra("temporal_patch_size", ModelSpecificValue::Int(2))
     }
 
-    #[test]
-    fn concat_stacks_clips_the_way_one_batch_would_be_laid_out() {
-        let layouts = HashMap::from([
+    fn video_layouts() -> HashMap<String, FieldLayout> {
+        HashMap::from([
             ("video_grid_thw".to_string(), FieldLayout::Batched),
             ("patches_per_video".to_string(), FieldLayout::Batched),
-        ]);
+            ("video_second_per_grid".to_string(), FieldLayout::Batched),
+        ])
+    }
+
+    #[test]
+    fn concat_stacks_clips_the_way_one_batch_would_be_laid_out() {
+        let layouts = video_layouts();
 
         let joined =
             PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0), clip(32, 2, 0.5)], &layouts)
@@ -554,9 +625,32 @@ mod tests {
         ));
     }
 
+    /// A value the backend shares across the batch must not be stacked: the
+    /// whole joined sequence would then stand for every item. Parts that
+    /// disagree on such a value cannot be joined at all.
+    #[test]
+    fn a_value_without_a_layout_is_kept_once_and_must_agree() {
+        let mut layouts = video_layouts();
+        layouts.remove("video_second_per_grid");
+
+        let same =
+            PreprocessedEncoderInputs::concat(vec![clip(16, 1, 0.5), clip(32, 2, 0.5)], &layouts)
+                .unwrap();
+        assert!(matches!(
+            &same.model_specific["video_second_per_grid"],
+            ModelSpecificValue::Tensor { data, shape } if data == &vec![0.5] && shape == &vec![1]
+        ));
+
+        assert!(PreprocessedEncoderInputs::concat(
+            vec![clip(16, 1, 1.0), clip(32, 2, 0.5)],
+            &layouts
+        )
+        .is_err());
+    }
+
     #[test]
     fn concat_keeps_a_single_clip_untouched_and_rejects_mismatched_parts() {
-        let layouts = HashMap::new();
+        let layouts = video_layouts();
         let single = PreprocessedEncoderInputs::concat(vec![clip(16, 1, 1.0)], &layouts).unwrap();
         assert_eq!(single.encoder_input_shape(), vec![16, 3]);
 

@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+    media::FrameSampling,
     registry::{
         MediaItemInfo, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
@@ -383,6 +384,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     /// the reference's frame and token counts.
     fn default_video_sample_fps(&self) -> Option<f32> {
         Some(DEFAULT_VIDEO_SAMPLE_FPS)
+    }
+
+    /// The reference takes one frame per second from the start and always
+    /// keeps the last frame.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        FrameSampling::Interval
     }
 
     fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
@@ -1206,6 +1213,10 @@ mod tests {
     #[test]
     fn samples_video_at_the_reference_rate_by_default() {
         assert_eq!(MiniMaxM3VisionSpec.default_video_sample_fps(), Some(1.0));
+        assert_eq!(
+            MiniMaxM3VisionSpec.video_frame_sampling(),
+            FrameSampling::Interval
+        );
     }
 
     #[test]

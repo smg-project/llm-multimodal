@@ -89,6 +89,16 @@ impl Default for ImageFetchConfig {
     }
 }
 
+/// Where the sampled frames sit within a clip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameSampling {
+    /// Spread evenly from the first frame to the last.
+    #[default]
+    Even,
+    /// One frame per sampling interval from the start, plus the last frame.
+    Interval,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct VideoFetchConfig {
     pub min_frames: usize,
@@ -96,6 +106,7 @@ pub struct VideoFetchConfig {
     pub sample_fps: f32,
     /// MiniMax-M3 extension: cap each decoded frame's long side.
     pub max_long_side_pixel: Option<u32>,
+    pub sampling: FrameSampling,
 }
 
 impl Default for VideoFetchConfig {
@@ -105,6 +116,7 @@ impl Default for VideoFetchConfig {
             max_frames: 768,
             sample_fps: 2.0,
             max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
         }
     }
 }
@@ -529,6 +541,7 @@ impl MediaConnector {
             &bytes,
             cfg.sample_fps,
             cfg.max_long_side_pixel,
+            cfg.sampling,
         );
         let decoded = decode_video_frames(bytes.clone(), cfg).await?;
         // Cap here rather than in the ffmpeg filter chain: the rawvideo decoder
@@ -1299,8 +1312,18 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
     (decoder_budget.max(1) / active_decodes).clamp(1, max_threads) as i32
 }
 
-/// Source index per output frame, spread evenly over the stream; short clips repeat frames.
+/// Source index per output frame; short clips repeat frames up to `min_frames`.
 fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+    if total_frames == 0 {
+        return Vec::new();
+    }
+    match cfg.sampling {
+        FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
+        FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
+    }
+}
+
+fn even_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let mut target_frames = if fps.is_finite() && fps > 0.0 {
         let duration = total_frames as f64 / fps;
         (duration * cfg.sample_fps as f64).round() as usize
@@ -1308,16 +1331,77 @@ fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -
         cfg.max_frames
     };
     target_frames = target_frames.clamp(cfg.min_frames, cfg.max_frames);
-    target_frames = target_frames.max(1);
-    if target_frames == 1 {
+    spread_evenly(total_frames, target_frames)
+}
+
+fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
+    if count <= 1 {
         return vec![0];
     }
-
     let last = (total_frames - 1) as f64;
-    let denom = (target_frames - 1) as f64;
-    (0..target_frames)
+    let denom = (count - 1) as f64;
+    (0..count)
         .map(|idx| ((idx as f64 * last) / denom).floor() as usize)
         .collect()
+}
+
+/// One frame per sampling interval from the start, the last frame always
+/// included, thinned evenly when over `max_frames`.
+fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+    if !(fps.is_finite() && fps > 0.0) || cfg.sample_fps <= 0.0 {
+        return even_frame_indices(total_frames, fps, cfg);
+    }
+    const EPS: f64 = 1e-4;
+    let interval = 1.0 / cfg.sample_fps as f64;
+    let last_index = total_frames - 1;
+
+    let mut indices: Vec<usize> = Vec::new();
+    let mut previous_seconds = f64::NEG_INFINITY;
+    loop {
+        let next = match indices.last() {
+            None => 0,
+            Some(&last) => {
+                let target = ((previous_seconds + interval - EPS) * fps).ceil();
+                let target = if target.is_finite() && target > 0.0 {
+                    target as usize
+                } else {
+                    0
+                };
+                target.max(last + 1)
+            }
+        };
+        if next >= total_frames {
+            break;
+        }
+        indices.push(next);
+        previous_seconds = next as f64 / fps;
+    }
+    if indices.last().is_some_and(|&last| last != last_index)
+        && last_index as f64 / fps - previous_seconds > EPS
+    {
+        indices.push(last_index);
+    }
+    if indices.is_empty() {
+        indices.push(0);
+    }
+
+    if cfg.max_frames > 0 && indices.len() > cfg.max_frames {
+        let last = indices[indices.len() - 1];
+        indices = if cfg.max_frames == 1 {
+            vec![last]
+        } else {
+            let step = indices.len() as f64 / (cfg.max_frames - 1) as f64;
+            let mut thinned: Vec<usize> = (0..cfg.max_frames - 1)
+                .map(|i| indices[(i as f64 * step) as usize])
+                .collect();
+            thinned.push(last);
+            thinned
+        };
+    }
+    if indices.len() < cfg.min_frames {
+        return spread_evenly(total_frames, cfg.min_frames);
+    }
+    indices
 }
 
 /// Distinct indices in order, each with its repeat count.
@@ -2385,7 +2469,7 @@ mod tests {
         checked_payload_length, collect_http_body_with_limit, decode_base64_with_limit,
         effective_sample_fps, ensure_input_byte_limit, expected_sampled_frame_count,
         fps_filter_for_metadata, parse_ffmpeg_duration_seconds, parse_ffprobe_video_info,
-        parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix,
+        parse_ppm_stream, read_file_with_limit, split_png_stream, video_temp_suffix, FrameSampling,
         MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaSource, VideoFetchConfig,
         VideoMetadata,
     };
@@ -2437,6 +2521,7 @@ mod tests {
             max_frames: 8,
             sample_fps: 2.0,
             max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
         };
         let metadata = VideoMetadata {
             width: info.width.expect("video width"),
@@ -2501,6 +2586,7 @@ mod tests {
             max_frames: 8,
             sample_fps: 2.0,
             max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
         };
 
         assert_eq!(effective_sample_fps(Some(1.0), cfg), 4.0);
@@ -2639,6 +2725,7 @@ mod tests {
             max_frames: 8,
             sample_fps: 2.0,
             max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
         };
         let indices = super::sampled_frame_indices(1, 30.0, cfg);
         assert_eq!(indices, vec![0, 0, 0, 0]);
@@ -2725,7 +2812,57 @@ mod video_sampling_tests {
             max_frames: 8,
             sample_fps: 2.0,
             max_long_side_pixel: None,
+            sampling: FrameSampling::Even,
         }
+    }
+
+    fn interval_cfg(sample_fps: f32, max_frames: usize) -> VideoFetchConfig {
+        VideoFetchConfig {
+            min_frames: 1,
+            max_frames,
+            sample_fps,
+            max_long_side_pixel: None,
+            sampling: FrameSampling::Interval,
+        }
+    }
+
+    #[test]
+    fn interval_sampling_takes_one_frame_per_interval_and_keeps_the_last() {
+        assert_eq!(
+            sampled_frame_indices(360, 30.0, interval_cfg(1.0, 768)),
+            vec![0, 30, 60, 90, 120, 150, 180, 210, 240, 270, 300, 330, 359]
+        );
+        assert_eq!(
+            sampled_frame_indices(60, 30.0, interval_cfg(1.0, 768)),
+            vec![0, 30, 59]
+        );
+        assert_eq!(
+            sampled_frame_indices(100, 25.0, interval_cfg(0.5, 768)),
+            vec![0, 50, 99]
+        );
+        assert_eq!(
+            sampled_frame_indices(300, 29.97, interval_cfg(2.0, 768)),
+            vec![
+                0, 15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 195, 210, 225, 240, 255,
+                270, 285, 299
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_sampling_thins_to_the_frame_budget_and_fills_to_the_minimum() {
+        assert_eq!(
+            sampled_frame_indices(3000, 30.0, interval_cfg(1.0, 10)),
+            vec![0, 330, 660, 990, 1320, 1680, 2010, 2340, 2670, 2999]
+        );
+        let long = sampled_frame_indices(54_000, 30.0, interval_cfg(1.0, 768));
+        assert_eq!(long.len(), 768);
+        assert_eq!(long.last(), Some(&53_999));
+
+        let mut short = interval_cfg(1.0, 768);
+        short.min_frames = 4;
+        assert_eq!(sampled_frame_indices(2, 30.0, short), vec![0, 0, 0, 1]);
+        assert_eq!(sampled_frame_indices(0, 30.0, short), Vec::<usize>::new());
     }
 
     fn metadata(source_fps: Option<f64>, total_frames: Option<usize>) -> VideoMetadata {

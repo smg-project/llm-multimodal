@@ -1,11 +1,12 @@
-#[cfg(feature = "opencv-video")]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     collections::HashSet,
     io::Write,
     path::PathBuf,
     process::{Output, Stdio},
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::{Duration, Instant},
 };
 
@@ -38,22 +39,14 @@ static VIDEO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
-#[cfg(feature = "opencv-video")]
-static ACTIVE_OPENCV_DECODES: AtomicUsize = AtomicUsize::new(0);
-#[cfg(feature = "opencv-video")]
-static AVAILABLE_OPENCV_CPUS: OnceLock<usize> = OnceLock::new();
-#[cfg(feature = "opencv-video")]
-const MAX_OPENCV_DECODER_THREADS: usize = 8;
-#[cfg(feature = "opencv-video")]
-const OPENCV_DECODE_BURST_COALESCE: Duration = Duration::from_millis(5);
-#[cfg(feature = "opencv-video")]
-const OPENCV_LOW_CONCURRENCY_LIMIT: usize = 8;
-#[cfg(feature = "opencv-video")]
-const OPENCV_LOW_CONCURRENCY_CPU_MULTIPLIER: usize = 2;
-#[cfg(feature = "opencv-video")]
-const OPENCV_HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR: usize = 6;
-#[cfg(feature = "opencv-video")]
-const OPENCV_HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR: usize = 7;
+static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
+static AVAILABLE_DECODE_CPUS: OnceLock<usize> = OnceLock::new();
+const MAX_DECODER_THREADS: usize = 8;
+const DECODE_BURST_COALESCE: Duration = Duration::from_millis(5);
+const LOW_CONCURRENCY_LIMIT: usize = 8;
+const LOW_CONCURRENCY_CPU_MULTIPLIER: usize = 2;
+const HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR: usize = 6;
+const HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR: usize = 7;
 
 use super::{
     error::MediaConnectorError,
@@ -986,8 +979,8 @@ fn decode_video_with_opencv_file(
         ))
     })?;
 
-    let active_decode = ActiveOpenCvDecode::enter();
-    let decoder_threads = opencv_decoder_threads(active_decode.count());
+    let active_decode = ActiveVideoDecode::enter();
+    let decoder_threads = decoder_threads(active_decode.count());
     let capture = open_opencv_video_capture(input, decoder_threads)?;
     decode_video_from_opencv_capture(capture, cfg)
 }
@@ -997,8 +990,8 @@ fn decode_video_with_opencv_bytes(
     bytes: Bytes,
     cfg: VideoFetchConfig,
 ) -> Result<DecodedVideoFrames, MediaConnectorError> {
-    let active_decode = ActiveOpenCvDecode::enter();
-    let decoder_threads = opencv_decoder_threads(active_decode.count());
+    let active_decode = ActiveVideoDecode::enter();
+    let decoder_threads = decoder_threads(active_decode.count());
     let capture = open_opencv_video_capture_from_buffer(bytes, decoder_threads)?;
     decode_video_from_opencv_capture(capture, cfg)
 }
@@ -1229,21 +1222,28 @@ fn open_opencv_video_capture(
     )))
 }
 
-#[cfg(feature = "opencv-video")]
-struct ActiveOpenCvDecode {
+struct ActiveVideoDecode {
     count: usize,
 }
 
-#[cfg(feature = "opencv-video")]
-impl ActiveOpenCvDecode {
+impl ActiveVideoDecode {
+    #[cfg(feature = "opencv-video")]
     fn enter() -> Self {
-        ACTIVE_OPENCV_DECODES.fetch_add(1, Ordering::AcqRel);
+        ACTIVE_VIDEO_DECODES.fetch_add(1, Ordering::AcqRel);
         // Let a burst of decode tasks become visible before dividing the CPU
         // budget. The fixed window also covers blocking-pool ramp-up, where
         // arrivals may briefly appear stable before the full burst.
-        std::thread::sleep(OPENCV_DECODE_BURST_COALESCE);
+        std::thread::sleep(DECODE_BURST_COALESCE);
         Self {
-            count: ACTIVE_OPENCV_DECODES.load(Ordering::Acquire),
+            count: ACTIVE_VIDEO_DECODES.load(Ordering::Acquire),
+        }
+    }
+
+    async fn enter_async() -> Self {
+        ACTIVE_VIDEO_DECODES.fetch_add(1, Ordering::AcqRel);
+        time::sleep(DECODE_BURST_COALESCE).await;
+        Self {
+            count: ACTIVE_VIDEO_DECODES.load(Ordering::Acquire),
         }
     }
 
@@ -1252,38 +1252,35 @@ impl ActiveOpenCvDecode {
     }
 }
 
-#[cfg(feature = "opencv-video")]
-impl Drop for ActiveOpenCvDecode {
+impl Drop for ActiveVideoDecode {
     fn drop(&mut self) {
-        ACTIVE_OPENCV_DECODES.fetch_sub(1, Ordering::AcqRel);
+        ACTIVE_VIDEO_DECODES.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
-#[cfg(feature = "opencv-video")]
-fn opencv_decoder_threads(active_decodes: usize) -> i32 {
-    let available = *AVAILABLE_OPENCV_CPUS.get_or_init(|| {
+fn decoder_threads(active_decodes: usize) -> i32 {
+    let available = *AVAILABLE_DECODE_CPUS.get_or_init(|| {
         std::thread::available_parallelism()
             .map(|parallelism| parallelism.get())
             .unwrap_or(1)
     });
-    adaptive_opencv_decoder_threads(available, active_decodes)
+    adaptive_decoder_threads(available, active_decodes)
 }
 
-#[cfg(feature = "opencv-video")]
-fn adaptive_opencv_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32 {
+fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32 {
     let available_cpus = available_cpus.max(1);
     let active_decodes = active_decodes.max(1);
 
     // Once eight or more independent decoders fill the CPU quota, codec-level
     // threading only adds scheduler contention.
-    if active_decodes >= OPENCV_LOW_CONCURRENCY_LIMIT && active_decodes >= available_cpus {
+    if active_decodes >= LOW_CONCURRENCY_LIMIT && active_decodes >= available_cpus {
         return 1;
     }
 
-    let (decoder_budget, max_threads) = if active_decodes <= OPENCV_LOW_CONCURRENCY_LIMIT {
+    let (decoder_budget, max_threads) = if active_decodes <= LOW_CONCURRENCY_LIMIT {
         let max_threads = if active_decodes <= 2 { 16 } else { 8 };
         (
-            available_cpus.saturating_mul(OPENCV_LOW_CONCURRENCY_CPU_MULTIPLIER),
+            available_cpus.saturating_mul(LOW_CONCURRENCY_CPU_MULTIPLIER),
             max_threads,
         )
     } else {
@@ -1292,9 +1289,9 @@ fn adaptive_opencv_decoder_threads(available_cpus: usize, active_decodes: usize)
         // copies, request handling, and other non-decoder work.
         (
             available_cpus
-                .saturating_mul(OPENCV_HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR)
-                .div_ceil(OPENCV_HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR),
-            MAX_OPENCV_DECODER_THREADS,
+                .saturating_mul(HIGH_CONCURRENCY_CPU_BUDGET_NUMERATOR)
+                .div_ceil(HIGH_CONCURRENCY_CPU_BUDGET_DENOMINATOR),
+            MAX_DECODER_THREADS,
         )
     };
 
@@ -1586,10 +1583,9 @@ async fn decode_video_with_ffmpeg_ppm(
         .unwrap_or_else(video_max_decoded_bytes)
         .min(video_max_decoded_bytes())
         .to_string();
-    let mut command = Command::new("ffmpeg");
-    command
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(input_path);
+    let active_decode = ActiveVideoDecode::enter_async().await;
+    let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), true);
+    command.arg(input_path);
     frame_args.apply(&mut command);
     command.args([
         "-fs",
@@ -1632,20 +1628,12 @@ async fn decode_video_with_ffmpeg_raw(
     );
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
-    let mut command = Command::new("ffmpeg");
     // Rawvideo has no per-frame header, so we interpret stdout using ffprobe's
     // coded stream dimensions. Disable FFmpeg autorotation here; otherwise a
     // display-matrix rotation can swap output width/height and corrupt framing.
-    command
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-noautorotate",
-            "-i",
-        ])
-        .arg(input_path);
+    let active_decode = ActiveVideoDecode::enter_async().await;
+    let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), false);
+    command.arg(input_path);
     frame_args.apply(&mut command);
     command.args([
         "-fs",
@@ -1715,10 +1703,9 @@ async fn decode_video_with_ffmpeg_png(
         }
     };
     let output_limit = video_max_decoded_bytes().to_string();
-    let mut command = Command::new("ffmpeg");
-    command
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-i"])
-        .arg(input_path);
+    let active_decode = ActiveVideoDecode::enter_async().await;
+    let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), true);
+    command.arg(input_path);
     frame_args.apply(&mut command);
     command.args([
         "-fs",
@@ -2050,6 +2037,26 @@ impl FfmpegFrameArgs {
             command.args(sync);
         }
     }
+}
+
+/// An ffmpeg decode command whose decoder threads stay within the shared
+/// budget; the caller appends the input path.
+fn ffmpeg_decode_command(threads: i32, autorotate: bool) -> Command {
+    let threads = threads.to_string();
+    let mut command = Command::new("ffmpeg");
+    command.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-threads",
+        &threads,
+    ]);
+    if !autorotate {
+        command.arg("-noautorotate");
+    }
+    command.arg("-i");
+    command
 }
 
 const FPS_MODE_PASSTHROUGH: [&str; 2] = ["-fps_mode", "passthrough"];
@@ -2637,21 +2644,45 @@ mod tests {
         assert_eq!(super::counted_frame_indices(&indices), vec![(0, 4)]);
     }
 
-    #[cfg(feature = "opencv-video")]
     #[test]
-    fn opencv_decoder_threads_share_cpu_budget_across_active_decodes() {
-        assert_eq!(super::adaptive_opencv_decoder_threads(224, 1), 16);
-        assert_eq!(super::adaptive_opencv_decoder_threads(2, 1), 4);
-        assert_eq!(super::adaptive_opencv_decoder_threads(4, 2), 4);
-        assert_eq!(super::adaptive_opencv_decoder_threads(8, 4), 4);
-        assert_eq!(super::adaptive_opencv_decoder_threads(8, 8), 1);
-        assert_eq!(super::adaptive_opencv_decoder_threads(8, 9), 1);
-        assert_eq!(super::adaptive_opencv_decoder_threads(16, 8), 4);
-        assert_eq!(super::adaptive_opencv_decoder_threads(16, 16), 1);
-        assert_eq!(super::adaptive_opencv_decoder_threads(224, 8), 8);
-        assert_eq!(super::adaptive_opencv_decoder_threads(224, 32), 6);
-        assert_eq!(super::adaptive_opencv_decoder_threads(8, 32), 1);
-        assert_eq!(super::adaptive_opencv_decoder_threads(1, 0), 2);
+    fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
+        let args = |autorotate: bool| {
+            super::ffmpeg_decode_command(3, autorotate)
+                .as_std()
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            args(true),
+            [
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-threads",
+                "3",
+                "-i"
+            ]
+        );
+        assert_eq!(args(false).last().map(String::as_str), Some("-i"));
+        assert!(args(false).contains(&"-noautorotate".to_string()));
+    }
+
+    #[test]
+    fn decoder_threads_share_cpu_budget_across_active_decodes() {
+        assert_eq!(super::adaptive_decoder_threads(224, 1), 16);
+        assert_eq!(super::adaptive_decoder_threads(2, 1), 4);
+        assert_eq!(super::adaptive_decoder_threads(4, 2), 4);
+        assert_eq!(super::adaptive_decoder_threads(8, 4), 4);
+        assert_eq!(super::adaptive_decoder_threads(8, 8), 1);
+        assert_eq!(super::adaptive_decoder_threads(8, 9), 1);
+        assert_eq!(super::adaptive_decoder_threads(16, 8), 4);
+        assert_eq!(super::adaptive_decoder_threads(16, 16), 1);
+        assert_eq!(super::adaptive_decoder_threads(224, 8), 8);
+        assert_eq!(super::adaptive_decoder_threads(224, 32), 6);
+        assert_eq!(super::adaptive_decoder_threads(8, 32), 1);
+        assert_eq!(super::adaptive_decoder_threads(1, 0), 2);
     }
 
     /// Defense in depth for the video path: the tracker validates M3's range,

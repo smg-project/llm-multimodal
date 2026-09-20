@@ -4,7 +4,7 @@ use tokio::task::JoinHandle;
 
 use super::{
     error::{MediaConnectorError, MultiModalError, MultiModalResult},
-    media::{ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
+    media::{FrameSampling, ImageFetchConfig, MediaConnector, MediaSource, VideoFetchConfig},
     types::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
@@ -33,6 +33,7 @@ pub struct AsyncMultiModalTracker {
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
+    video_frame_sampling: FrameSampling,
 }
 
 impl AsyncMultiModalTracker {
@@ -43,6 +44,7 @@ impl AsyncMultiModalTracker {
             uuids: HashMap::new(),
             first_slot: HashMap::new(),
             default_video_sample_fps: None,
+            video_frame_sampling: FrameSampling::default(),
         }
     }
 
@@ -50,6 +52,12 @@ impl AsyncMultiModalTracker {
     /// default) instead of the connector default.
     pub fn with_default_video_sample_fps(mut self, fps: Option<f32>) -> Self {
         self.default_video_sample_fps = fps;
+        self
+    }
+
+    /// Place sampled video frames the way the model's reference does.
+    pub fn with_video_frame_sampling(mut self, sampling: FrameSampling) -> Self {
+        self.video_frame_sampling = sampling;
         self
     }
 
@@ -207,7 +215,12 @@ impl AsyncMultiModalTracker {
         fps: Option<f64>,
         max_long_side_pixel: Option<u32>,
     ) -> MultiModalResult<()> {
-        let cfg = video_fetch_config(fps, max_long_side_pixel, self.default_video_sample_fps)?;
+        let cfg = video_fetch_config(
+            fps,
+            max_long_side_pixel,
+            self.default_video_sample_fps,
+            self.video_frame_sampling,
+        )?;
 
         let modality = Modality::Video;
         self.uuids.entry(modality).or_default().push(uuid);
@@ -299,13 +312,17 @@ fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 3
 
 /// The fetch settings for one video: the request's `fps` when given (and
 /// valid), else the model's default, else the connector default; plus the
-/// long-side cap when given.
+/// long-side cap when given and the model's frame placement.
 fn video_fetch_config(
     fps: Option<f64>,
     max_long_side_pixel: Option<u32>,
     default_sample_fps: Option<f32>,
+    sampling: FrameSampling,
 ) -> MultiModalResult<VideoFetchConfig> {
-    let mut cfg = VideoFetchConfig::default();
+    let mut cfg = VideoFetchConfig {
+        sampling,
+        ..VideoFetchConfig::default()
+    };
     match fps {
         Some(fps) => cfg.sample_fps = validate_sample_fps(fps)? as f32,
         None => {
@@ -368,14 +385,17 @@ mod video_param_tests {
 
     #[test]
     fn a_request_fps_wins_then_the_model_default_then_the_connector_default() {
-        let requested = video_fetch_config(Some(0.5), None, Some(1.0)).unwrap();
+        let requested =
+            video_fetch_config(Some(0.5), None, Some(1.0), FrameSampling::Even).unwrap();
         assert_eq!(requested.sample_fps, 0.5);
 
-        let model_default = video_fetch_config(None, Some(1008), Some(1.0)).unwrap();
+        let model_default =
+            video_fetch_config(None, Some(1008), Some(1.0), FrameSampling::Interval).unwrap();
         assert_eq!(model_default.sample_fps, 1.0);
         assert_eq!(model_default.max_long_side_pixel, Some(1008));
+        assert_eq!(model_default.sampling, FrameSampling::Interval);
 
-        let connector_default = video_fetch_config(None, None, None).unwrap();
+        let connector_default = video_fetch_config(None, None, None, FrameSampling::Even).unwrap();
         assert_eq!(
             connector_default.sample_fps,
             VideoFetchConfig::default().sample_fps
@@ -384,10 +404,10 @@ mod video_param_tests {
         // A model's own default is held to the same range as a requested one,
         // right up to the edge of it: nothing reaches sampling unchecked just
         // because the model named it rather than the caller.
-        assert!(video_fetch_config(Some(100.0), None, Some(1.0)).is_err());
+        assert!(video_fetch_config(Some(100.0), None, Some(1.0), FrameSampling::Even).is_err());
         for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f32::NAN, f32::INFINITY] {
             assert!(
-                video_fetch_config(None, None, Some(bad_default)).is_err(),
+                video_fetch_config(None, None, Some(bad_default), FrameSampling::Even).is_err(),
                 "{bad_default}"
             );
         }

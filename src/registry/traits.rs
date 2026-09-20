@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::{
     audio::AudioPreProcessor,
     encoder_inputs::PreprocessedEncoderInputs,
+    media::FrameSampling,
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
     },
@@ -360,6 +361,12 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// keeps the media connector's default.
     fn default_video_sample_fps(&self) -> Option<f32> {
         None
+    }
+
+    /// Where a video's sampled frames sit: evenly spread, or one per interval
+    /// from the start with the last frame kept, as the model's reference does.
+    fn video_frame_sampling(&self) -> FrameSampling {
+        FrameSampling::Even
     }
 }
 

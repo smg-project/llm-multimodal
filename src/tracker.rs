@@ -12,6 +12,13 @@ use super::{
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
+/// One media slot of a request: either its own fetch, or the same media a
+/// slot before it already fetches.
+enum Slot {
+    Fetch(PendingTask),
+    SameAs(usize),
+}
+
 #[derive(Debug)]
 pub struct TrackerOutput {
     pub data: MultiModalData,
@@ -20,8 +27,9 @@ pub struct TrackerOutput {
 
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
-    pending: HashMap<Modality, Vec<PendingTask>>,
+    pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
+    first_slot: HashMap<[u8; 32], usize>,
 }
 
 impl AsyncMultiModalTracker {
@@ -30,6 +38,7 @@ impl AsyncMultiModalTracker {
             media_connector,
             pending: HashMap::new(),
             uuids: HashMap::new(),
+            first_slot: HashMap::new(),
         }
     }
 
@@ -108,10 +117,17 @@ impl AsyncMultiModalTracker {
 
     pub async fn finalize(mut self) -> MultiModalResult<TrackerOutput> {
         let mut data = MultiModalData::new();
-        for (modality, tasks) in self.pending.drain() {
-            let mut items = Vec::with_capacity(tasks.len());
-            for task in tasks {
-                let media = task.await??;
+        for (modality, slots) in self.pending.drain() {
+            let mut items: Vec<TrackedMedia> = Vec::with_capacity(slots.len());
+            for slot in slots {
+                let media = match slot {
+                    Slot::Fetch(task) => task.await??,
+                    Slot::SameAs(first) => items.get(first).cloned().ok_or_else(|| {
+                        MultiModalError::Validation(format!(
+                            "{modality} slot refers to a slot that was never fetched"
+                        ))
+                    })?,
+                };
                 items.push(media);
             }
             data.insert(modality, items);
@@ -121,6 +137,17 @@ impl AsyncMultiModalTracker {
             data,
             uuids: self.uuids,
         })
+    }
+
+    /// The slot that already fetches this media, if an earlier part named it;
+    /// otherwise the next slot is claimed for it.
+    fn same_media_as(&mut self, modality: Modality, key: [u8; 32]) -> Option<usize> {
+        let next = self.pending.entry(modality).or_default().len();
+        if let Some(&first) = self.first_slot.get(&key) {
+            return Some(first);
+        }
+        self.first_slot.insert(key, next);
+        None
     }
 
     fn enqueue_image(
@@ -133,25 +160,33 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Image;
         self.uuids.entry(modality).or_default().push(uuid);
 
+        let config = ImageFetchConfig {
+            detail,
+            max_long_side_pixel,
+        };
+        let key = fetch_key(modality, &format!("{config:?}"), &source);
+        if let Some(first) = self.same_media_as(modality, key) {
+            self.pending
+                .entry(modality)
+                .or_default()
+                .push(Slot::SameAs(first));
+            return;
+        }
+
         let connector = Arc::clone(&self.media_connector);
         #[expect(
             clippy::disallowed_methods,
             reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
         )]
         let handle = tokio::spawn(async move {
-            let frame = connector
-                .fetch_image(
-                    source,
-                    ImageFetchConfig {
-                        detail,
-                        max_long_side_pixel,
-                    },
-                )
-                .await?;
+            let frame = connector.fetch_image(source, config).await?;
             Ok(TrackedMedia::Image(frame))
         });
 
-        self.pending.entry(modality).or_default().push(handle);
+        self.pending
+            .entry(modality)
+            .or_default()
+            .push(Slot::Fetch(handle));
     }
 
     fn enqueue_video(
@@ -173,6 +208,15 @@ impl AsyncMultiModalTracker {
         let modality = Modality::Video;
         self.uuids.entry(modality).or_default().push(uuid);
 
+        let key = fetch_key(modality, &format!("{cfg:?}"), &source);
+        if let Some(first) = self.same_media_as(modality, key) {
+            self.pending
+                .entry(modality)
+                .or_default()
+                .push(Slot::SameAs(first));
+            return Ok(());
+        }
+
         let connector = Arc::clone(&self.media_connector);
         #[expect(
             clippy::disallowed_methods,
@@ -183,13 +227,25 @@ impl AsyncMultiModalTracker {
             Ok(TrackedMedia::Video(clip))
         });
 
-        self.pending.entry(modality).or_default().push(handle);
+        self.pending
+            .entry(modality)
+            .or_default()
+            .push(Slot::Fetch(handle));
         Ok(())
     }
 
     fn enqueue_audio(&mut self, source: MediaSource, uuid: Option<String>) {
         let modality = Modality::Audio;
         self.uuids.entry(modality).or_default().push(uuid);
+
+        let key = fetch_key(modality, "", &source);
+        if let Some(first) = self.same_media_as(modality, key) {
+            self.pending
+                .entry(modality)
+                .or_default()
+                .push(Slot::SameAs(first));
+            return;
+        }
 
         let connector = Arc::clone(&self.media_connector);
         #[expect(
@@ -201,8 +257,40 @@ impl AsyncMultiModalTracker {
             Ok(TrackedMedia::Audio(clip))
         });
 
-        self.pending.entry(modality).or_default().push(handle);
+        self.pending
+            .entry(modality)
+            .or_default()
+            .push(Slot::Fetch(handle));
     }
+}
+
+/// Identity of one fetch: the media a part names, together with the settings
+/// it would be fetched with.
+fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(modality.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(settings.as_bytes());
+    hasher.update(b"\0");
+    match source {
+        MediaSource::Url(url) => {
+            hasher.update(b"url\0");
+            hasher.update(url.as_bytes());
+        }
+        MediaSource::DataUrl(url) => {
+            hasher.update(b"data\0");
+            hasher.update(url.as_bytes());
+        }
+        MediaSource::InlineBytes(bytes) => {
+            hasher.update(b"bytes\0");
+            hasher.update(bytes);
+        }
+        MediaSource::File(path) => {
+            hasher.update(b"file\0");
+            hasher.update(path.to_string_lossy().as_bytes());
+        }
+    }
+    hasher.finalize().into()
 }
 
 /// Lowest sampling rate MiniMax-M3 accepts for a video clip.
@@ -279,5 +367,93 @@ mod video_param_tests {
         for cap in [0, 140, 3612, 1009] {
             assert!(validate_video_long_side_cap(cap).is_err(), "{cap}");
         }
+    }
+}
+
+#[cfg(test)]
+mod repeat_tests {
+    use super::*;
+    use crate::media::MediaConnectorConfig;
+
+    const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+
+    fn tracker() -> AsyncMultiModalTracker {
+        let connector =
+            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
+                .expect("default connector");
+        AsyncMultiModalTracker::new(Arc::new(connector))
+    }
+
+    fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {
+        MediaContentPart::ImageUrl {
+            url: TINY_PNG_URL.to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel,
+        }
+    }
+
+    async fn images(tracker: AsyncMultiModalTracker) -> Vec<TrackedMedia> {
+        tracker
+            .finalize()
+            .await
+            .expect("every part resolves")
+            .data
+            .remove(&Modality::Image)
+            .expect("the request carries images")
+    }
+
+    #[tokio::test]
+    async fn an_image_named_twice_is_fetched_once() {
+        let mut tracker = tracker();
+        tracker.push_part(image_part(None)).expect("first part");
+        tracker.push_part(image_part(None)).expect("second part");
+
+        let items = images(tracker).await;
+        assert_eq!(items.len(), 2);
+        let mut iter = items.iter();
+        let (Some(TrackedMedia::Image(first)), Some(TrackedMedia::Image(second))) =
+            (iter.next(), iter.next())
+        else {
+            panic!("both slots must hold an image");
+        };
+        assert!(Arc::ptr_eq(first, second));
+    }
+
+    #[tokio::test]
+    async fn an_image_asked_for_at_two_sizes_is_fetched_twice() {
+        let mut tracker = tracker();
+        tracker.push_part(image_part(None)).expect("first part");
+        tracker
+            .push_part(image_part(Some(504)))
+            .expect("second part");
+
+        let items = images(tracker).await;
+        assert_eq!(items.len(), 2);
+        let mut iter = items.iter();
+        let (Some(TrackedMedia::Image(first)), Some(TrackedMedia::Image(second))) =
+            (iter.next(), iter.next())
+        else {
+            panic!("both slots must hold an image");
+        };
+        assert!(!Arc::ptr_eq(first, second));
+    }
+
+    #[test]
+    fn a_fetch_is_shared_only_with_the_same_media_and_settings() {
+        let clip = MediaSource::Url("https://example.test/clip.mp4".to_string());
+        let key = fetch_key(Modality::Video, "one", &clip);
+
+        assert_eq!(key, fetch_key(Modality::Video, "one", &clip));
+        assert_ne!(key, fetch_key(Modality::Video, "two", &clip));
+        assert_ne!(key, fetch_key(Modality::Image, "one", &clip));
+        assert_ne!(
+            key,
+            fetch_key(
+                Modality::Video,
+                "one",
+                &MediaSource::Url("https://example.test/other.mp4".to_string()),
+            )
+        );
     }
 }

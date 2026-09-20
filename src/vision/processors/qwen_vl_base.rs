@@ -1124,49 +1124,67 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             });
         }
 
-        let mut all_patches: Vec<f32> = Vec::with_capacity(total_patch_values);
         let mut patches_per_image: Vec<i64> = Vec::with_capacity(images.len());
         let mut grid_thw_data = Vec::with_capacity(images.len() * 3);
         let mut feature_token_counts = Vec::with_capacity(images.len());
-
-        for (image, plan) in images.iter().zip(image_plans) {
-            // Resize to the image's own target size (skip if dimensions match)
-            let resized;
-            let img_ref = if plan.needs_resize {
-                // BICUBIC (Qwen default) uses the PIL-compatible path; other
-                // filters keep the SIMD path.
-                resized = if filter == FilterType::CatmullRom {
-                    resize_bicubic_pil(image, plan.target_width, plan.target_height)
-                } else {
-                    resize(image, plan.target_width, plan.target_height, filter)
-                };
-                &resized
-            } else {
-                image
-            };
-
-            grid_thw_data.push(plan.grid_t as i64);
-            grid_thw_data.push(plan.grid_h as i64);
-            grid_thw_data.push(plan.grid_w as i64);
-
+        for plan in &image_plans {
+            grid_thw_data.extend([plan.grid_t as i64, plan.grid_h as i64, plan.grid_w as i64]);
             feature_token_counts.push(plan.tokens);
-
-            // Patchify directly from RGB bytes to avoid the intermediate
-            // [C,H,W] tensor allocation. This matches the tensor path's
-            // channel/temporal/spatial order.
-            let base_idx = all_patches.len();
-            all_patches.resize(base_idx + plan.patch_values, 0.0);
-            let mut out_idx = base_idx;
-            self.patchify_image_rgb_into(
-                img_ref,
-                plan.grid_h,
-                plan.grid_w,
-                &mut all_patches,
-                &mut out_idx,
-                &lut,
-            )?;
-            debug_assert_eq!(out_idx, all_patches.len());
             patches_per_image.push(plan.num_patches as i64);
+        }
+
+        // Each image owns a disjoint band of the patch buffer, so the images
+        // resize and patchify in parallel.
+        let mut all_patches: Vec<f32> = vec![0.0; total_patch_values];
+        let mut bands = Vec::with_capacity(images.len());
+        let mut remaining = all_patches.as_mut_slice();
+        for plan in &image_plans {
+            let (band, rest) = remaining.split_at_mut(plan.patch_values);
+            bands.push(band);
+            remaining = rest;
+        }
+        let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
+        parallel_scope(|scope| {
+            for (((image, plan), band), error_slot) in images
+                .iter()
+                .zip(&image_plans)
+                .zip(bands)
+                .zip(errors.iter_mut())
+            {
+                let lut = &lut;
+                scope.spawn(move |_| {
+                    // BICUBIC (Qwen default) uses the PIL-compatible path; other
+                    // filters keep the SIMD path.
+                    let resized;
+                    let img_ref = if plan.needs_resize {
+                        resized = if filter == FilterType::CatmullRom {
+                            resize_bicubic_pil(image, plan.target_width, plan.target_height)
+                        } else {
+                            resize(image, plan.target_width, plan.target_height, filter)
+                        };
+                        &resized
+                    } else {
+                        image
+                    };
+                    // Patchify directly from RGB bytes to avoid the intermediate
+                    // [C,H,W] tensor allocation. This matches the tensor path's
+                    // channel/temporal/spatial order.
+                    let mut out_idx = 0;
+                    let outcome = self.patchify_image_rgb_into(
+                        img_ref,
+                        plan.grid_h,
+                        plan.grid_w,
+                        band,
+                        &mut out_idx,
+                        lut,
+                    );
+                    debug_assert!(outcome.is_err() || out_idx == band.len());
+                    *error_slot = outcome.err();
+                });
+            }
+        });
+        if let Some(error) = errors.into_iter().flatten().next() {
+            return Err(error);
         }
 
         let encoder_input =

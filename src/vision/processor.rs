@@ -69,6 +69,15 @@ impl PreprocessedEncoderInputs {
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline.
 pub trait VisionPreProcessor: Send + Sync {
+    /// Whether preprocessing individual images and concatenating their outputs
+    /// is equivalent to preprocessing the whole batch, including metadata.
+    ///
+    /// Opt in only when resize, padding and normalization are independent of
+    /// other images. An output field layout alone does not guarantee this.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 

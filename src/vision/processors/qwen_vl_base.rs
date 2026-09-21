@@ -1403,6 +1403,80 @@ mod tests {
     use super::*;
     use crate::vision::transforms::to_tensor_and_normalize;
 
+    /// The opted-in Qwen processors must produce bit-identical pixels and
+    /// metadata when individual images are concatenated instead of batched.
+    #[test]
+    fn test_preprocess_per_image_concat_matches_batch() {
+        use crate::{
+            types::FieldLayout,
+            vision::processors::{Qwen2VLProcessor, Qwen3VLProcessor},
+        };
+
+        let processors: [&dyn VisionPreProcessor; 2] =
+            [&Qwen2VLProcessor::new(), &Qwen3VLProcessor::new()];
+        for processor in processors {
+            assert!(processor.supports_per_image_preprocessing());
+            let config = PreProcessorConfig {
+                image_mean: Some(processor.default_mean().to_vec()),
+                image_std: Some(processor.default_std().to_vec()),
+                min_pixels: Some(56 * 56),
+                max_pixels: Some(112 * 112),
+                ..Default::default()
+            };
+            let images = vec![
+                create_sized_pattern_frame(7, 9, 3),
+                create_sized_pattern_frame(12, 6, 42),
+                create_sized_pattern_frame(8, 8, 250),
+            ];
+
+            let batched = processor.preprocess(&images, &config).unwrap();
+
+            let layouts = std::collections::HashMap::from([
+                ("image_grid_thw".to_string(), FieldLayout::Batched),
+                ("patches_per_image".to_string(), FieldLayout::Batched),
+            ]);
+            let parts = images
+                .iter()
+                .map(|image| {
+                    processor
+                        .preprocess(std::slice::from_ref(image), &config)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let merged = PreprocessedEncoderInputs::concat(parts, &layouts).unwrap();
+
+            assert_eq!(merged.encoder_input_shape(), batched.encoder_input_shape());
+            assert_eq!(merged.feature_token_counts, batched.feature_token_counts);
+            assert_eq!(merged.item_sizes, batched.item_sizes);
+            let merged_values = merged.encoder_input.as_slice_memory_order().unwrap();
+            let batched_values = batched.encoder_input.as_slice_memory_order().unwrap();
+            for (idx, (&got, &want)) in merged_values.iter().zip(batched_values.iter()).enumerate()
+            {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "merged patch value differs at index {idx}: got {got}, want {want}"
+                );
+            }
+            for key in ["image_grid_thw", "patches_per_image"] {
+                let (merged_extra, batched_extra) = (
+                    merged.model_specific.get(key).unwrap(),
+                    batched.model_specific.get(key).unwrap(),
+                );
+                assert!(
+                    matches!(
+                        (merged_extra, batched_extra),
+                        (
+                            ModelSpecificValue::IntTensor { data: got, shape: got_shape },
+                            ModelSpecificValue::IntTensor { data: want, shape: want_shape },
+                        ) if got == want && got_shape == want_shape
+                    ),
+                    "model-specific value {key:?} differs between merged and batched outputs"
+                );
+            }
+        }
+    }
+
     fn create_test_config() -> QwenVLConfig {
         QwenVLConfig {
             patch_size: 14,

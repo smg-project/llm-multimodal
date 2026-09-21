@@ -42,6 +42,14 @@ MODELS = {
         # Anchor = the literal <|image|> token (config image_token_index when present).
         "anchors": {"image": ("literal", "<|image|>")},
     },
+    "minimax_m3": {
+        "model_id": "MiniMaxAI/MiniMax-M3",
+        # Anchor = tokenizer token for the config's <modality>_token_index.
+        "anchors": {
+            "image": ("config_id", "image_token_index"),
+            "video": ("config_id", "video_token_index"),
+        },
+    },
 }
 
 PREFIX_TEXT = "Describe what you see."

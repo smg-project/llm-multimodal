@@ -2082,12 +2082,23 @@ impl FrameSelection {
             .len()
             .checked_sub(1)
             .filter(|denom| *denom > 0)?;
-        let spread = |index: usize| {
-            let step = ((index * denom) as f64 / last as f64).round();
-            (step * last as f64 / denom as f64).floor() as usize
-        };
-        let described = (0..self.total_frames).filter(|index| spread(*index) == *index);
-        if !described.eq(self.unique_frames.iter().map(|(index, _)| *index)) {
+        let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
+        let frame_at = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
+        // A fixed point is by definition something the formula produces, and the
+        // formula produces one frame per step, so the candidates are counted by
+        // the frames asked for rather than by the frames the file claims to hold.
+        // Ascending, so the last one kept is enough to skip a repeat.
+        let mut described: Vec<usize> = Vec::with_capacity(self.unique_frames.len());
+        for step in 0..=denom {
+            let index = frame_at(step as f64);
+            if described.last() != Some(&index) && frame_at(step_of(index)) == index {
+                described.push(index);
+            }
+        }
+        if !described
+            .iter()
+            .eq(self.unique_frames.iter().map(|(index, _)| index))
+        {
             return None;
         }
         Some(format!(
@@ -3031,6 +3042,27 @@ mod video_sampling_tests {
             .collect();
         assert!(selection.spread_select_filter().is_none());
         assert!(selection.select_filter().starts_with(r"select='eq(n\,0)+"));
+    }
+
+    #[test]
+    fn a_frame_count_the_container_made_up_still_builds_a_filter() {
+        // The count is whatever the file claims. Walking every frame of it to
+        // find the ones the formula picks turns a made-up claim into a stall
+        // before ffmpeg is even started.
+        let selection = FrameSelection::from_metadata(
+            metadata(Some(30.0), Some(usize::MAX / 2)),
+            VideoFetchConfig {
+                max_frames: 768,
+                ..cfg()
+            },
+        )
+        .expect("frame rate and count are known");
+
+        let filter = selection.select_filter();
+        assert!(
+            filter.contains("floor(round("),
+            "described, not listed: {filter}"
+        );
     }
 
     #[test]

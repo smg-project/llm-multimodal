@@ -300,12 +300,26 @@ fn resize_dynamic_frame_to_raw(
 #[derive(Debug, Clone)]
 pub struct QwenVLProcessorBase {
     config: QwenVLConfig,
+    allow_video_dimensions_below_factor: bool,
 }
 
 impl QwenVLProcessorBase {
     /// Create a new processor with the given configuration.
     pub fn new(config: QwenVLConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            allow_video_dimensions_below_factor: false,
+        }
+    }
+
+    /// Allow non-zero video dimensions below the patch-alignment factor.
+    ///
+    /// Some model families upscale these inputs to the minimum aligned size,
+    /// while Qwen processors reject them. This opt-in preserves the Qwen
+    /// default and lets wrappers select the model-specific behavior.
+    pub fn allow_video_dimensions_below_factor(mut self) -> Self {
+        self.allow_video_dimensions_below_factor = true;
+        self
     }
 
     /// Get the patch size.
@@ -539,7 +553,14 @@ impl QwenVLProcessorBase {
             });
         }
 
-        if height < factor || width < factor {
+        if height == 0 || width == 0 {
+            return Err(TransformError::InvalidShape {
+                expected: "non-zero dimensions".to_string(),
+                actual: vec![height, width],
+            });
+        }
+
+        if !self.allow_video_dimensions_below_factor && (height < factor || width < factor) {
             return Err(TransformError::InvalidShape {
                 expected: format!("height and width >= factor ({factor})"),
                 actual: vec![height, width],
@@ -1710,6 +1731,33 @@ mod tests {
     fn test_qwen_vl_base_factor() {
         let processor = QwenVLProcessorBase::new(create_test_config());
         assert_eq!(processor.get_factor(), 28); // 14 * 2
+    }
+
+    #[test]
+    fn test_video_dimension_guards() {
+        let qwen = QwenVLProcessorBase::new(create_test_config());
+        let permissive = qwen.clone().allow_video_dimensions_below_factor();
+        for (height, width) in [(20, 100), (100, 20), (1, 1), (27, 28), (28, 27)] {
+            assert!(matches!(
+                qwen.smart_resize_video(2, height, width),
+                Err(TransformError::InvalidShape { .. })
+            ));
+            assert!(permissive.smart_resize_video(2, height, width).is_ok());
+        }
+        for processor in [&qwen, &permissive] {
+            for (height, width) in [(0, 100), (100, 0), (0, 0)] {
+                assert!(matches!(
+                    processor.smart_resize_video(2, height, width),
+                    Err(TransformError::InvalidShape { .. })
+                ));
+            }
+        }
+        for (height, width) in [(28, 28), (100, 100), (720, 1280)] {
+            assert_eq!(
+                qwen.smart_resize_video(2, height, width).unwrap(),
+                permissive.smart_resize_video(2, height, width).unwrap()
+            );
+        }
     }
 
     #[test]

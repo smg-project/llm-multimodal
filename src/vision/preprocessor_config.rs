@@ -6,12 +6,12 @@
 use std::collections::HashMap;
 
 use image::imageops::FilterType;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::transforms;
 
 /// Struct to represent patch_size as dict {"height": x, "width": y}
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PatchSize {
     pub height: Option<u32>,
     pub width: Option<u32>,
@@ -143,7 +143,7 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
     #[serde(default)]

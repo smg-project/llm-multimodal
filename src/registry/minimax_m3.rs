@@ -337,6 +337,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         Self::image_token_id(metadata)
     }
 
+    /// The bare `]<]image[>[` / `]<]video[>[` are vLLM's single-token targets.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image | Modality::Video)
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
@@ -1202,6 +1207,14 @@ mod tests {
             err,
             ModelRegistryError::InvalidPreprocessedField { ref field } if field == "video_grid_thw"
         ));
+    }
+
+    #[test]
+    fn image_and_video_anchors_can_be_expanded_by_the_worker() {
+        let spec = MiniMaxM3VisionSpec;
+        assert!(spec.worker_expandable(Modality::Image));
+        assert!(spec.worker_expandable(Modality::Video));
+        assert!(!spec.worker_expandable(Modality::Audio));
     }
 
     #[test]

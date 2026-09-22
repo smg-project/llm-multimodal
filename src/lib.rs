@@ -8,6 +8,7 @@ pub mod jpeg_turbo;
 pub mod media;
 #[cfg(feature = "opencv-video")]
 mod opencv_buffer;
+pub mod preprocessing;
 pub mod registry;
 pub mod tracker;
 pub mod types;
@@ -19,6 +20,7 @@ pub use error::{MediaConnectorError, MultiModalError, MultiModalResult, Transfor
 pub use media::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaSource, VideoFetchConfig,
 };
+pub use preprocessing::PreprocessingContext;
 pub use registry::{
     ModelMetadata, ModelProcessorSpec, ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
@@ -33,5 +35,4 @@ pub use types::{
 pub use vision::{
     DeepseekV41Processor, InklingImageProcessor, KimiK3Processor, LlavaNextProcessor,
     LlavaProcessor, NemotronHOmniProcessor, PreProcessorConfig, VisionPreProcessor,
-    VisionPreprocessingContext, VisionProcessorRegistry,
 };

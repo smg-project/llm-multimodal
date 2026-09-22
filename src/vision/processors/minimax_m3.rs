@@ -54,6 +54,11 @@ impl Default for MiniMaxM3Processor {
 }
 
 impl MiniMaxM3Processor {
+    fn with_transform_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.inner = self.inner.with_preprocessor_config(config);
+        self
+    }
+
     /// Create a new MiniMax-M3 processor with default settings.
     ///
     /// Defaults:
@@ -114,6 +119,7 @@ impl MiniMaxM3Processor {
             min_pixels,
             max_pixels,
         )
+        .with_transform_config(config)
     }
 
     /// Get the patch size.
@@ -171,22 +177,6 @@ impl MiniMaxM3Processor {
         self.inner
             .calculate_tokens_from_grid(grid_t, grid_h, grid_w)
     }
-
-    /// Build the effective processor for a request, applying any structural
-    /// overrides from `config`; otherwise reuse the existing defaults.
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some()
-            || config.merge_size.is_some()
-            || config.min_pixels.is_some()
-            || config.max_pixels.is_some()
-            || config.temporal_patch_size.is_some()
-            || config.size.is_some()
-        {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
-    }
 }
 
 impl Deref for MiniMaxM3Processor {
@@ -209,22 +199,20 @@ impl VisionPreProcessor for MiniMaxM3Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.preprocess(images, config)
+        self.inner.preprocess(images)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
-        self.inner.calculate_num_tokens(width, height, _config)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        self.inner.calculate_num_tokens(width, height)
     }
 
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        self.inner.get_processed_size(config)
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        self.inner.get_processed_size()
     }
 }
 
@@ -299,17 +287,15 @@ mod tests {
 
     #[test]
     fn test_calculate_num_tokens() {
-        let config = PreProcessorConfig::default();
         // 500x500 -> 324 tokens (verified against HF).
         let p = MiniMaxM3Processor::new();
-        assert_eq!(p.calculate_num_tokens(500, 500, &config), 324);
+        assert_eq!(p.calculate_num_tokens(500, 500), 324);
         // 4000x3000 -> grid 40x54 -> (40*54)/4 = 540.
-        assert_eq!(p.calculate_num_tokens(4000, 3000, &config), 540);
+        assert_eq!(p.calculate_num_tokens(4000, 3000), 540);
     }
 
     #[test]
     fn test_preprocess_single() {
-        let p = MiniMaxM3Processor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_normalize: Some(true),
@@ -319,7 +305,9 @@ mod tests {
         };
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = MiniMaxM3Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
 
         // pixel_values is patchified: [total_patches, patch_features].
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -334,14 +322,13 @@ mod tests {
     #[test]
     fn test_preprocess_multiple() {
         let p = MiniMaxM3Processor::new();
-        let config = PreProcessorConfig::default();
 
         let images = vec![
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = p.preprocess(&images, &config).unwrap();
+        let result = p.preprocess(&images).unwrap();
 
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
@@ -369,8 +356,7 @@ mod tests {
     #[test]
     fn test_preprocess_empty_batch_errors() {
         let p = MiniMaxM3Processor::new();
-        let config = PreProcessorConfig::default();
-        assert!(p.preprocess(&[], &config).is_err());
+        assert!(p.preprocess(&[]).is_err());
     }
 
     #[test]

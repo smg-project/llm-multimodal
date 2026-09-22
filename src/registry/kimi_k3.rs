@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct KimiK3VisionSpec;
@@ -34,6 +35,21 @@ impl KimiK3VisionSpec {
 }
 
 impl ModelProcessorSpec for KimiK3VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(KimiK3Processor::from_preprocessor_config(config))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "kimi_k3"
     }

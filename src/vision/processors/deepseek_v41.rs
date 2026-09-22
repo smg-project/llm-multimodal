@@ -195,19 +195,6 @@ impl DeepseekV41Processor {
         }
     }
 
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some()
-            || config.min_pixels.is_some()
-            || config.extra.contains_key("downsample_ratio")
-            || config.extra.contains_key("max_image_tokens")
-            || config.extra.contains_key("max_wh_ratio")
-        {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
-    }
-
     /// Resize plan for an image of the given original size; a pure function
     /// of its arguments (the reference `plan_image_grid` / `load_image`
     /// geometry).
@@ -313,12 +300,10 @@ impl VisionPreProcessor for DeepseekV41Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-        let processor = self.with_preprocessor_config(config);
 
         let mut patches = Vec::new();
         let mut feature_token_counts = Vec::with_capacity(images.len());
@@ -331,7 +316,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
 
         let mut total_patches = 0usize;
         for image in images {
-            let (image_patches, plan) = processor.load_image(image)?;
+            let (image_patches, plan) = self.load_image(image)?;
             total_patches += plan.n_vit_h * plan.n_vit_w;
             patches.push(image_patches);
             feature_token_counts.push(plan.num_image_tokens());
@@ -343,7 +328,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
             types_per_image.push(plan.num_image_tokens() as i64);
         }
 
-        let patch_len = 3 * processor.patch_size * processor.patch_size;
+        let patch_len = 3 * self.patch_size * self.patch_size;
         let mut encoder_input = Vec::with_capacity(total_patches * patch_len);
         for image_patches in &patches {
             encoder_input.extend_from_slice(
@@ -354,7 +339,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
         }
         // The engine consumes patches as `(np, 3, p, p)` (see vLLM's
         // `DeepseekV4VLImagePixelInputs`).
-        let p = processor.patch_size;
+        let p = self.patch_size;
         let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
             .expect("concatenated patch buffer matches its shape by construction");
 
@@ -387,10 +372,8 @@ impl VisionPreProcessor for DeepseekV41Processor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.with_preprocessor_config(config)
-            .plan_image_grid(width, height)
-            .num_image_tokens()
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        self.plan_image_grid(width, height).num_image_tokens()
     }
 
     fn model_name(&self) -> &'static str {
@@ -473,18 +456,19 @@ mod tests {
         let config: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"max_image_tokens": 320})).unwrap();
 
-        assert!(processor.calculate_num_tokens(4000, 4000, &config) <= 320);
-        assert!(processor.calculate_num_tokens(4000, 4000, &PreProcessorConfig::default()) > 320);
+        assert!(
+            DeepseekV41Processor::from_preprocessor_config(&config)
+                .calculate_num_tokens(4000, 4000)
+                <= 320
+        );
+        assert!(processor.calculate_num_tokens(4000, 4000) > 320);
     }
 
     #[test]
     fn preprocess_emits_engine_contract() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(64, 48, Rgb([10, 200, 30])));
         let processor = DeepseekV41Processor::new();
-        let config = PreProcessorConfig::default();
-        let out = processor
-            .preprocess(std::slice::from_ref(&image), &config)
-            .unwrap();
+        let out = processor.preprocess(std::slice::from_ref(&image)).unwrap();
 
         let plan = processor.plan_image_grid(64, 48);
         assert_eq!((plan.best_width, plan.best_height), (630, 476));

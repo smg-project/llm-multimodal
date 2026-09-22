@@ -8,6 +8,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{NemotronHOmniProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 const IMAGE_PLACEHOLDER: &str = "<image>";
@@ -17,6 +18,24 @@ const IMAGE_END: &str = "</img>";
 pub(super) struct NemotronHOmniVisionSpec;
 
 impl ModelProcessorSpec for NemotronHOmniVisionSpec {
+    fn vision_processor(
+        &self,
+        metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(NemotronHOmniProcessor::from_configs(
+                metadata.config,
+                config,
+            )?)),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "nemotron_h_omni"
     }
@@ -100,11 +119,13 @@ impl ModelProcessorSpec for NemotronHOmniVisionSpec {
 
 #[cfg(test)]
 mod tests {
+    use image::DynamicImage;
     use ndarray::Array4;
     use serde_json::json;
 
     use super::*;
     use crate::registry::test_helpers::TestTokenizer;
+    use crate::PreprocessingContext;
 
     fn metadata<'a>(tokenizer: &'a TestTokenizer, config: &'a Value) -> ModelMetadata<'a> {
         ModelMetadata {
@@ -119,7 +140,14 @@ mod tests {
         let tokenizer = TestTokenizer::new(&[]);
         let config = json!({
             "model_type": "nemotron_h_omni",
-            "img_context_token_id": 18
+            "img_context_token_id": 18,
+            "patch_size": 16,
+            "downsample_ratio": 0.5,
+            "norm_mean": [0.0, 0.0, 0.0],
+            "norm_std": [1.0, 1.0, 1.0],
+            "vision_config": {
+                "args": {"min_num_patches": 1024, "max_num_patches": 13312}
+            }
         });
         let metadata = metadata(&tokenizer, &config);
 
@@ -130,9 +158,42 @@ mod tests {
                 .name(),
             "nemotron_h_omni"
         );
-        assert!(crate::VisionProcessorRegistry::with_defaults()
-            .find(metadata.model_id, metadata.config_model_type())
-            .is_some());
+        let processor = NemotronHOmniVisionSpec
+            .vision_processor(&metadata, &PreProcessorConfig::default(), Modality::Image)
+            .unwrap();
+        let output = processor
+            .preprocess_with_context(
+                &[DynamicImage::new_rgb8(48, 32)],
+                &PreprocessingContext {
+                    token_budget: Some(16384),
+                },
+            )
+            .unwrap();
+        assert_eq!(output.feature_token_counts, vec![276]);
+    }
+
+    #[test]
+    fn factory_distinguishes_unsupported_modality_and_invalid_config() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({"model_type": "nemotron_h_omni"});
+        let metadata = metadata(&tokenizer, &config);
+        assert!(matches!(
+            NemotronHOmniVisionSpec.vision_processor(
+                &metadata,
+                &PreProcessorConfig::default(),
+                Modality::Video,
+            ),
+            Err(ModelRegistryError::UnsupportedModality {
+                spec: "nemotron_h_omni",
+                modality: Modality::Video,
+            })
+        ));
+        assert!(matches!(
+            NemotronHOmniVisionSpec.vision_processor(
+                &metadata, &PreProcessorConfig::default(), Modality::Image,
+            ),
+            Err(ModelRegistryError::MissingConfigField { field }) if field == "patch_size"
+        ));
     }
 
     #[test]

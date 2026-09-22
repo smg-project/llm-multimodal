@@ -7,7 +7,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{processors::Qwen3OmniVisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
@@ -54,6 +54,23 @@ impl Qwen3OmniSpec {
 }
 
 impl ModelProcessorSpec for Qwen3OmniSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Qwen3OmniVisionProcessor::from_config_for(config, modality),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "qwen3_omni"
     }
@@ -124,11 +141,11 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
 
     fn audio_processor(
         &self,
-        model_config: &Value,
+        metadata: &ModelMetadata,
         preprocessor_config: &PreProcessorConfig,
     ) -> Option<Box<dyn AudioPreProcessor>> {
         Some(Box::new(Qwen3AudioProcessor::from_configs(
-            model_config,
+            metadata.config,
             preprocessor_config,
         )))
     }
@@ -347,7 +364,7 @@ mod tests {
         )
         .unwrap();
         let processor = spec
-            .audio_processor(&config, &preprocessor_config)
+            .audio_processor(&metadata, &preprocessor_config)
             .expect("qwen3_omni spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

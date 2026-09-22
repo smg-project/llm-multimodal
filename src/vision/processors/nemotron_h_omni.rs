@@ -5,34 +5,23 @@ use ndarray::Axis;
 use serde_json::Value;
 
 use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::vision::{
-    transforms, PreProcessorConfig, TransformError, VisionPreProcessor, VisionPreprocessingContext,
-};
+use crate::registry::{ModelRegistryError, RegistryResult};
+use crate::vision::{transforms, PreProcessorConfig, TransformError, VisionPreProcessor};
+use crate::PreprocessingContext;
 
 #[derive(Debug, Clone)]
-struct ProcessorConfig {
+pub struct NemotronHOmniProcessor {
     patch_size: usize,
     reduction_factor: usize,
     min_num_patches: usize,
     max_num_patches: usize,
-    max_model_len: usize,
     mean: [f64; 3],
     std: [f64; 3],
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct NemotronHOmniProcessor;
-
 impl NemotronHOmniProcessor {
-    pub fn new() -> Self {
-        Self
-    }
-
-    fn processor_config(
-        config: &PreProcessorConfig,
-        context: &VisionPreprocessingContext,
-    ) -> Result<ProcessorConfig, TransformError> {
-        let model_config = &context.model_config;
+    /// Resolve and validate checkpoint parameters once for this model instance.
+    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> RegistryResult<Self> {
         let patch_size = json_usize(model_config, &["patch_size"])
             .or_else(|| {
                 config
@@ -51,10 +40,11 @@ impl NemotronHOmniProcessor {
             || (downsample_ratio * reduction_factor as f64 - 1.0).abs() > f64::EPSILON
             || reduction_factor != 2
         {
-            return Err(TransformError::ShapeError(
-                "Nemotron-H Omni requires a positive patch size and a 0.5 downsample ratio"
-                    .to_string(),
-            ));
+            return Err(ModelRegistryError::InvalidConfig {
+                message:
+                    "Nemotron-H Omni requires a positive patch size and a 0.5 downsample ratio"
+                        .to_string(),
+            });
         }
 
         let min_num_patches =
@@ -65,12 +55,6 @@ impl NemotronHOmniProcessor {
             json_usize(model_config, &["vision_config", "args", "max_num_patches"])
                 .or_else(|| config_usize(config, "max_num_patches"))
                 .ok_or_else(|| missing_config_field("vision_config.args.max_num_patches"))?;
-        let max_model_len = context
-            .max_model_len
-            .or_else(|| json_usize(model_config, &["max_position_embeddings"]))
-            .or_else(|| json_usize(model_config, &["text_config", "max_position_embeddings"]))
-            .or_else(|| config_usize(config, "max_model_len"))
-            .ok_or_else(|| missing_config_field("max_model_len"))?;
         let mean = json_array3(model_config, &["norm_mean"])
             .or_else(|| slice_to_array3(config.image_mean.as_deref()))
             .ok_or_else(|| missing_config_field("norm_mean"))?;
@@ -78,104 +62,88 @@ impl NemotronHOmniProcessor {
             .or_else(|| slice_to_array3(config.image_std.as_deref()))
             .ok_or_else(|| missing_config_field("norm_std"))?;
         if min_num_patches == 0 || max_num_patches < min_num_patches {
-            return Err(TransformError::ShapeError(
-                "Nemotron-H Omni patch limits must be positive and ordered".to_string(),
-            ));
+            return Err(ModelRegistryError::InvalidConfig {
+                message: "Nemotron-H Omni patch limits must be positive and ordered".to_string(),
+            });
         }
         if std.contains(&0.0) {
-            return Err(TransformError::ShapeError(
-                "Nemotron-H Omni normalization standard deviations must be nonzero".to_string(),
-            ));
+            return Err(ModelRegistryError::InvalidConfig {
+                message: "Nemotron-H Omni normalization standard deviations must be nonzero"
+                    .to_string(),
+            });
         }
 
-        Ok(ProcessorConfig {
+        Ok(Self {
             patch_size,
             reduction_factor,
             min_num_patches,
             max_num_patches,
-            max_model_len,
             mean,
             std,
         })
     }
 
-    fn target_patch_grid(
-        width: u32,
-        height: u32,
-        config: &ProcessorConfig,
-        text_prompt_length: usize,
-    ) -> (usize, usize) {
-        let closest_h = (f64::from(height) / config.patch_size as f64 + 0.5)
+    fn target_patch_grid(&self, width: u32, height: u32, token_budget: usize) -> (usize, usize) {
+        let closest_h = (f64::from(height) / self.patch_size as f64 + 0.5)
             .round_ties_even()
             .max(1.0) as usize;
-        let closest_w = (f64::from(width) / config.patch_size as f64 + 0.5)
+        let closest_w = (f64::from(width) / self.patch_size as f64 + 0.5)
             .round_ties_even()
             .max(1.0) as usize;
         let source_patches = closest_h.saturating_mul(closest_w).max(1);
-        let post_shuffle_budget = config
-            .max_model_len
-            .saturating_sub(text_prompt_length)
-            .saturating_sub(4);
+        let post_shuffle_budget = token_budget.saturating_sub(4);
         let patch_budget = post_shuffle_budget
-            .saturating_mul(
-                config
-                    .reduction_factor
-                    .saturating_mul(config.reduction_factor),
-            )
-            .max(config.min_num_patches)
-            .min(config.max_num_patches);
+            .saturating_mul(self.reduction_factor.saturating_mul(self.reduction_factor))
+            .max(self.min_num_patches)
+            .min(self.max_num_patches);
         let scale = (patch_budget as f64 / source_patches as f64)
             .sqrt()
             .min(1.0);
         let mut target_h = ((closest_h as f64 * scale).floor() as usize).max(1);
         let mut target_w = ((closest_w as f64 * scale).floor() as usize).max(1);
 
-        if patch_budget > config.min_num_patches
-            && target_h.saturating_mul(target_w) < config.min_num_patches
+        if patch_budget > self.min_num_patches
+            && target_h.saturating_mul(target_w) < self.min_num_patches
         {
             let upscale =
-                (config.min_num_patches as f64 / target_h.saturating_mul(target_w) as f64).sqrt();
+                (self.min_num_patches as f64 / target_h.saturating_mul(target_w) as f64).sqrt();
             target_h = (target_h as f64 * upscale).ceil() as usize;
             target_w = (target_w as f64 * upscale).ceil() as usize;
         }
 
-        round_grid_dimension(
-            &mut target_h,
-            target_w,
-            config.reduction_factor,
-            patch_budget,
-        );
-        round_grid_dimension(
-            &mut target_w,
-            target_h,
-            config.reduction_factor,
-            patch_budget,
-        );
+        round_grid_dimension(&mut target_h, target_w, self.reduction_factor, patch_budget);
+        round_grid_dimension(&mut target_w, target_h, self.reduction_factor, patch_budget);
         (target_w, target_h)
     }
 
     fn preprocess_one(
         &self,
         image: &DynamicImage,
-        config: &ProcessorConfig,
-        text_prompt_length: usize,
-    ) -> PreprocessedEncoderInputs {
+        token_budget: usize,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let (patch_w, patch_h) =
-            Self::target_patch_grid(image.width(), image.height(), config, text_prompt_length);
-        let target_w = patch_w * config.patch_size;
-        let target_h = patch_h * config.patch_size;
+            self.target_patch_grid(image.width(), image.height(), token_budget);
+        let feature_count = patch_w * patch_h / (self.reduction_factor * self.reduction_factor);
+        if token_budget
+            .checked_sub(4)
+            .is_none_or(|budget| feature_count > budget)
+        {
+            return Err(TransformError::ShapeError(format!(
+                "Nemotron-H Omni image requires {feature_count} feature tokens plus 4 structural tokens, exceeding token_budget {token_budget}"
+            )));
+        }
+        let target_w = patch_w * self.patch_size;
+        let target_h = patch_h * self.patch_size;
         let resized = transforms::resize(
             image,
             target_w as u32,
             target_h as u32,
             FilterType::CatmullRom,
         );
-        let encoder_input =
-            transforms::to_tensor_and_normalize(&resized, &config.mean, &config.std)
-                .insert_axis(Axis(0));
-        let feature_count = patch_w * patch_h / (config.reduction_factor * config.reduction_factor);
+        let encoder_input = transforms::to_tensor_and_normalize(&resized, &self.mean, &self.std)
+            .insert_axis(Axis(0));
 
-        PreprocessedEncoderInputs::new(
+        Ok(PreprocessedEncoderInputs::new(
             encoder_input,
             vec![feature_count],
             vec![(image.width(), image.height())],
@@ -187,7 +155,7 @@ impl NemotronHOmniProcessor {
         .with_extra(
             "num_tokens_per_image",
             ModelSpecificValue::IntVec(vec![feature_count as i64]),
-        )
+        ))
     }
 }
 
@@ -203,16 +171,14 @@ impl VisionPreProcessor for NemotronHOmniProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_with_context(images, config, &VisionPreprocessingContext::default())
+        self.preprocess_with_context(images, &PreprocessingContext::default())
     }
 
     fn preprocess_with_context(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
-        context: &VisionPreprocessingContext,
+        context: &PreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let [image] = images else {
             return Err(if images.is_empty() {
@@ -223,18 +189,19 @@ impl VisionPreProcessor for NemotronHOmniProcessor {
                 )
             });
         };
-        let config = Self::processor_config(config, context)?;
-        Ok(self.preprocess_one(image, &config, context.text_prompt_length))
+        let token_budget = context.token_budget.ok_or_else(|| {
+            TransformError::ShapeError(
+                "Nemotron-H Omni requires a request token_budget".to_string(),
+            )
+        })?;
+        self.preprocess_one(image, token_budget)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let context = VisionPreprocessingContext::default();
-        Self::processor_config(config, &context)
-            .map(|config| {
-                let (patch_w, patch_h) = Self::target_patch_grid(width, height, &config, 0);
-                patch_w * patch_h / (config.reduction_factor * config.reduction_factor)
-            })
-            .unwrap_or(0)
+    /// Estimate using the checkpoint patch limit. Preprocessing reports the actual
+    /// feature count after applying the request's token budget.
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        let (patch_w, patch_h) = self.target_patch_grid(width, height, usize::MAX);
+        patch_w * patch_h / (self.reduction_factor * self.reduction_factor)
     }
 
     fn model_name(&self) -> &'static str {
@@ -242,10 +209,10 @@ impl VisionPreProcessor for NemotronHOmniProcessor {
     }
 }
 
-fn missing_config_field(field: &str) -> TransformError {
-    TransformError::ShapeError(format!(
-        "Nemotron-H Omni requires `{field}` from checkpoint or runtime configuration"
-    ))
+fn missing_config_field(field: &str) -> ModelRegistryError {
+    ModelRegistryError::MissingConfigField {
+        field: field.to_string(),
+    }
 }
 
 fn json_value_at<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -312,33 +279,36 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::encoder_inputs::ModelSpecificValue;
 
-    fn context(max_model_len: usize, text_prompt_length: usize) -> VisionPreprocessingContext {
-        VisionPreprocessingContext {
-            model_config: json!({
-                "model_type": "nemotron_h_omni",
-                "patch_size": 16,
-                "downsample_ratio": 0.5,
-                "norm_mean": [0.48145466, 0.4578275, 0.40821073],
-                "norm_std": [0.26862954, 0.26130258, 0.27577711],
-                "vision_config": {
-                    "args": {
-                        "min_num_patches": 1024,
-                        "max_num_patches": 13312
-                    }
-                }
-            }),
-            max_model_len: Some(max_model_len),
-            text_prompt_length,
+    fn model_config() -> Value {
+        json!({
+            "model_type": "nemotron_h_omni",
+            "patch_size": 16,
+            "downsample_ratio": 0.5,
+            "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+            "norm_std": [0.26862954, 0.26130258, 0.27577711],
+            "vision_config": {
+                "args": { "min_num_patches": 1024, "max_num_patches": 13312 }
+            }
+        })
+    }
+
+    fn processor() -> NemotronHOmniProcessor {
+        NemotronHOmniProcessor::from_configs(&model_config(), &PreProcessorConfig::default())
+            .unwrap()
+    }
+
+    fn context(token_budget: usize) -> PreprocessingContext {
+        PreprocessingContext {
+            token_budget: Some(token_budget),
         }
     }
 
     #[test]
     fn matches_python_patch_grid_rounding() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(48, 32, Rgb([255, 0, 0])));
-        let output = NemotronHOmniProcessor::new()
-            .preprocess_with_context(&[image], &PreProcessorConfig::default(), &context(16384, 0))
+        let output = processor()
+            .preprocess_with_context(&[image], &context(16384))
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[1, 3, 384, 736]);
@@ -354,10 +324,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_length_limits_dynamic_resolution_budget() {
+    fn token_budget_limits_dynamic_resolution() {
         let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(4096, 4096, Rgb([1, 2, 3])));
-        let output = NemotronHOmniProcessor::new()
-            .preprocess_with_context(&[image], &PreProcessorConfig::default(), &context(512, 100))
+        let output = processor()
+            .preprocess_with_context(&[image], &context(512 - 100))
             .unwrap();
 
         assert_eq!(output.encoder_input.shape(), &[1, 3, 640, 640]);
@@ -365,41 +335,119 @@ mod tests {
     }
 
     #[test]
+    fn request_budgets_do_not_change_processor_configuration() {
+        let processor = processor();
+        let images = [DynamicImage::new_rgb8(1024, 1024)];
+        let unrestricted = processor.calculate_num_tokens(1024, 1024);
+        for budget in [16384, 412, 16384] {
+            let output = processor
+                .preprocess_with_context(&images, &context(budget))
+                .unwrap();
+            let count = output.feature_token_counts[0];
+            assert_eq!(count, if budget == 412 { 400 } else { unrestricted });
+            assert!(count + 4 <= budget);
+        }
+    }
+
+    #[test]
     fn rejects_a_ragged_multi_image_batch() {
         let images = [
-            DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
-            DynamicImage::ImageRgb8(RgbImage::new(48, 32)),
+            DynamicImage::new_rgb8(32, 32),
+            DynamicImage::new_rgb8(48, 32),
         ];
-        let error = NemotronHOmniProcessor::new()
-            .preprocess_with_context(&images, &PreProcessorConfig::default(), &context(16384, 0))
+        let error = processor()
+            .preprocess_with_context(&images, &context(16384))
             .unwrap_err();
-
         assert!(error.to_string().contains("one image"));
     }
 
     #[test]
-    fn requires_checkpoint_configuration() {
-        let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
-        let error = NemotronHOmniProcessor::new()
-            .preprocess_with_context(
-                &[image],
-                &PreProcessorConfig::default(),
-                &VisionPreprocessingContext::default(),
-            )
-            .unwrap_err();
-
-        assert!(error.to_string().contains("patch_size"));
+    fn requires_checkpoint_configuration_at_construction() {
+        assert!(matches!(
+            NemotronHOmniProcessor::from_configs(&json!({}), &PreProcessorConfig::default()),
+            Err(ModelRegistryError::MissingConfigField { field }) if field == "patch_size"
+        ));
     }
 
     #[test]
-    fn requires_runtime_max_model_len() {
-        let image = DynamicImage::ImageRgb8(RgbImage::new(32, 32));
-        let mut context = context(16384, 0);
-        context.max_model_len = None;
-        let error = NemotronHOmniProcessor::new()
-            .preprocess_with_context(&[image], &PreProcessorConfig::default(), &context)
-            .unwrap_err();
+    fn validates_checkpoint_parameters_at_construction() {
+        for (field, value) in [
+            ("patch_size", json!(0)),
+            ("downsample_ratio", json!(0.25)),
+            ("norm_std", json!([1.0, 0.0, 1.0])),
+            (
+                "vision_config",
+                json!({"args": {"min_num_patches": 0, "max_num_patches": 1024}}),
+            ),
+            (
+                "vision_config",
+                json!({"args": {"min_num_patches": 1024, "max_num_patches": 512}}),
+            ),
+        ] {
+            let mut config = model_config();
+            config[field] = value;
+            assert!(
+                matches!(
+                    NemotronHOmniProcessor::from_configs(&config, &PreProcessorConfig::default()),
+                    Err(ModelRegistryError::InvalidConfig { .. })
+                ),
+                "{field}"
+            );
+        }
+    }
 
-        assert!(error.to_string().contains("max_model_len"));
+    #[test]
+    fn preprocessor_fallbacks_are_owned_by_the_instance() {
+        let mut config = PreProcessorConfig::from_value(json!({
+            "patch_size": 16,
+            "downsample_ratio": 0.5,
+            "min_num_patches": 1024,
+            "max_num_patches": 13312,
+            "image_mean": [0.0, 0.0, 0.0],
+            "image_std": [1.0, 1.0, 1.0]
+        }))
+        .unwrap();
+        let first = NemotronHOmniProcessor::from_configs(&json!({}), &config).unwrap();
+        config.image_mean = Some(vec![1.0; 3]);
+        let second = NemotronHOmniProcessor::from_configs(&json!({}), &config).unwrap();
+        drop(config);
+
+        let images = [DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            48,
+            32,
+            Rgb([255; 3]),
+        ))];
+        let first_output = first
+            .preprocess_with_context(&images, &context(16384))
+            .unwrap();
+        let second_output = second
+            .preprocess_with_context(&images, &context(16384))
+            .unwrap();
+        assert_eq!(first_output.encoder_input.shape(), &[1, 3, 384, 736]);
+        assert!(first_output.encoder_input.iter().all(|&v| v == 1.0));
+        assert!(second_output.encoder_input.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn requires_request_token_budget() {
+        let image = DynamicImage::new_rgb8(32, 32);
+        let error = processor().preprocess(&[image]).unwrap_err();
+        assert!(error.to_string().contains("token_budget"));
+    }
+
+    #[test]
+    fn rejects_insufficient_budget_including_structural_tokens() {
+        let processor = processor();
+        let images = [DynamicImage::new_rgb8(512, 512)];
+        for budget in [0, 3, 4, 259] {
+            let error = processor
+                .preprocess_with_context(&images, &context(budget))
+                .unwrap_err();
+            assert!(error.to_string().contains("exceeding token_budget"));
+        }
+        let output = processor
+            .preprocess_with_context(&images, &context(260))
+            .unwrap();
+        assert_eq!(output.feature_token_counts, vec![256]);
     }
 }

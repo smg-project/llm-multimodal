@@ -12,6 +12,7 @@ use image::{DynamicImage, RgbImage};
 use llm_multimodal::vision::{
     preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
 };
+use llm_multimodal::Modality;
 
 fn make(w: u32, h: u32) -> DynamicImage {
     let img = RgbImage::from_fn(w, h, |x, y| {
@@ -52,8 +53,9 @@ const CASES: &[(u32, u32)] = &[(560, 420), (840, 560), (1280, 960)];
 const EXPECTED: &[u64] = &[0x391ca5deba1ff255, 0x5bde4728a72eba9d, 0x617d3e39f58f1c45];
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
-    let proc = Qwen3VLProcessor::new();
-    let res = proc.preprocess(&[make(w, h)], &config()).unwrap();
+    let res = Qwen3VLProcessor::from_config_for(&config(), Modality::Image)
+        .preprocess(&[make(w, h)])
+        .unwrap();
     let flat = res.encoder_input_flat();
     (fnv1a_f32(flat.as_ref()), flat.len())
 }

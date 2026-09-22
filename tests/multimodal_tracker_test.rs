@@ -193,7 +193,7 @@ async fn tracker_audio_flows_into_inkling_preprocessor() {
     let registry = ModelRegistry::new();
     let model_spec = registry.lookup(&metadata).expect("Inkling model spec");
     let processor = model_spec
-        .audio_processor(&config, &PreProcessorConfig::default())
+        .audio_processor(&metadata, &PreProcessorConfig::default())
         .expect("Inkling audio processor");
     let preprocessed = processor.preprocess(&clips).expect("Inkling dMel");
 

@@ -6,6 +6,7 @@ use llm_multimodal::vision::{
     processor::ModelSpecificValue, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
     VisionPreProcessor,
 };
+use llm_multimodal::Modality;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -93,9 +94,9 @@ fn config(mean: [f64; 3], std: [f64; 3]) -> PreProcessorConfig {
     }
 }
 
-fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, case: &GoldenCase) {
+fn check_case(processor: &dyn VisionPreProcessor, case: &GoldenCase) {
     let result = processor
-        .preprocess(&[make_image(case.width, case.height)], config)
+        .preprocess(&[make_image(case.width, case.height)])
         .expect("Qwen golden preprocessing failed");
     assert_eq!(result.encoder_input.shape(), case.shape);
 
@@ -120,11 +121,7 @@ fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, c
     );
 }
 
-fn check_video_case(
-    processor: &Qwen3VLProcessor,
-    config: &PreProcessorConfig,
-    case: &GoldenVideoCase,
-) {
+fn check_video_case(processor: &Qwen3VLProcessor, case: &GoldenVideoCase) {
     assert_eq!(case.model, "qwen3_vl");
     let seeds = [3, 101, 177];
     assert_eq!(case.frame_count, seeds.len());
@@ -133,7 +130,7 @@ fn check_video_case(
         .map(|seed| make_seeded_image(case.width, case.height, seed))
         .collect::<Vec<_>>();
     let result = processor
-        .preprocess_video(&frames, config)
+        .preprocess_video(&frames)
         .expect("Qwen video golden preprocessing failed");
     assert_eq!(result.encoder_input.shape(), case.shape);
     assert_eq!(video_grid(&result), &case.grid_thw);
@@ -170,7 +167,6 @@ fn qwen_preprocessing_matches_huggingface_golden() {
         "Qwen video golden coverage changed"
     );
 
-    let qwen2 = Qwen2VLProcessor::new();
     let qwen2_config = PreProcessorConfig {
         min_pixels: Some(256 * 28 * 28),
         max_pixels: Some(1280 * 28 * 28),
@@ -179,17 +175,19 @@ fn qwen_preprocessing_matches_huggingface_golden() {
             [0.26862954, 0.26130258, 0.27577711],
         )
     };
-    let qwen3 = Qwen3VLProcessor::new();
     let qwen3_config = config([0.5; 3], [0.5; 3]);
 
+    let qwen2 = Qwen2VLProcessor::from_preprocessor_config(&qwen2_config);
+    let qwen3 = Qwen3VLProcessor::from_preprocessor_config(&qwen3_config);
     for case in &golden.cases {
         match case.model.as_str() {
-            "qwen2_vl" => check_case(&qwen2, &qwen2_config, case),
-            "qwen3_vl" => check_case(&qwen3, &qwen3_config, case),
+            "qwen2_vl" => check_case(&qwen2, case),
+            "qwen3_vl" => check_case(&qwen3, case),
             model => panic!("unknown Qwen golden model {model}"),
         }
     }
+    let qwen3_video = Qwen3VLProcessor::from_config_for(&qwen3_config, Modality::Video);
     for case in &golden.video_cases {
-        check_video_case(&qwen3, &qwen3_config, case);
+        check_video_case(&qwen3_video, case);
     }
 }

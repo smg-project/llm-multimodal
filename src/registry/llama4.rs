@@ -4,8 +4,9 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::Llama4VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Llama4Spec;
@@ -58,7 +59,9 @@ impl Llama4Spec {
         {
             if shape.len() == 2 && shape[1] == 2 && data.len() == shape[0] * 2 {
                 return data
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .map(|chunk| (chunk[0] as usize, chunk[1] as usize))
                     .collect();
             }
@@ -77,6 +80,23 @@ impl Llama4Spec {
 }
 
 impl ModelProcessorSpec for Llama4Spec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Llama4VisionProcessor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "llama4"
     }

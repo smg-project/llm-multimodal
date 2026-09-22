@@ -80,6 +80,23 @@ impl Default for Qwen3VLProcessor {
 }
 
 impl Qwen3VLProcessor {
+    /// Build a processor for a resolved image or video configuration.
+    ///
+    /// Shared image-only configs retain the model family's separate video
+    /// pixel budgets, matching the defaults supplied by the HF processor.
+    pub fn from_config_for(config: &PreProcessorConfig, modality: crate::Modality) -> Self {
+        if modality == crate::Modality::Video && !config.is_image_only_processor_type() {
+            Self::from_video_preprocessor_config(config)
+        } else {
+            Self::from_image_preprocessor_config(config)
+        }
+    }
+
+    fn with_transform_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.inner = self.inner.with_preprocessor_config(config);
+        self
+    }
+
     /// Create a new Qwen3-VL processor with default settings.
     ///
     /// Defaults:
@@ -163,6 +180,7 @@ impl Qwen3VLProcessor {
                 .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         )
+        .with_transform_config(config)
     }
 
     fn from_image_preprocessor_config(config: &PreProcessorConfig) -> Self {
@@ -179,6 +197,7 @@ impl Qwen3VLProcessor {
                 .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         )
+        .with_transform_config(config)
     }
 
     fn from_video_preprocessor_config(config: &PreProcessorConfig) -> Self {
@@ -195,25 +214,7 @@ impl Qwen3VLProcessor {
                 .temporal_patch_size
                 .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE),
         )
-    }
-
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides() {
-            Self::from_image_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
-    }
-
-    fn with_video_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if !config.has_structural_overrides() {
-            return self.clone();
-        }
-        if config.is_image_only_processor_type() {
-            Self::from_image_preprocessor_config(config)
-        } else {
-            Self::from_video_preprocessor_config(config)
-        }
+        .with_transform_config(config)
     }
 
     /// Get the patch size.
@@ -293,41 +294,34 @@ impl VisionPreProcessor for Qwen3VLProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.preprocess(images, config)
+        self.inner.preprocess(images)
     }
 
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_video_preprocessor_config(config);
-        processor.inner.preprocess_video(frames, config)
+        self.inner.preprocess_video(frames)
     }
 
     fn preprocess_video_rgb(
         &self,
         frames: &[RgbFrameRef<'_>],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_video_preprocessor_config(config);
-        processor.inner.preprocess_video_rgb(frames, config)
+        self.inner.preprocess_video_rgb(frames)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.calculate_num_tokens(width, height, config)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        self.inner.calculate_num_tokens(width, height)
     }
 
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        self.inner.get_processed_size(config)
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        self.inner.get_processed_size()
     }
 }
 
@@ -439,7 +433,6 @@ mod tests {
 
     #[test]
     fn test_qwen3_vl_preprocess() {
-        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_normalize: Some(true),
@@ -456,7 +449,9 @@ mod tests {
         };
 
         let image = create_test_image(640, 480, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+            .preprocess(&[image])
+            .unwrap();
 
         // encoder_input is patchified: [total_patches, patch_features]
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -479,7 +474,6 @@ mod tests {
 
     #[test]
     fn test_qwen3_vl_preprocess_multiple() {
-        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             image_mean: Some(QWEN3_MEAN.to_vec()),
             image_std: Some(QWEN3_STD.to_vec()),
@@ -491,7 +485,9 @@ mod tests {
             create_test_image(480, 640, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+            .preprocess(&images)
+            .unwrap();
 
         // Both images processed
         assert_eq!(result.item_sizes.len(), 2);
@@ -535,7 +531,6 @@ mod tests {
     fn per_image_preprocess_equals_batched_slices() {
         use ndarray::{Axis, Slice};
 
-        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             image_mean: Some(QWEN3_MEAN.to_vec()),
             image_std: Some(QWEN3_STD.to_vec()),
@@ -545,11 +540,15 @@ mod tests {
         let image_a = create_test_image(640, 480, Rgb([100, 110, 120]));
         let image_b = create_test_image(420, 560, Rgb([10, 200, 90]));
 
-        let batched = processor
-            .preprocess(&[image_a.clone(), image_b.clone()], &config)
+        let batched = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+            .preprocess(&[image_a.clone(), image_b.clone()])
             .unwrap();
-        let single_a = processor.preprocess(&[image_a], &config).unwrap();
-        let single_b = processor.preprocess(&[image_b], &config).unwrap();
+        let single_a = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+            .preprocess(&[image_a])
+            .unwrap();
+        let single_b = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+            .preprocess(&[image_b])
+            .unwrap();
 
         // Feature token counts line up per image.
         assert_eq!(
@@ -594,7 +593,6 @@ mod tests {
 
     #[test]
     fn test_qwen3_vl_preprocess_video() {
-        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             image_mean: Some(QWEN3_MEAN.to_vec()),
             image_std: Some(QWEN3_STD.to_vec()),
@@ -607,7 +605,9 @@ mod tests {
             create_test_image(640, 480, Rgb([200, 200, 200])),
         ];
 
-        let result = processor.preprocess_video(&frames, &config).unwrap();
+        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+            .preprocess_video(&frames)
+            .unwrap();
         assert_eq!(result.encoder_input.ndim(), 2);
         assert_eq!(result.feature_token_counts.len(), 1);
         assert!(result.model_specific.contains_key("video_grid_thw"));
@@ -629,7 +629,6 @@ mod tests {
 
     #[test]
     fn test_qwen3_vl_preprocess_video_rgb_applies_config() {
-        let processor = Qwen3VLProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(8),
@@ -657,9 +656,11 @@ mod tests {
             })
             .collect();
 
-        let dynamic = processor.preprocess_video(&frames, &config).unwrap();
-        let rgb = processor
-            .preprocess_video_rgb(&rgb_frames, &config)
+        let dynamic = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+            .preprocess_video(&frames)
+            .unwrap();
+        let rgb = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+            .preprocess_video_rgb(&rgb_frames)
             .unwrap();
 
         assert_eq!(rgb.encoder_input.shape(), dynamic.encoder_input.shape());
@@ -717,7 +718,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen3VLProcessor::new().with_video_preprocessor_config(&config);
+        let processor = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video);
 
         assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
         assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
@@ -738,7 +739,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen3VLProcessor::new().with_video_preprocessor_config(&config);
+        let processor = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video);
 
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);

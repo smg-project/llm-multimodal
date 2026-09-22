@@ -22,6 +22,19 @@ impl QwenVLVisionSpec {
 }
 
 impl ModelProcessorSpec for QwenVLVisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::Qwen2VLProcessor;
+        (modality == Modality::Image).then(|| {
+            Box::new(Qwen2VLProcessor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "qwen_vl"
     }

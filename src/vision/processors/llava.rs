@@ -80,6 +80,34 @@ impl std::str::FromStr for ImageAspectRatio {
     }
 }
 
+/// Resolved image transforms shared by the LLaVA variants.
+#[derive(Debug, Clone)]
+struct LlavaTransforms {
+    mean: [f64; 3],
+    std: [f64; 3],
+    filter: image::imageops::FilterType,
+    target_size: Option<(u32, u32)>,
+    crop_size: Option<(u32, u32)>,
+    do_resize: bool,
+    do_center_crop: bool,
+    do_normalize: bool,
+}
+
+impl LlavaTransforms {
+    fn new(config: &PreProcessorConfig) -> Self {
+        Self {
+            mean: config.get_image_mean(),
+            std: config.get_image_std(),
+            filter: pil_to_filter(config.resampling),
+            target_size: config.get_target_size(),
+            crop_size: config.get_crop_size(),
+            do_resize: config.do_resize.unwrap_or(true),
+            do_center_crop: config.do_center_crop.unwrap_or(true),
+            do_normalize: config.do_normalize.unwrap_or(true),
+        }
+    }
+}
+
 /// LLaVA 1.5 image processor.
 ///
 /// Implements CLIP-based preprocessing with configurable aspect ratio handling.
@@ -100,6 +128,7 @@ impl std::str::FromStr for ImageAspectRatio {
 /// With default settings (336x336, patch_size=14): 576 tokens
 #[derive(Debug, Clone)]
 pub struct LlavaProcessor {
+    transforms: LlavaTransforms,
     /// Patch size for token calculation (typically 14)
     pub patch_size: u32,
     /// Target image size after processing (typically 336)
@@ -121,6 +150,7 @@ impl LlavaProcessor {
     /// This matches the llava-hf/* model behavior.
     pub fn new() -> Self {
         Self {
+            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
             patch_size: 14,
             image_size: 336,
             aspect_ratio: ImageAspectRatio::Square,
@@ -133,6 +163,7 @@ impl LlavaProcessor {
     /// images are expanded to square before processing.
     pub fn new_with_pad() -> Self {
         Self {
+            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
             patch_size: 14,
             image_size: 336,
             aspect_ratio: ImageAspectRatio::Pad,
@@ -142,6 +173,7 @@ impl LlavaProcessor {
     /// Create a processor with custom settings.
     pub fn with_config(patch_size: u32, image_size: u32, aspect_ratio: ImageAspectRatio) -> Self {
         Self {
+            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
             patch_size,
             image_size,
             aspect_ratio,
@@ -173,10 +205,22 @@ impl LlavaProcessor {
             .unwrap_or_default();
 
         Self {
+            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
             patch_size,
             image_size,
             aspect_ratio,
         }
+    }
+
+    /// Resolve model geometry and image transforms once for a loaded model.
+    pub fn from_configs(model_config: &serde_json::Value, config: &PreProcessorConfig) -> Self {
+        Self::from_config(model_config).with_preprocessor_config(config)
+    }
+
+    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.patch_size = config.get_patch_size(self.patch_size as usize) as u32;
+        self.transforms = LlavaTransforms::new(config);
+        self
     }
 
     /// Process a single image through the LLaVA 1.5 pipeline.
@@ -184,20 +228,22 @@ impl LlavaProcessor {
     /// The processing flow depends on `self.aspect_ratio`:
     /// - `Square`: Standard CLIP (resize shortest edge, center crop)
     /// - `Pad`: Expand to square with mean padding, then resize
-    fn process_one_image(&self, image: &DynamicImage, config: &PreProcessorConfig) -> Array3<f32> {
-        let mean = config.get_image_mean();
-        let std = config.get_image_std();
-        let filter = pil_to_filter(config.resampling);
+    fn process_one_image(&self, image: &DynamicImage) -> Array3<f32> {
+        let mean = self.transforms.mean;
+        let std = self.transforms.std;
+        let filter = self.transforms.filter;
 
         // Get target size from config or use default
-        let target_size = config
-            .get_target_size()
+        let target_size = self
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.image_size);
 
         // Get crop size (may be different from target_size)
-        let crop_size = config
-            .get_crop_size()
+        let crop_size = self
+            .transforms
+            .crop_size
             .map(|(h, _w)| h)
             .unwrap_or(target_size);
 
@@ -213,7 +259,7 @@ impl LlavaProcessor {
                 };
 
                 // Resize to target size (maintaining square)
-                if config.do_resize.unwrap_or(true) {
+                if self.transforms.do_resize {
                     resize(&squared, target_size, target_size, filter)
                 } else {
                     squared.into_owned()
@@ -223,7 +269,7 @@ impl LlavaProcessor {
                 // Square mode: Standard CLIP processing
                 // 1. Resize so shortest edge = target_size (preserving aspect ratio)
                 // 2. Center crop to crop_size x crop_size
-                let resized = if config.do_resize.unwrap_or(true) {
+                let resized = if self.transforms.do_resize {
                     // Resize so shortest edge = target_size
                     let (w, h) = image.dimensions();
                     let scale = if w < h {
@@ -239,7 +285,7 @@ impl LlavaProcessor {
                 };
 
                 // Center crop to crop_size (skip if image already fits)
-                if config.do_center_crop.unwrap_or(true) {
+                if self.transforms.do_center_crop {
                     let (rw, rh) = resized.dimensions();
                     if crop_size >= rw && crop_size >= rh {
                         resized
@@ -256,7 +302,7 @@ impl LlavaProcessor {
         let mut tensor = to_tensor(&processed);
 
         // Normalize with mean/std
-        if config.do_normalize.unwrap_or(true) {
+        if self.transforms.do_normalize {
             normalize(&mut tensor, &mean, &std);
         }
 
@@ -276,7 +322,6 @@ impl VisionPreProcessor for LlavaProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -288,7 +333,7 @@ impl VisionPreProcessor for LlavaProcessor {
         // Process each image
         let tensors: Vec<Array3<f32>> = images
             .iter()
-            .map(|img| self.process_one_image(img, config))
+            .map(|img| self.process_one_image(img))
             .collect();
 
         // Stack into batch
@@ -297,7 +342,7 @@ impl VisionPreProcessor for LlavaProcessor {
         // Calculate token counts
         let feature_token_counts: Vec<usize> = images
             .iter()
-            .map(|_| self.calculate_num_tokens(self.image_size, self.image_size, config))
+            .map(|_| self.calculate_num_tokens(self.image_size, self.image_size))
             .collect();
 
         Ok(PreprocessedEncoderInputs::new(
@@ -307,16 +352,12 @@ impl VisionPreProcessor for LlavaProcessor {
         ))
     }
 
-    fn calculate_num_tokens(
-        &self,
-        _width: u32,
-        _height: u32,
-        config: &PreProcessorConfig,
-    ) -> usize {
+    fn calculate_num_tokens(&self, _width: u32, _height: u32) -> usize {
         // For LLaVA 1.5, token count is based on processed image size and patch size
-        let patch_size = config.get_patch_size(self.patch_size as usize) as u32;
-        let image_size = config
-            .get_target_size()
+        let patch_size = self.patch_size;
+        let image_size = self
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.image_size);
 
@@ -328,9 +369,10 @@ impl VisionPreProcessor for LlavaProcessor {
         "llava"
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        let size = config
-            .get_target_size()
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        let size = self
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.image_size);
         Some((size, size))
@@ -373,6 +415,16 @@ impl Default for LlavaNextProcessor {
 }
 
 impl LlavaNextProcessor {
+    /// Resolve model geometry and image transforms once for a loaded model.
+    pub fn from_configs(model_config: &serde_json::Value, config: &PreProcessorConfig) -> Self {
+        Self::from_config(model_config).with_preprocessor_config(config)
+    }
+
+    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.base = self.base.with_preprocessor_config(config);
+        self
+    }
+
     /// Create a new LLaVA-NeXT processor with default settings.
     ///
     /// Default grid pinpoints are common LLaVA-NeXT resolutions.
@@ -464,27 +516,29 @@ impl LlavaNextProcessor {
     }
 
     /// Process a single patch/crop.
-    fn process_patch(&self, image: &DynamicImage, config: &PreProcessorConfig) -> Array3<f32> {
-        let mean = config.get_image_mean();
-        let std = config.get_image_std();
-        let filter = pil_to_filter(config.resampling);
+    fn process_patch(&self, image: &DynamicImage) -> Array3<f32> {
+        let mean = self.base.transforms.mean;
+        let std = self.base.transforms.std;
+        let filter = self.base.transforms.filter;
 
         // Get target size for patches
-        let target_size = config
-            .get_target_size()
+        let target_size = self
+            .base
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
 
         // Resize patch to target size
-        let resized = if config.do_resize.unwrap_or(true) {
+        let resized = if self.base.transforms.do_resize {
             resize(image, target_size, target_size, filter)
         } else {
             image.clone()
         };
 
         // Center crop if configured (skip if image already fits)
-        let cropped = if config.do_center_crop.unwrap_or(true) {
-            if let Some((crop_h, crop_w)) = config.get_crop_size() {
+        let cropped = if self.base.transforms.do_center_crop {
+            if let Some((crop_h, crop_w)) = self.base.transforms.crop_size {
                 let (rw, rh) = resized.dimensions();
                 if crop_w >= rw && crop_h >= rh {
                     resized
@@ -502,7 +556,7 @@ impl LlavaNextProcessor {
         let mut tensor = to_tensor(&cropped);
 
         // Normalize
-        if config.do_normalize.unwrap_or(true) {
+        if self.base.transforms.do_normalize {
             normalize(&mut tensor, &mean, &std);
         }
 
@@ -522,7 +576,6 @@ impl VisionPreProcessor for LlavaNextProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
@@ -532,12 +585,18 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
 
-        let filter = pil_to_filter(config.resampling);
-        let target_size = config
-            .get_target_size()
+        let filter = self.base.transforms.filter;
+        let target_size = self
+            .base
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
-        let crop_size = config.get_crop_size().unwrap_or((target_size, target_size));
+        let crop_size = self
+            .base
+            .transforms
+            .crop_size
+            .unwrap_or((target_size, target_size));
 
         for image in images {
             let original_size = image.dimensions();
@@ -550,17 +609,10 @@ impl VisionPreProcessor for LlavaNextProcessor {
             let mut samples = vec![image_original_resize];
             samples.extend(self.divide_to_samples(&image_padded, crop_size));
 
-            let patches: Vec<Array3<f32>> = samples
-                .iter()
-                .map(|s| self.process_patch(s, config))
-                .collect();
+            let patches: Vec<Array3<f32>> = samples.iter().map(|s| self.process_patch(s)).collect();
             patches_per_image.push(patches);
 
-            feature_token_counts.push(self.calculate_num_tokens(
-                original_size.0,
-                original_size.1,
-                config,
-            ));
+            feature_token_counts.push(self.calculate_num_tokens(original_size.0, original_size.1));
         }
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
@@ -599,12 +651,14 @@ impl VisionPreProcessor for LlavaNextProcessor {
         Ok(result)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
         let original_size = (width, height);
 
         // Use effective geometry from config, falling back to base defaults.
-        let image_size = config
-            .get_target_size()
+        let image_size = self
+            .base
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
         let patch_size = self.base.patch_size;
@@ -649,11 +703,13 @@ impl VisionPreProcessor for LlavaNextProcessor {
         "llava-next"
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // LLaVA-NeXT has variable output size based on crops
         // Return the base patch size
-        let size = config
-            .get_target_size()
+        let size = self
+            .base
+            .transforms
+            .target_size
             .map(|(h, _w)| h)
             .unwrap_or(self.base.image_size);
         Some((size, size))
@@ -808,16 +864,14 @@ mod tests {
     #[test]
     fn test_llava_token_calculation() {
         let processor = LlavaProcessor::new();
-        let config = PreProcessorConfig::default();
 
         // 336 / 14 = 24, 24 * 24 = 576
-        let tokens = processor.calculate_num_tokens(336, 336, &config);
+        let tokens = processor.calculate_num_tokens(336, 336);
         assert_eq!(tokens, 576);
     }
 
     #[test]
     fn test_llava_preprocess_square() {
-        let processor = LlavaProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_center_crop: Some(true),
@@ -826,9 +880,10 @@ mod tests {
             image_std: Some(CLIP_STD.to_vec()),
             ..Default::default()
         };
+        let processor = LlavaProcessor::new().with_preprocessor_config(&config);
 
         let image = create_test_image(336, 336, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert_eq!(result.height().unwrap(), 336);
@@ -839,7 +894,6 @@ mod tests {
     #[test]
     fn test_llava_preprocess_rectangular_square_mode() {
         // Square mode (default): resize shortest edge, center crop
-        let processor = LlavaProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_center_crop: Some(true),
@@ -852,10 +906,11 @@ mod tests {
             ),
             ..Default::default()
         };
+        let processor = LlavaProcessor::new().with_preprocessor_config(&config);
 
         // Tall image - should be resized so shortest edge = 336, then center cropped
         let image = create_test_image(200, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         assert_eq!(result.height().unwrap(), 336);
@@ -865,17 +920,17 @@ mod tests {
     #[test]
     fn test_llava_preprocess_rectangular_pad_mode() {
         // Pad mode: expand to square with mean padding, then resize
-        let processor = LlavaProcessor::new_with_pad();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_center_crop: Some(false),
             do_normalize: Some(true),
             ..Default::default()
         };
+        let processor = LlavaProcessor::new_with_pad().with_preprocessor_config(&config);
 
         // Tall image should be padded to square first
         let image = create_test_image(200, 400, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
         // After expand_to_square: 400x400, then resize to 336x336
@@ -920,16 +975,16 @@ mod tests {
 
     #[test]
     fn test_llava_next_preprocess() {
-        let processor = LlavaNextProcessor::new();
         let config = PreProcessorConfig {
             do_resize: Some(true),
             do_center_crop: Some(false),
             do_normalize: Some(true),
             ..Default::default()
         };
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
 
         let image = create_test_image(500, 500, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         // 5D: [num_images=1, num_patches, C, H, W]
         assert_eq!(result.batch_size(), 1);

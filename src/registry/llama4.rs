@@ -77,6 +77,19 @@ impl Llama4Spec {
 }
 
 impl ModelProcessorSpec for Llama4Spec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::Llama4VisionProcessor;
+        (modality == Modality::Image).then(|| {
+            Box::new(Llama4VisionProcessor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llama4"
     }

@@ -1,13 +1,11 @@
-//! Vision processor trait and registry.
+//! Model-owned vision processor trait.
 //!
 //! Shared encoder output types live in [`crate::encoder_inputs`] and are re-exported
 //! here for compatibility.
 
-use std::collections::HashMap;
-
 use image::DynamicImage;
 
-use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
+use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 use crate::types::RgbFrameRef;
 
@@ -67,7 +65,8 @@ impl PreprocessedEncoderInputs {
 /// Trait for model-specific vision preprocessors.
 ///
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
-/// to provide the correct preprocessing pipeline.
+/// to provide the correct preprocessing pipeline. Each instance owns its resolved
+/// model parameters; request methods receive only the media to process.
 pub trait VisionPreProcessor: Send + Sync {
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
@@ -79,14 +78,12 @@ pub trait VisionPreProcessor: Send + Sync {
     ///
     /// # Arguments
     /// * `images` - Input images to preprocess
-    /// * `config` - Preprocessor configuration from HuggingFace
     ///
     /// # Returns
     /// Preprocessed encoder inputs ready for the model, or an error.
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
 
     /// Preprocess one decoded video clip represented as sampled frames.
@@ -97,7 +94,6 @@ pub trait VisionPreProcessor: Send + Sync {
     fn preprocess_video(
         &self,
         _frames: &[DynamicImage],
-        _config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         Err(TransformError::ShapeError(format!(
             "{} does not support video preprocessing",
@@ -111,7 +107,6 @@ pub trait VisionPreProcessor: Send + Sync {
     fn preprocess_video_rgb(
         &self,
         _frames: &[RgbFrameRef<'_>],
-        _config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         Err(TransformError::ShapeError(format!(
             "{} does not support RGB video preprocessing",
@@ -127,8 +122,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// # Arguments
     /// * `width` - Image width after preprocessing
     /// * `height` - Image height after preprocessing
-    /// * `config` - Preprocessor configuration
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize;
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize;
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;
@@ -136,344 +130,7 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Get the expected image size after preprocessing.
     ///
     /// Some models have fixed sizes, others are dynamic.
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        config.get_target_size()
-    }
-}
-
-/// Registry of available vision processors.
-pub struct VisionProcessorRegistry {
-    processors: HashMap<String, Box<dyn VisionPreProcessor>>,
-}
-
-impl VisionProcessorRegistry {
-    /// Create a new empty registry.
-    pub fn new() -> Self {
-        Self {
-            processors: HashMap::new(),
-        }
-    }
-
-    /// Register a processor for a model pattern.
-    pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
-        self.processors.insert(pattern.into(), processor);
-    }
-
-    /// Find a processor for the given model ID, falling back to model_type.
-    ///
-    /// Matches by substring containment (case-insensitive).
-    pub fn find(
-        &self,
-        model_id: &str,
-        model_type: Option<&str>,
-    ) -> Option<&dyn VisionPreProcessor> {
-        self.find_in_candidate(model_id)
-            .or_else(|| model_type.and_then(|mt| self.find_in_candidate(mt)))
-    }
-
-    fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
-        let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
-    }
-
-    /// Get list of supported model patterns.
-    pub fn supported_patterns(&self) -> Vec<&str> {
-        self.processors.keys().map(|s| s.as_str()).collect()
-    }
-}
-
-impl Default for VisionProcessorRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VisionProcessorRegistry {
-    /// Create a registry with all built-in processors registered.
-    ///
-    /// Currently registers:
-    /// - `llava-next` -> LlavaNextProcessor
-    /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
-    /// - `qwen2-vl` -> Qwen2VLProcessor
-    /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
-    /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
-    /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
-    /// - `qwen4_exp` / `qwen4-exp` -> Qwen3VLProcessor (same vision tower as Qwen3.5)
-    /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
-    /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
-    pub fn with_defaults() -> Self {
-        let mut registry = Self::new();
-
-        // DeepSeek-V4.1 vision variant (patch=14, 3x3 aligner downsample,
-        // gray-padded contain fit).
-        registry.register(
-            "deepseek_v41",
-            Box::new(super::processors::DeepseekV41Processor::new()),
-        );
-        registry.register(
-            "deepseek-v4.1",
-            Box::new(super::processors::DeepseekV41Processor::new()),
-        );
-
-        // LLaVA-NeXT (v1.6+, anyres multi-crop)
-        registry.register(
-            "llava-next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava_next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.6",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-
-        // Standard LLaVA (v1.5, single-patch).
-        // Use specific patterns so they don't accidentally match LLaVA-NeXT
-        // model IDs like "llava-v1.6-*".
-        registry.register(
-            "llava-1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-
-        // Register Qwen3-VL first (more specific pattern - must match before qwen2)
-        registry.register(
-            "qwen3-vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Qwen3-Omni uses the same patchification and normalization contract
-        // as Qwen3-VL for its image and video towers.
-        registry.register(
-            "qwen3-omni",
-            Box::new(super::processors::Qwen3OmniVisionProcessor::new()),
-        );
-        registry.register(
-            "qwen3_omni",
-            Box::new(super::processors::Qwen3OmniVisionProcessor::new()),
-        );
-
-        // Qwen3.5 family (and Qwen3.6: same arch) reuses Qwen3-VL preprocessing.
-        registry.register(
-            "qwen3.5",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_5",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3.6",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_6",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Qwen4-Exp: same vision tower as Qwen3.5
-        registry.register(
-            "qwen4_exp",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen4-exp",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
-        registry.register(
-            "qwen2-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
-            "qwen2_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-
-        // Register Qwen2.5-VL (uses identical preprocessing to Qwen2-VL)
-        registry.register(
-            "qwen2.5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
-            "qwen2_5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
-            "qwen2_5_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-
-        // Register Phi3-Vision
-        registry.register(
-            "phi-3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3_v",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-
-        // Register LLaMA 4 Vision
-        registry.register(
-            "llama-4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-        registry.register(
-            "llama4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-
-        // Register Kimi-K2.5 Vision
-        registry.register(
-            "kimi-k2",
-            Box::new(super::processors::KimiK25Processor::new()),
-        );
-        registry.register(
-            "kimi_k2",
-            Box::new(super::processors::KimiK25Processor::new()),
-        );
-        registry.register(
-            "kimi-k3",
-            Box::new(super::processors::KimiK3Processor::new()),
-        );
-        registry.register(
-            "kimi_k3",
-            Box::new(super::processors::KimiK3Processor::new()),
-        );
-
-        // Register Inkling vision.
-        registry.register(
-            "inkling_mm_model",
-            Box::new(super::processors::InklingImageProcessor::new()),
-        );
-
-        // Register MiniMax-M3 VL
-        registry.register(
-            "minimax-m3-vl",
-            Box::new(super::processors::MiniMaxM3Processor::new()),
-        );
-        registry.register(
-            "minimax_m3_vl",
-            Box::new(super::processors::MiniMaxM3Processor::new()),
-        );
-
-        registry
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use ndarray::Array4;
-
-    use super::*;
-    use crate::vision::processors::LlavaProcessor;
-
-    #[test]
-    fn test_preprocessed_encoder_inputs_geometry_accessors() {
-        let encoder_input = Array4::<f32>::zeros((2, 3, 336, 336));
-        let inputs = PreprocessedEncoderInputs::new(
-            encoder_input,
-            vec![576, 576],
-            vec![(640, 480), (800, 600)],
-        );
-
-        assert_eq!(inputs.channels().unwrap(), 3);
-        assert_eq!(inputs.height().unwrap(), 336);
-        assert_eq!(inputs.width().unwrap(), 336);
-    }
-
-    #[test]
-    fn test_registry_with_defaults() {
-        let registry = VisionProcessorRegistry::with_defaults();
-
-        // Should find LLaVA processor
-        assert!(registry.find("llava-hf/llava-1.5-7b-hf", None).is_some());
-        assert!(registry.find("liuhaotian/llava-v1.5-7b", None).is_some());
-
-        // Should find LLaVA-NeXT processor
-        assert!(registry
-            .find("llava-hf/llava-v1.6-mistral-7b-hf", None)
-            .is_some());
-        assert!(registry
-            .find("lmms-lab/llava-next-interleave-qwen-7b", None)
-            .is_some());
-
-        // Get the processor and check model name
-        let processor = registry.find("llava-hf/llava-1.5-7b-hf", None).unwrap();
-        assert_eq!(processor.model_name(), "llava");
-    }
-
-    #[test]
-    fn test_registry_find() {
-        let mut registry = VisionProcessorRegistry::new();
-
-        // Create a mock processor using LlavaProcessor
-        registry.register("test-model", Box::new(LlavaProcessor::new()));
-
-        assert!(registry.find("test-model-7b", None).is_some());
-        assert!(registry.find("TEST-MODEL", None).is_some());
-        assert!(registry.find("other-model", None).is_none());
-    }
-
-    #[test]
-    fn test_registry_find_falls_back_to_model_type() {
-        let registry = VisionProcessorRegistry::with_defaults();
-
-        assert!(registry.find("custom-model", None).is_none());
-
-        let processor = registry
-            .find("custom-model", Some("qwen3_vl"))
-            .expect("qwen3 processor by model_type");
-        assert_eq!(processor.model_name(), "qwen3-vl");
-    }
-
-    #[test]
-    fn test_registry_find_preserves_fast_path() {
-        let registry = VisionProcessorRegistry::with_defaults();
-
-        let processor = registry
-            .find("Qwen3-VL-30B-A3B-Instruct", Some("qwen2_vl"))
-            .expect("qwen3 processor by model_id");
-        assert_eq!(processor.model_name(), "qwen3-vl");
-    }
-
-    #[test]
-    fn test_registry_find_phi3_model_type_fallback() {
-        let registry = VisionProcessorRegistry::with_defaults();
-
-        let processor = registry
-            .find("custom-model", Some("phi3_v"))
-            .expect("phi3 processor by model_type");
-        assert_eq!(processor.model_name(), "phi3-vision");
-    }
-
-    #[test]
-    fn test_registry_find_qwen4_exp_model_type_fallback() {
-        let registry = VisionProcessorRegistry::with_defaults();
-
-        let processor = registry
-            .find("custom-model", Some("qwen4_exp"))
-            .expect("qwen3 processor by qwen4_exp model_type");
-        assert_eq!(processor.model_name(), "qwen3-vl");
     }
 }

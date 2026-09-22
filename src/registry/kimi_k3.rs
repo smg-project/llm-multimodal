@@ -34,6 +34,19 @@ impl KimiK3VisionSpec {
 }
 
 impl ModelProcessorSpec for KimiK3VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::KimiK3Processor;
+        (modality == Modality::Image).then(|| {
+            Box::new(KimiK3Processor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "kimi_k3"
     }

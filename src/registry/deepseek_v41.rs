@@ -51,6 +51,19 @@ impl DeepseekV41VisionSpec {
 }
 
 impl ModelProcessorSpec for DeepseekV41VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::DeepseekV41Processor;
+        (modality == Modality::Image).then(|| {
+            Box::new(DeepseekV41Processor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "deepseek_v41"
     }
@@ -175,8 +188,12 @@ mod tests {
         let tokenizer = TestTokenizer::new(&[]);
         let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         assert!(DeepseekV41VisionSpec.matches(&metadata(&tokenizer, &config)));
-        assert!(crate::VisionProcessorRegistry::with_defaults()
-            .find("/models/local-checkpoint", Some("deepseek_v41"))
+        assert!(DeepseekV41VisionSpec
+            .vision_processor(
+                &metadata(&tokenizer, &config),
+                &crate::PreProcessorConfig::default(),
+                Modality::Image
+            )
             .is_some());
 
         // A text-only DeepSeek model with a neutral model id must not match.

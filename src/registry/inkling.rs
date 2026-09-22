@@ -35,6 +35,19 @@ impl InklingSpec {
 }
 
 impl ModelProcessorSpec for InklingSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::InklingImageProcessor;
+        (modality == Modality::Image).then(|| {
+            Box::new(InklingImageProcessor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "inkling"
     }
@@ -94,11 +107,11 @@ impl ModelProcessorSpec for InklingSpec {
 
     fn audio_processor(
         &self,
-        model_config: &Value,
+        metadata: &ModelMetadata,
         preprocessor_config: &PreProcessorConfig,
     ) -> Option<Box<dyn AudioPreProcessor>> {
         Some(Box::new(InklingAudioProcessor::from_configs(
-            model_config,
+            metadata.config,
             preprocessor_config,
         )))
     }

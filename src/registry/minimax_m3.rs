@@ -17,6 +17,19 @@ impl MiniMaxM3VisionSpec {
 }
 
 impl ModelProcessorSpec for MiniMaxM3VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::MiniMaxM3Processor;
+        (modality == Modality::Image).then(|| {
+            Box::new(MiniMaxM3Processor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "minimax_m3_vl"
     }

@@ -72,7 +72,8 @@ impl KimiK3Processor {
                     "transparent_bg_config",
                 ),
                 transparent_bg_fill_stage: fill_stage,
-            }),
+            })
+            .with_preprocessor_config(config),
         }
     }
 
@@ -84,19 +85,6 @@ impl KimiK3Processor {
                 .and_then(|media_cfg| media_cfg.get(key))
                 .and_then(|value| serde_json::from_value(value.clone()).ok())
         })
-    }
-
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some()
-            || config.merge_size.is_some()
-            || config.extra.contains_key("media_proc_cfg")
-            || config.extra.contains_key("in_patch_limit")
-            || config.extra.contains_key("patch_limit_on_one_side")
-        {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
     }
 }
 
@@ -110,21 +98,16 @@ impl VisionPreProcessor for KimiK3Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.with_preprocessor_config(config)
-            .inner
-            .preprocess_images(images, config)
+        self.inner.preprocess_images(images)
     }
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.with_preprocessor_config(config)
-            .inner
-            .calculate_num_tokens(width, height)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        self.inner.calculate_num_tokens(width, height)
     }
     fn model_name(&self) -> &'static str {
         "kimi-k3"
     }
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -138,8 +121,8 @@ mod tests {
     fn composites_alpha_with_checkpoint_chessboard() {
         let config = PreProcessorConfig::from_json(r#"{"media_proc_cfg":{"patch_size":14,"merge_kernel_size":2,"transparent_bg_config":{"pattern":"chessboard","chessboard_square_size":8,"chessboard_square_on_top_left":true,"chessboard_white_value":255,"chessboard_gray_value":180},"transparent_bg_fill_stage":"after_resize","image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5]}}"#).unwrap();
         let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0])));
-        let output = KimiK3Processor::new()
-            .preprocess(&[image], &config)
+        let output = KimiK3Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
             .unwrap();
         assert!((output.encoder_input_flat()[0] - 1.0).abs() < 1e-6);
     }

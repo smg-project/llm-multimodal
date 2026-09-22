@@ -125,6 +125,19 @@ impl Qwen3VLVisionSpec {
 }
 
 impl ModelProcessorSpec for Qwen3VLVisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::Qwen3VLProcessor;
+        matches!(modality, Modality::Image | Modality::Video).then(|| {
+            Box::new(Qwen3VLProcessor::from_config_for(config, modality))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "qwen3_vl"
     }

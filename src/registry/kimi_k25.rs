@@ -23,6 +23,19 @@ impl KimiK25VisionSpec {
 }
 
 impl ModelProcessorSpec for KimiK25VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::KimiK25Processor;
+        (modality == Modality::Image).then(|| {
+            Box::new(KimiK25Processor::from_preprocessor_config(config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "kimi_k25"
     }

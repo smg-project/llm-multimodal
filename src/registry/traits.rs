@@ -7,7 +7,7 @@ use crate::{
     audio::AudioPreProcessor,
     encoder_inputs::PreprocessedEncoderInputs,
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, VisionPreProcessor},
 };
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -173,6 +173,19 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
 
+    /// Build a model-owned processor for a resolved image or video configuration.
+    ///
+    /// Model specs own processor selection. The returned instance resolves and
+    /// retains checkpoint-specific parameters for all subsequent requests.
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        _preprocessor_config: &PreProcessorConfig,
+        _modality: Modality,
+    ) -> Option<Box<dyn VisionPreProcessor>> {
+        None
+    }
+
     /// Build the audio preprocessor for this model, if it supports audio.
     ///
     /// This is the single source of truth for audio-processor selection: the
@@ -184,7 +197,7 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// shapes and quantization parameters can be checkpoint-specific.
     fn audio_processor(
         &self,
-        _model_config: &Value,
+        _metadata: &ModelMetadata,
         _preprocessor_config: &PreProcessorConfig,
     ) -> Option<Box<dyn AudioPreProcessor>> {
         None

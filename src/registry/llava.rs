@@ -12,6 +12,19 @@ pub(super) struct LlavaSpec;
 pub(super) struct LlavaNextSpec;
 
 impl ModelProcessorSpec for LlavaSpec {
+    fn vision_processor(
+        &self,
+        metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::LlavaProcessor;
+        (modality == Modality::Image).then(|| {
+            Box::new(LlavaProcessor::from_configs(metadata.config, config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llava"
     }
@@ -67,6 +80,19 @@ impl ModelProcessorSpec for LlavaSpec {
 }
 
 impl ModelProcessorSpec for LlavaNextSpec {
+    fn vision_processor(
+        &self,
+        metadata: &ModelMetadata,
+        config: &crate::vision::PreProcessorConfig,
+        modality: Modality,
+    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
+        use crate::vision::processors::LlavaNextProcessor;
+        (modality == Modality::Image).then(|| {
+            Box::new(LlavaNextProcessor::from_configs(metadata.config, config))
+                as Box<dyn crate::vision::VisionPreProcessor>
+        })
+    }
+
     fn name(&self) -> &'static str {
         "llava_next"
     }
@@ -214,7 +240,7 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("llava spec");
         assert!(spec
-            .audio_processor(&config, &PreProcessorConfig::default())
+            .audio_processor(&metadata, &PreProcessorConfig::default())
             .is_none());
     }
 }

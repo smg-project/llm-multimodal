@@ -33,7 +33,6 @@ fn load_preprocessor_config(model_path: &str) -> Option<PreProcessorConfig> {
 // ── Full pipeline benchmarks ─────────────────────────────────────
 
 fn bench_qwen3_vl(c: &mut Criterion) {
-    let processor = Qwen3VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen3-VL-8B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -41,6 +40,8 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+
+    let processor = Qwen3VLProcessor::from_config_for(&config, llm_multimodal::Modality::Image);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -58,7 +59,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -74,7 +75,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("640x480", format!("batch{batch_size}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -93,14 +94,13 @@ fn bench_qwen3_vl(c: &mut Criterion) {
         let image = make_test_image(w, h);
         let images = [image];
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
-            b.iter(|| processor.preprocess(imgs, &config).unwrap());
+            b.iter(|| processor.preprocess(imgs).unwrap());
         });
     }
     group.finish();
 }
 
 fn bench_qwen2_vl(c: &mut Criterion) {
-    let processor = Qwen2VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen2-VL-2B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -108,6 +108,8 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+
+    let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[(224, 224), (640, 480), (1024, 768), (1920, 1080)];
 
@@ -119,7 +121,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -127,7 +129,6 @@ fn bench_qwen2_vl(c: &mut Criterion) {
 }
 
 fn bench_llama4(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -136,6 +137,8 @@ fn bench_llama4(c: &mut Criterion) {
                 )
                 .unwrap()
             });
+
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -153,7 +156,7 @@ fn bench_llama4(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -220,7 +223,6 @@ fn bench_individual_steps(c: &mut Criterion) {
 }
 
 fn bench_llama4_steps(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -231,6 +233,8 @@ fn bench_llama4_steps(c: &mut Criterion) {
             });
 
     // 1024x768 is the worst case (1.8x slower than HF)
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
+
     let sizes: &[(u32, u32)] = &[(640, 480), (1024, 768), (1920, 1080)];
 
     let mut group = c.benchmark_group("llama4_steps");
@@ -243,7 +247,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
             &image,
             |b, img| {
                 let imgs = [img.clone()];
-                b.iter(|| processor.preprocess(&imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(&imgs).unwrap());
             },
         );
 

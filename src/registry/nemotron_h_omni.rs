@@ -125,7 +125,7 @@ mod tests {
 
     use super::*;
     use crate::registry::test_helpers::TestTokenizer;
-    use crate::PreprocessingContext;
+    use crate::VisionPreprocessingContext;
 
     fn metadata<'a>(tokenizer: &'a TestTokenizer, config: &'a Value) -> ModelMetadata<'a> {
         ModelMetadata {
@@ -164,7 +164,7 @@ mod tests {
         let output = processor
             .preprocess_with_context(
                 &[DynamicImage::new_rgb8(48, 32)],
-                &PreprocessingContext {
+                &VisionPreprocessingContext {
                     token_budget: Some(16384),
                 },
             )

@@ -7,7 +7,16 @@ use image::DynamicImage;
 
 use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::{types::RgbFrameRef, PreprocessingContext};
+use crate::types::RgbFrameRef;
+
+/// Request-specific inputs for vision preprocessing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VisionPreprocessingContext {
+    /// Tokens available for this preprocessing call's media after fixed prompt tokens
+    /// have been accounted for, including any model-specific structural overhead.
+    /// `None` means no budget was supplied; `Some(0)` means the budget is exhausted.
+    pub token_budget: Option<usize>,
+}
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -92,7 +101,7 @@ pub trait VisionPreProcessor: Send + Sync {
     fn preprocess_with_context(
         &self,
         images: &[DynamicImage],
-        _context: &PreprocessingContext,
+        _context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess(images)
     }

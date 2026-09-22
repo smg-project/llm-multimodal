@@ -42,7 +42,9 @@ pub mod transforms;
 // Re-export commonly used types, including compatibility paths for shared
 // preprocessing outputs.
 pub use preprocessor_config::PreProcessorConfig;
-pub use processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor};
+pub use processor::{
+    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionPreprocessingContext,
+};
 pub use processors::{
     DeepseekV41Processor, InklingImageProcessor, KimiK3Processor, Llama4VisionProcessor,
     LlavaNextProcessor, LlavaProcessor, MiniMaxM3Processor, NemotronHOmniProcessor,

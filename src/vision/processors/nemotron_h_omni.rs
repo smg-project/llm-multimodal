@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 use crate::registry::{ModelRegistryError, RegistryResult};
-use crate::vision::{transforms, PreProcessorConfig, TransformError, VisionPreProcessor};
-use crate::PreprocessingContext;
+use crate::vision::{
+    transforms, PreProcessorConfig, TransformError, VisionPreProcessor, VisionPreprocessingContext,
+};
 
 #[derive(Debug, Clone)]
 pub struct NemotronHOmniProcessor {
@@ -172,13 +173,13 @@ impl VisionPreProcessor for NemotronHOmniProcessor {
         &self,
         images: &[DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.preprocess_with_context(images, &PreprocessingContext::default())
+        self.preprocess_with_context(images, &VisionPreprocessingContext::default())
     }
 
     fn preprocess_with_context(
         &self,
         images: &[DynamicImage],
-        context: &PreprocessingContext,
+        context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let [image] = images else {
             return Err(if images.is_empty() {
@@ -298,8 +299,8 @@ mod tests {
             .unwrap()
     }
 
-    fn context(token_budget: usize) -> PreprocessingContext {
-        PreprocessingContext {
+    fn context(token_budget: usize) -> VisionPreprocessingContext {
+        VisionPreprocessingContext {
             token_budget: Some(token_budget),
         }
     }

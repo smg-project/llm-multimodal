@@ -23,11 +23,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        (modality == Modality::Image).then(|| {
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok((modality == Modality::Image).then(|| {
             Box::new(MiniMaxM3Processor::from_preprocessor_config(config))
                 as Box<dyn VisionPreProcessor>
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {

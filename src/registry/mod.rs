@@ -202,12 +202,14 @@ mod processor_tests {
         .unwrap();
         let small = spec
             .vision_processor(&metadata, &config, Modality::Image)
+            .unwrap()
             .unwrap();
         config.min_pixels = Some(4096);
         config.max_pixels = Some(4096);
         config.image_mean = Some(vec![1.0; 3]);
         let large = spec
             .vision_processor(&metadata, &config, Modality::Image)
+            .unwrap()
             .unwrap();
         drop(config);
 
@@ -242,9 +244,11 @@ mod processor_tests {
                 .unwrap();
         let images = spec
             .vision_processor(&metadata, &image_config, Modality::Image)
+            .unwrap()
             .unwrap();
         let videos = spec
             .vision_processor(&metadata, &video_config, Modality::Video)
+            .unwrap()
             .unwrap();
         assert_eq!(
             images.preprocess(&[image()]).unwrap().feature_token_counts,
@@ -259,6 +263,7 @@ mod processor_tests {
         ));
         assert!(spec
             .vision_processor(&metadata, &image_config, Modality::Audio)
+            .unwrap()
             .is_none());
     }
 
@@ -280,6 +285,7 @@ mod processor_tests {
         let config = PreProcessorConfig::default();
         let processor = spec
             .vision_processor(&metadata, &config, Modality::Image)
+            .unwrap()
             .unwrap();
         let output = processor.preprocess(&[image()]).unwrap();
         assert_eq!(output.encoder_input.shape(), &[1, 3, 28, 28]);
@@ -287,6 +293,7 @@ mod processor_tests {
         assert_eq!(processor.get_processed_size(), Some((28, 28)));
         assert!(spec
             .vision_processor(&metadata, &config, Modality::Video)
+            .unwrap()
             .is_none());
     }
 }

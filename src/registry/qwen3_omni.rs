@@ -59,11 +59,13 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        matches!(modality, Modality::Image | Modality::Video).then(|| {
-            Box::new(Qwen3OmniVisionProcessor::from_config_for(config, modality))
-                as Box<dyn VisionPreProcessor>
-        })
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok(
+            matches!(modality, Modality::Image | Modality::Video).then(|| {
+                Box::new(Qwen3OmniVisionProcessor::from_config_for(config, modality))
+                    as Box<dyn VisionPreProcessor>
+            }),
+        )
     }
 
     fn name(&self) -> &'static str {

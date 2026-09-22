@@ -21,11 +21,11 @@ impl ModelProcessorSpec for LlavaSpec {
         metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        (modality == Modality::Image).then(|| {
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok((modality == Modality::Image).then(|| {
             Box::new(LlavaProcessor::from_configs(metadata.config, config))
                 as Box<dyn VisionPreProcessor>
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {
@@ -88,11 +88,11 @@ impl ModelProcessorSpec for LlavaNextSpec {
         metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        (modality == Modality::Image).then(|| {
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok((modality == Modality::Image).then(|| {
             Box::new(LlavaNextProcessor::from_configs(metadata.config, config))
                 as Box<dyn VisionPreProcessor>
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {

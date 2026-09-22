@@ -83,11 +83,11 @@ impl ModelProcessorSpec for Llama4Spec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        (modality == Modality::Image).then(|| {
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok((modality == Modality::Image).then(|| {
             Box::new(Llama4VisionProcessor::from_preprocessor_config(config))
                 as Box<dyn VisionPreProcessor>
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {

@@ -59,11 +59,11 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn VisionPreProcessor>> {
-        (modality == Modality::Image).then(|| {
+    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
+        Ok((modality == Modality::Image).then(|| {
             Box::new(DeepseekV41Processor::from_preprocessor_config(config))
                 as Box<dyn VisionPreProcessor>
-        })
+        }))
     }
 
     fn name(&self) -> &'static str {
@@ -196,6 +196,7 @@ mod tests {
                 &PreProcessorConfig::default(),
                 Modality::Image
             )
+            .unwrap()
             .is_some());
 
         // A text-only DeepSeek model with a neutral model id must not match.

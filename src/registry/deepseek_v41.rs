@@ -59,11 +59,16 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
-        Ok((modality == Modality::Image).then(|| {
-            Box::new(DeepseekV41Processor::from_preprocessor_config(config))
-                as Box<dyn VisionPreProcessor>
-        }))
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(DeepseekV41Processor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -196,8 +201,7 @@ mod tests {
                 &PreProcessorConfig::default(),
                 Modality::Image
             )
-            .unwrap()
-            .is_some());
+            .is_ok());
 
         // A text-only DeepSeek model with a neutral model id must not match.
         let other = json!({"model_type": "deepseek_v3"});

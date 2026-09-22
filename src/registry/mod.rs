@@ -178,7 +178,7 @@ mod processor_tests {
     use image::{DynamicImage, Rgb, RgbImage};
     use serde_json::json;
 
-    use super::{test_helpers::TestTokenizer, ModelMetadata, ModelRegistry};
+    use super::{test_helpers::TestTokenizer, ModelMetadata, ModelRegistry, ModelRegistryError};
     use crate::{Modality, ModelSpecificValue, PreProcessorConfig};
 
     fn image() -> DynamicImage {
@@ -202,14 +202,12 @@ mod processor_tests {
         .unwrap();
         let small = spec
             .vision_processor(&metadata, &config, Modality::Image)
-            .unwrap()
             .unwrap();
         config.min_pixels = Some(4096);
         config.max_pixels = Some(4096);
         config.image_mean = Some(vec![1.0; 3]);
         let large = spec
             .vision_processor(&metadata, &config, Modality::Image)
-            .unwrap()
             .unwrap();
         drop(config);
 
@@ -244,11 +242,9 @@ mod processor_tests {
                 .unwrap();
         let images = spec
             .vision_processor(&metadata, &image_config, Modality::Image)
-            .unwrap()
             .unwrap();
         let videos = spec
             .vision_processor(&metadata, &video_config, Modality::Video)
-            .unwrap()
             .unwrap();
         assert_eq!(
             images.preprocess(&[image()]).unwrap().feature_token_counts,
@@ -261,10 +257,13 @@ mod processor_tests {
             Some(ModelSpecificValue::Tensor { data, shape })
                 if data == &[0.25] && shape == &[1]
         ));
-        assert!(spec
-            .vision_processor(&metadata, &image_config, Modality::Audio)
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            spec.vision_processor(&metadata, &image_config, Modality::Audio),
+            Err(ModelRegistryError::UnsupportedModality {
+                spec: "qwen3_vl",
+                modality: Modality::Audio,
+            })
+        ));
     }
 
     #[test]
@@ -285,15 +284,17 @@ mod processor_tests {
         let config = PreProcessorConfig::default();
         let processor = spec
             .vision_processor(&metadata, &config, Modality::Image)
-            .unwrap()
             .unwrap();
         let output = processor.preprocess(&[image()]).unwrap();
         assert_eq!(output.encoder_input.shape(), &[1, 3, 28, 28]);
         assert_eq!(output.feature_token_counts, vec![4]);
         assert_eq!(processor.get_processed_size(), Some((28, 28)));
-        assert!(spec
-            .vision_processor(&metadata, &config, Modality::Video)
-            .unwrap()
-            .is_none());
+        assert!(matches!(
+            spec.vision_processor(&metadata, &config, Modality::Video),
+            Err(ModelRegistryError::UnsupportedModality {
+                spec: "llava",
+                modality: Modality::Video,
+            })
+        ));
     }
 }

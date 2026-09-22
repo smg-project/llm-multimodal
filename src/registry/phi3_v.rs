@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::{processors::Phi3VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
@@ -17,11 +17,16 @@ impl ModelProcessorSpec for Phi3VisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
-        Ok((modality == Modality::Image).then(|| {
-            Box::new(Phi3VisionProcessor::from_preprocessor_config(config))
-                as Box<dyn VisionPreProcessor>
-        }))
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Phi3VisionProcessor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn name(&self) -> &'static str {

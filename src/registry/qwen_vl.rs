@@ -28,11 +28,14 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
-        Ok((modality == Modality::Image).then(|| {
-            Box::new(Qwen2VLProcessor::from_preprocessor_config(config))
-                as Box<dyn VisionPreProcessor>
-        }))
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Qwen2VLProcessor::from_preprocessor_config(config))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn name(&self) -> &'static str {

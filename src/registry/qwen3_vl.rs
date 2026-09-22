@@ -131,13 +131,16 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
         _metadata: &ModelMetadata,
         config: &PreProcessorConfig,
         modality: Modality,
-    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
-        Ok(
-            matches!(modality, Modality::Image | Modality::Video).then(|| {
-                Box::new(Qwen3VLProcessor::from_config_for(config, modality))
-                    as Box<dyn VisionPreProcessor>
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(Qwen3VLProcessor::from_config_for(
+                config, modality,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
             }),
-        )
+        }
     }
 
     fn name(&self) -> &'static str {

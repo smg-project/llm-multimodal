@@ -177,14 +177,17 @@ pub trait ModelProcessorSpec: Send + Sync {
     ///
     /// Model specs own processor selection. The returned instance resolves and
     /// retains checkpoint-specific parameters for all subsequent requests.
-    /// Returns `Ok(None)` for unsupported modalities and an error for invalid configuration.
+    /// Returns [`ModelRegistryError::UnsupportedModality`] for unsupported modalities.
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
         _preprocessor_config: &PreProcessorConfig,
-        _modality: Modality,
-    ) -> RegistryResult<Option<Box<dyn VisionPreProcessor>>> {
-        Ok(None)
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        Err(ModelRegistryError::UnsupportedModality {
+            spec: self.name(),
+            modality,
+        })
     }
 
     /// Build the audio preprocessor for this model, if it supports audio.

@@ -34,8 +34,9 @@
 //! 4. Process each crop + original resized image
 //! 5. Stack all processed patches
 
-use image::{DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use ndarray::{self, Array3};
+use serde_json::Value;
 
 use crate::vision::{
     preprocessor_config::PreProcessorConfig,
@@ -85,7 +86,7 @@ impl std::str::FromStr for ImageAspectRatio {
 struct LlavaTransforms {
     mean: [f64; 3],
     std: [f64; 3],
-    filter: image::imageops::FilterType,
+    filter: FilterType,
     target_size: Option<(u32, u32)>,
     crop_size: Option<(u32, u32)>,
     do_resize: bool,
@@ -183,7 +184,7 @@ impl LlavaProcessor {
     /// Create a processor from model config JSON.
     ///
     /// Extracts patch_size, image_size, and image_aspect_ratio from config.
-    pub fn from_config(config: &serde_json::Value) -> Self {
+    pub fn from_config(config: &Value) -> Self {
         let patch_size = config
             .get("vision_config")
             .and_then(|v| v.get("patch_size"))
@@ -213,7 +214,7 @@ impl LlavaProcessor {
     }
 
     /// Resolve model geometry and image transforms once for a loaded model.
-    pub fn from_configs(model_config: &serde_json::Value, config: &PreProcessorConfig) -> Self {
+    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
         Self::from_config(model_config).with_preprocessor_config(config)
     }
 
@@ -416,7 +417,7 @@ impl Default for LlavaNextProcessor {
 
 impl LlavaNextProcessor {
     /// Resolve model geometry and image transforms once for a loaded model.
-    pub fn from_configs(model_config: &serde_json::Value, config: &PreProcessorConfig) -> Self {
+    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
         Self::from_config(model_config).with_preprocessor_config(config)
     }
 
@@ -451,7 +452,7 @@ impl LlavaNextProcessor {
     }
 
     /// Create a processor from model config.
-    pub fn from_config(config: &serde_json::Value) -> Self {
+    pub fn from_config(config: &Value) -> Self {
         let base = LlavaProcessor::from_config(config);
 
         let grid_pinpoints = config
@@ -806,12 +807,7 @@ fn resize_and_pad_image(image: &DynamicImage, target: (u32, u32)) -> DynamicImag
         )
     };
 
-    let resized = resize(
-        image,
-        new_width,
-        new_height,
-        image::imageops::FilterType::CatmullRom,
-    );
+    let resized = resize(image, new_width, new_height, FilterType::CatmullRom);
 
     let mut new_image = DynamicImage::new_rgb8(target_width, target_height);
     let paste_x = (target_width - new_width) as i64 / 2;

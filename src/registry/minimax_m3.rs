@@ -6,6 +6,7 @@ use crate::{
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::processor::PreprocessedEncoderInputs,
+    vision::{processors::MiniMaxM3Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct MiniMaxM3VisionSpec;
@@ -20,13 +21,12 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::MiniMaxM3Processor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(MiniMaxM3Processor::from_preprocessor_config(config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 

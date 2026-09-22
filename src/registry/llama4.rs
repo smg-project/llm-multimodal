@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::Llama4VisionProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Llama4Spec;
@@ -80,13 +81,12 @@ impl ModelProcessorSpec for Llama4Spec {
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::Llama4VisionProcessor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(Llama4VisionProcessor::from_preprocessor_config(config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 

@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::KimiK3Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct KimiK3VisionSpec;
@@ -37,13 +38,12 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::KimiK3Processor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(KimiK3Processor::from_preprocessor_config(config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 

@@ -16,7 +16,10 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::processors::deepseek_v41::COMPRESS_PAD_TO,
+    vision::{
+        processors::{deepseek_v41::COMPRESS_PAD_TO, DeepseekV41Processor},
+        PreProcessorConfig, VisionPreProcessor,
+    },
 };
 
 /// The placeholder text inlined at each image's position; the multimodal
@@ -54,13 +57,12 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::DeepseekV41Processor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(DeepseekV41Processor::from_preprocessor_config(config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 
@@ -191,7 +193,7 @@ mod tests {
         assert!(DeepseekV41VisionSpec
             .vision_processor(
                 &metadata(&tokenizer, &config),
-                &crate::PreProcessorConfig::default(),
+                &PreProcessorConfig::default(),
                 Modality::Image
             )
             .is_some());

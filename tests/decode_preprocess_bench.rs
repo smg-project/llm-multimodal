@@ -18,6 +18,7 @@ use llm_multimodal::{
     vision::{
         preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
     },
+    Modality,
 };
 
 #[test]
@@ -30,7 +31,7 @@ fn bench_decode_preprocess() {
     let config =
         PreProcessorConfig::from_json(&std::fs::read_to_string(&cfg_path).expect("read config"))
             .expect("parse preprocessor config");
-    let proc = Qwen3VLProcessor::from_config_for(&config, llm_multimodal::Modality::Image);
+    let proc = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
     // warmup
     let img = jpeg_turbo::decode_jpeg_rgb(&bytes).expect("turbojpeg decode");

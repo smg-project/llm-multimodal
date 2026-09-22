@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::Qwen3VLProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Qwen3VLVisionSpec;
@@ -128,13 +129,12 @@ impl ModelProcessorSpec for Qwen3VLVisionSpec {
     fn vision_processor(
         &self,
         _metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::Qwen3VLProcessor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         matches!(modality, Modality::Image | Modality::Video).then(|| {
             Box::new(Qwen3VLProcessor::from_config_for(config, modality))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 

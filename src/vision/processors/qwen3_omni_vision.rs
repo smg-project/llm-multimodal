@@ -10,7 +10,7 @@ use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
-    types::RgbFrameRef,
+    types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
@@ -44,8 +44,8 @@ impl Qwen3OmniVisionProcessor {
     ///
     /// Shared image-only configs retain the model family's separate video
     /// pixel budgets, matching the defaults supplied by the HF processor.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: crate::Modality) -> Self {
-        if modality == crate::Modality::Video && !config.is_image_only_processor_type() {
+    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+        if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {
             Self::from_preprocessor_config(config)
@@ -232,7 +232,7 @@ mod tests {
             r#"{"image_processor_type":"Qwen2VLImageProcessor","min_pixels":3136,"max_pixels":12845056,"patch_size":16,"merge_size":2,"temporal_patch_size":2}"#,
         )
         .unwrap();
-        let processor = Qwen3OmniVisionProcessor::from_config_for(&config, crate::Modality::Video);
+        let processor = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video);
 
         assert_eq!(processor.inner.video_min_pixels(), DEFAULT_VIDEO_MIN_PIXELS);
         assert_eq!(processor.inner.video_max_pixels(), DEFAULT_VIDEO_MAX_PIXELS);
@@ -266,7 +266,7 @@ mod tests {
             DynamicImage::ImageRgb8(RgbImage::new(32, 32)),
         ];
 
-        let output = Qwen3OmniVisionProcessor::from_config_for(&config, crate::Modality::Video)
+        let output = Qwen3OmniVisionProcessor::from_config_for(&config, Modality::Video)
             .preprocess_video(&frames)
             .unwrap();
 

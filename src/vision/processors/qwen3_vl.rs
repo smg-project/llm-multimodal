@@ -22,7 +22,7 @@ use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
-    types::RgbFrameRef,
+    types::{Modality, RgbFrameRef},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
@@ -84,8 +84,8 @@ impl Qwen3VLProcessor {
     ///
     /// Shared image-only configs retain the model family's separate video
     /// pixel budgets, matching the defaults supplied by the HF processor.
-    pub fn from_config_for(config: &PreProcessorConfig, modality: crate::Modality) -> Self {
-        if modality == crate::Modality::Video && !config.is_image_only_processor_type() {
+    pub fn from_config_for(config: &PreProcessorConfig, modality: Modality) -> Self {
+        if modality == Modality::Video && !config.is_image_only_processor_type() {
             Self::from_video_preprocessor_config(config)
         } else {
             Self::from_image_preprocessor_config(config)
@@ -449,7 +449,7 @@ mod tests {
         };
 
         let image = create_test_image(640, 480, Rgb([128, 128, 128]));
-        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+        let result = Qwen3VLProcessor::from_config_for(&config, Modality::Image)
             .preprocess(&[image])
             .unwrap();
 
@@ -485,7 +485,7 @@ mod tests {
             create_test_image(480, 640, Rgb([150, 150, 150])),
         ];
 
-        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+        let result = Qwen3VLProcessor::from_config_for(&config, Modality::Image)
             .preprocess(&images)
             .unwrap();
 
@@ -540,13 +540,13 @@ mod tests {
         let image_a = create_test_image(640, 480, Rgb([100, 110, 120]));
         let image_b = create_test_image(420, 560, Rgb([10, 200, 90]));
 
-        let batched = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+        let batched = Qwen3VLProcessor::from_config_for(&config, Modality::Image)
             .preprocess(&[image_a.clone(), image_b.clone()])
             .unwrap();
-        let single_a = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+        let single_a = Qwen3VLProcessor::from_config_for(&config, Modality::Image)
             .preprocess(&[image_a])
             .unwrap();
-        let single_b = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Image)
+        let single_b = Qwen3VLProcessor::from_config_for(&config, Modality::Image)
             .preprocess(&[image_b])
             .unwrap();
 
@@ -605,7 +605,7 @@ mod tests {
             create_test_image(640, 480, Rgb([200, 200, 200])),
         ];
 
-        let result = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+        let result = Qwen3VLProcessor::from_config_for(&config, Modality::Video)
             .preprocess_video(&frames)
             .unwrap();
         assert_eq!(result.encoder_input.ndim(), 2);
@@ -656,10 +656,10 @@ mod tests {
             })
             .collect();
 
-        let dynamic = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+        let dynamic = Qwen3VLProcessor::from_config_for(&config, Modality::Video)
             .preprocess_video(&frames)
             .unwrap();
-        let rgb = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video)
+        let rgb = Qwen3VLProcessor::from_config_for(&config, Modality::Video)
             .preprocess_video_rgb(&rgb_frames)
             .unwrap();
 
@@ -718,7 +718,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video);
+        let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Video);
 
         assert_eq!(processor.min_pixels(), DEFAULT_MIN_PIXELS);
         assert_eq!(processor.max_pixels(), DEFAULT_MAX_PIXELS);
@@ -739,7 +739,7 @@ mod tests {
             ..Default::default()
         };
 
-        let processor = Qwen3VLProcessor::from_config_for(&config, crate::Modality::Video);
+        let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Video);
 
         assert_eq!(processor.min_pixels(), 100000);
         assert_eq!(processor.max_pixels(), 500000);

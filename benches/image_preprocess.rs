@@ -15,6 +15,7 @@ use llm_multimodal::vision::{
     processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
     transforms, VisionPreProcessor,
 };
+use llm_multimodal::Modality;
 
 /// Create a synthetic RGB image with some variation (not all zeros).
 fn make_test_image(width: u32, height: u32) -> DynamicImage {
@@ -41,7 +42,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             .unwrap()
         });
 
-    let processor = Qwen3VLProcessor::from_config_for(&config, llm_multimodal::Modality::Image);
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),

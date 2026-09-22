@@ -6,6 +6,10 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{
+        processors::{LlavaNextProcessor, LlavaProcessor},
+        PreProcessorConfig, VisionPreProcessor,
+    },
 };
 
 pub(super) struct LlavaSpec;
@@ -15,13 +19,12 @@ impl ModelProcessorSpec for LlavaSpec {
     fn vision_processor(
         &self,
         metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::LlavaProcessor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(LlavaProcessor::from_configs(metadata.config, config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 
@@ -83,13 +86,12 @@ impl ModelProcessorSpec for LlavaNextSpec {
     fn vision_processor(
         &self,
         metadata: &ModelMetadata,
-        config: &crate::vision::PreProcessorConfig,
+        config: &PreProcessorConfig,
         modality: Modality,
-    ) -> Option<Box<dyn crate::vision::VisionPreProcessor>> {
-        use crate::vision::processors::LlavaNextProcessor;
+    ) -> Option<Box<dyn VisionPreProcessor>> {
         (modality == Modality::Image).then(|| {
             Box::new(LlavaNextProcessor::from_configs(metadata.config, config))
-                as Box<dyn crate::vision::VisionPreProcessor>
+                as Box<dyn VisionPreProcessor>
         })
     }
 

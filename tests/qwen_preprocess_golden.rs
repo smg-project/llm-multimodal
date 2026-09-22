@@ -6,6 +6,7 @@ use llm_multimodal::vision::{
     processor::ModelSpecificValue, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
     VisionPreProcessor,
 };
+use llm_multimodal::Modality;
 use serde::Deserialize;
 
 #[derive(Deserialize)]
@@ -185,8 +186,7 @@ fn qwen_preprocessing_matches_huggingface_golden() {
             model => panic!("unknown Qwen golden model {model}"),
         }
     }
-    let qwen3_video =
-        Qwen3VLProcessor::from_config_for(&qwen3_config, llm_multimodal::Modality::Video);
+    let qwen3_video = Qwen3VLProcessor::from_config_for(&qwen3_config, Modality::Video);
     for case in &golden.video_cases {
         check_video_case(&qwen3_video, case);
     }

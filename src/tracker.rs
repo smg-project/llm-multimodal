@@ -70,10 +70,7 @@ impl AsyncMultiModalTracker {
                 uuid,
                 max_long_side_pixel,
             } => {
-                let source = match url::Url::parse(&url) {
-                    Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-                    _ => MediaSource::Url(url),
-                };
+                let source = image_url_source(url);
                 self.enqueue_image(
                     source,
                     detail.unwrap_or_default(),
@@ -281,6 +278,20 @@ impl AsyncMultiModalTracker {
     }
 }
 
+// Avoid scanning and allocating the entire payload just to identify its scheme.
+// Only canonical opaque image URLs take this path; noncanonical forms and
+// invalid data:// authorities retain URL parsing. Connector validation still
+// receives the original input unchanged.
+fn image_url_source(url: String) -> MediaSource {
+    if url.starts_with("data:image/") {
+        return MediaSource::DataUrl(url);
+    }
+    match url::Url::parse(&url) {
+        Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
+        _ => MediaSource::Url(url),
+    }
+}
+
 /// Identity of one fetch: the media a part names, together with the settings
 /// it would be fetched with.
 fn fetch_key(modality: Modality, settings: &str, source: &MediaSource) -> [u8; 32] {
@@ -452,6 +463,41 @@ mod repeat_tests {
     use crate::media::MediaConnectorConfig;
 
     const TINY_PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
+
+    #[test]
+    fn fast_image_scheme_classification_matches_url_parser() {
+        let mut cases = vec![
+            TINY_PNG_URL.to_owned(),
+            "data:".to_owned(),
+            "DATA:image/png;base64,abc".to_owned(),
+            " data:text/plain,hello".to_owned(),
+            "https://example.com/image".to_owned(),
+            "not-a-url".to_owned(),
+            "data://[invalid];base64,abc".to_owned(),
+            "data:\n//[invalid];base64,abc".to_owned(),
+            "data://user:password@[invalid]/image;base64,abc".to_owned(),
+            "data:;base64,abc".to_owned(),
+        ];
+        for byte in 0..=127u8 {
+            cases.push(format!("data:{};base64,abc", char::from(byte)));
+            cases.push(format!("data:text/plain,abc{}def", char::from(byte)));
+            cases.push(format!("data:image/png;base64,abc{}def", char::from(byte)));
+        }
+        for input in cases {
+            let expected = url::Url::parse(&input).is_ok_and(|url| url.scheme() == "data");
+            match image_url_source(input.clone()) {
+                MediaSource::DataUrl(actual) => {
+                    assert!(expected, "{input:?}");
+                    assert_eq!(actual, input);
+                }
+                MediaSource::Url(actual) => {
+                    assert!(!expected, "{input:?}");
+                    assert_eq!(actual, input);
+                }
+                _ => panic!("unexpected image source"),
+            }
+        }
+    }
 
     fn tracker() -> AsyncMultiModalTracker {
         let connector =

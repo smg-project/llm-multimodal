@@ -32,5 +32,6 @@ pub use types::{
 // Re-export vision processing components
 pub use vision::{
     DeepseekV41Processor, InklingImageProcessor, KimiK3Processor, LlavaNextProcessor,
-    LlavaProcessor, PreProcessorConfig, VisionPreProcessor,
+    LlavaProcessor, NemotronHOmniProcessor, PreProcessorConfig, VisionPreProcessor,
+    VisionPreprocessingContext,
 };

@@ -5,6 +5,7 @@ mod kimi_k3;
 mod llama4;
 mod llava;
 mod minimax_m3;
+mod nemotron_h_omni;
 mod phi3_v;
 mod qwen3_asr;
 mod qwen3_omni;
@@ -19,6 +20,7 @@ use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
+use nemotron_h_omni::NemotronHOmniVisionSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -47,6 +49,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
                 LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
+                LazySpec::new(|| Box::new(NemotronHOmniVisionSpec)),
                 LazySpec::new(|| Box::new(Qwen3AsrSpec)),
                 LazySpec::new(|| Box::new(Qwen3OmniSpec)),
                 // Qwen3-VL must be registered before QwenVL so "qwen3" matches first.

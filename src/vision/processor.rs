@@ -9,6 +9,15 @@ use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
 use crate::types::RgbFrameRef;
 
+/// Request-specific inputs for vision preprocessing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VisionPreprocessingContext {
+    /// Tokens available for this preprocessing call's media after fixed prompt tokens
+    /// have been accounted for, including any model-specific structural overhead.
+    /// `None` means no budget was supplied; `Some(0)` means the budget is exhausted.
+    pub token_budget: Option<usize>,
+}
+
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
 fn dim_for_ndim(
@@ -66,7 +75,7 @@ impl PreprocessedEncoderInputs {
 ///
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline. Each instance owns its resolved
-/// model parameters; request methods receive only the media to process.
+/// model parameters; request methods receive media and optional request context.
 pub trait VisionPreProcessor: Send + Sync {
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
@@ -85,6 +94,17 @@ pub trait VisionPreProcessor: Send + Sync {
         &self,
         images: &[DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// Preprocess a batch with request-specific inputs.
+    ///
+    /// Processors that do not use the request context retain their usual path.
+    fn preprocess_with_context(
+        &self,
+        images: &[DynamicImage],
+        _context: &VisionPreprocessingContext,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess(images)
+    }
 
     /// Preprocess one decoded video clip represented as sampled frames.
     ///

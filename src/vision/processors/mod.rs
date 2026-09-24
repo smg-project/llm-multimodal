@@ -18,6 +18,7 @@
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **MiniMax-M3** (`minimax_m3`): Qwen2-VL patchify with MiniMax smart resize
 //! - **DeepSeek-V4.1** (`deepseek_v41`): contain-fit resize with gray padding and 3x3 aligner downsample
+//! - **Nemotron-H Omni** (`nemotron_h_omni`): Dynamic-resolution RADIO preprocessing with pixel-shuffle token budgeting
 
 pub mod deepseek_v41;
 pub mod inkling;
@@ -27,6 +28,7 @@ pub mod kimi_k3;
 pub mod llama4_vision;
 pub mod llava;
 pub mod minimax_m3;
+pub mod nemotron_h_omni;
 pub mod phi3_vision;
 pub mod phi4_vision;
 pub mod pixtral;
@@ -42,6 +44,7 @@ pub use kimi_k3::KimiK3Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use minimax_m3::MiniMaxM3Processor;
+pub use nemotron_h_omni::NemotronHOmniProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

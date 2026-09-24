@@ -18,6 +18,8 @@ pub enum ModelRegistryError {
     TokenNotFound { token: String },
     #[error("missing config field '{field}'")]
     MissingConfigField { field: String },
+    #[error("invalid processor configuration: {message}")]
+    InvalidConfig { message: String },
     #[error("modality {modality} is not supported by model spec {spec}")]
     UnsupportedModality {
         spec: &'static str,

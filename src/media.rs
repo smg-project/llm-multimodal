@@ -167,16 +167,13 @@ impl MediaConnector {
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
         match source {
             MediaSource::Url(url) => self.fetch_http_image(url, cfg).await,
-            MediaSource::DataUrl(data_url) => self.fetch_data_url(data_url, cfg).await,
-            MediaSource::InlineBytes(bytes) => {
-                self.decode_image(
-                    bytes.into(),
-                    cfg.detail,
-                    cfg.max_long_side_pixel,
-                    ImageSource::InlineBytes,
-                )
-                .await
-            }
+            MediaSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
+            MediaSource::InlineBytes(bytes) => Self::decode_image(
+                bytes.into(),
+                cfg.detail,
+                cfg.max_long_side_pixel,
+                ImageSource::InlineBytes,
+            ),
             MediaSource::File(path) => self.fetch_file(path, cfg).await,
         }
     }
@@ -235,7 +232,7 @@ impl MediaConnector {
 
         let resp = resp.error_for_status()?;
         let bytes = collect_http_body_with_limit(resp, image_max_input_bytes(), "image").await?;
-        self.decode_image(
+        Self::decode_image(
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
@@ -243,11 +240,9 @@ impl MediaConnector {
                 url: parsed.to_string(),
             },
         )
-        .await
     }
 
-    async fn fetch_data_url(
-        &self,
+    fn fetch_data_url(
         data_url: String,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
@@ -263,13 +258,12 @@ impl MediaConnector {
 
         let data = data.trim();
         let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
-        self.decode_image(
+        Self::decode_image(
             decoded.into(),
             cfg.detail,
             cfg.max_long_side_pixel,
             ImageSource::DataUrl,
         )
-        .await
     }
 
     async fn fetch_video_data_url(
@@ -331,13 +325,12 @@ impl MediaConnector {
         }
 
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
-        self.decode_image(
+        Self::decode_image(
             bytes,
             cfg.detail,
             cfg.max_long_side_pixel,
             ImageSource::File { path: canonical },
         )
-        .await
     }
 
     async fn fetch_http_video(
@@ -454,8 +447,7 @@ impl MediaConnector {
         Ok(())
     }
 
-    async fn decode_image(
-        &self,
+    fn decode_image(
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,
@@ -466,30 +458,18 @@ impl MediaConnector {
         // The cap changes the decoded pixels, so it has to be part of the
         // identity the pixel cache and the backend's mm cache key off.
         let hash = crate::hasher::hash_image_with_resolution_cap(&bytes, max_long_side_pixel);
+        // The header is enough to plan the request by; the pixels are decoded
+        // when preprocessing first asks for them, which a pixel-cache hit
+        // never does.
+        let size = encoded_image_size(&bytes, max_long_side_pixel)?;
 
-        // Decode JPEGs through libjpeg-turbo (PIL-compatible defaults: accurate
-        // IDCT + fancy upsampling) so pixel values match vLLM bit-for-bit; the
-        // pure-Rust decoder diverges by a few levels, which the vision encoder
-        // amplifies into an embedding shift. Non-JPEG inputs and any turbojpeg
-        // failure fall back to the `image` crate.
-        let bytes_for_decode = bytes.clone();
-        let image = task::spawn_blocking(
-            move || -> Result<image::DynamicImage, MediaConnectorError> {
-                if let Some(img) = crate::jpeg_turbo::decode_jpeg_rgb(&bytes_for_decode) {
-                    return Ok(img);
-                }
-                let cursor = std::io::Cursor::new(bytes_for_decode);
-                let reader = image::ImageReader::new(cursor).with_guessed_format()?;
-                Ok(reader.decode()?)
-            },
-        )
-        .await
-        .map_err(MediaConnectorError::Blocking)??;
-
-        let image = apply_max_long_side_pixel(image, max_long_side_pixel);
-
-        Ok(Arc::new(ImageFrame::new(
-            image, bytes, detail, source, hash,
+        Ok(Arc::new(ImageFrame::encoded(
+            bytes,
+            detail,
+            source,
+            hash,
+            size,
+            max_long_side_pixel,
         )))
     }
 
@@ -3332,19 +3312,50 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// Images already within the bound are returned untouched, so the cap only
 /// ever removes resolution. The aspect ratio is preserved; the vision
 /// processor's own `smart_resize` then aligns the result to the patch grid.
+/// Decode an image to pixels: JPEGs through libjpeg-turbo when it is present
+/// (PIL's defaults, accurate IDCT and fancy upsampling, so the pixels match an
+/// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
+/// a few levels, which the vision encoder amplifies), everything else and any
+/// turbojpeg failure through the `image` crate; then the long-side cap.
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+) -> Result<image::DynamicImage, MediaConnectorError> {
+    let image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
+        Some(image) => image,
+        None => image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()?
+            .decode()?,
+    };
+    Ok(apply_max_long_side_pixel(image, max_long_side_pixel))
+}
+
+/// The dimensions the decode will produce, from the header alone.
+pub(crate) fn encoded_image_size(
+    bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+) -> Result<crate::types::ImageSize, MediaConnectorError> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()?;
+    let (width, height) = max_long_side_pixel
+        .and_then(|cap| capped_dimensions(width, height, cap))
+        .unwrap_or((width, height));
+    Ok(crate::types::ImageSize::new(width, height))
+}
+
 fn apply_max_long_side_pixel(
     image: image::DynamicImage,
     max_long_side_pixel: Option<u32>,
 ) -> image::DynamicImage {
-    let Some(cap) = max_long_side_pixel else {
-        return image;
-    };
-    let (width, height) = (image.width(), image.height());
-    if width.max(height) <= cap {
-        return image;
+    // The same fit `encoded_image_size` promised from the header.
+    match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
+    {
+        Some((width, height)) => {
+            image.resize_exact(width, height, image::imageops::FilterType::CatmullRom)
+        }
+        None => image,
     }
-    // `resize` fits within the box while preserving aspect ratio.
-    image.resize(cap, cap, image::imageops::FilterType::CatmullRom)
 }
 
 #[cfg(test)]

@@ -3338,9 +3338,11 @@ mod tests {
     /// spends a decode on the clip, exactly as the image decoder does.
     #[tokio::test]
     async fn decode_video_rejects_an_invalid_long_side_cap() {
-        let connector =
-            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-                .expect("default connector");
+        let connector = MediaConnector::new(
+            crate::test_support::http_client(),
+            MediaConnectorConfig::default(),
+        )
+        .expect("default connector");
         for value in [0, 505] {
             let cfg = VideoFetchConfig {
                 max_long_side_pixel: Some(value),

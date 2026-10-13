@@ -26,6 +26,7 @@ use url::Url;
 use crate::{
     audio::decode_audio_mono_f32,
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
+    vision::transforms::resize_catmull_rom_rgb,
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -4587,9 +4588,12 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => {
-            image.resize_exact(width, height, image::imageops::FilterType::CatmullRom)
-        }
+        Some((width, height)) => match image {
+            image::DynamicImage::ImageRgb8(rgb) => {
+                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
+            }
+            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+        },
         None => image,
     }
 }

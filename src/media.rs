@@ -132,6 +132,12 @@ pub enum FrameSampling {
     Even,
     /// One frame per sampling interval from the start, plus the last frame.
     Interval,
+    /// `trunc(duration x rate)` frames, at least `min_frames`, at most
+    /// `max_frames` and never more than the clip has, each the nearest frame
+    /// of `linspace(0, n - 1, count)` (ties to even, as numpy rounds): the
+    /// rule of the Qwen3-VL family's reference video processor, whose prompt
+    /// stamps every temporal group with the times of the frames it picked.
+    EvenRounded,
     /// Every frame of a clip with at most `max_frames`; a longer clip gives
     /// `max_frames` spread evenly from the first frame to the last
     /// (`numpy.linspace(0, n - 1, max_frames)` truncated to integers), the
@@ -1635,12 +1641,15 @@ fn adaptive_decoder_threads(available_cpus: usize, active_decodes: usize) -> i32
     (decoder_budget.max(1) / active_decodes).clamp(1, max_threads) as i32
 }
 
-/// Source index per output frame; short clips repeat frames up to `min_frames`.
-fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+/// Source index per output frame of a clip of `total_frames` at `fps` under
+/// `cfg`, in order, duplicates kept; the `Even` and `Interval` rules repeat
+/// frames up to `min_frames` on short clips.
+pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     match cfg.sampling {
         FrameSampling::UpTo { max_frames } => up_to_frame_indices(total_frames, max_frames),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
+        FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
         FrameSampling::Interval => interval_frame_indices(total_frames, fps, cfg),
     }
 }
@@ -1696,6 +1705,44 @@ fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
     let denom = (count - 1) as f64;
     (0..count)
         .map(|idx| ((idx as f64 * last) / denom).floor() as usize)
+        .collect()
+}
+
+/// The Qwen3-VL family's reference video processor sampling at `cfg.sample_fps`:
+/// `trunc(duration x rate)` frames, at least `min_frames`, at most `max_frames`
+/// and never more than the clip has; a clip whose rate is unknown gets
+/// `max_frames`. The reference then repeats its last pick up to a whole
+/// temporal group, which the processor's own temporal padding does here.
+fn even_rounded_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
+    let target_frames = if fps.is_finite() && fps > 0.0 {
+        (total_frames as f64 / fps * f64::from(cfg.sample_fps)).trunc() as usize
+    } else {
+        cfg.max_frames
+    };
+    let count = target_frames
+        .max(cfg.min_frames)
+        .min(cfg.max_frames)
+        .min(total_frames);
+    spread_evenly_rounded(total_frames, count)
+}
+
+/// `count` frames from the first to the last, each the nearest frame of
+/// `numpy.linspace(0, total_frames - 1, count)`: `i * step` for
+/// `step = (total_frames - 1) / (count - 1)` rounded with ties to even, as
+/// numpy rounds, and the last one the last frame itself.
+fn spread_evenly_rounded(total_frames: usize, count: usize) -> Vec<usize> {
+    if count <= 1 {
+        return vec![0];
+    }
+    let step = (total_frames - 1) as f64 / (count - 1) as f64;
+    (0..count)
+        .map(|idx| {
+            if idx + 1 == count {
+                total_frames - 1
+            } else {
+                (idx as f64 * step).round_ties_even() as usize
+            }
+        })
         .collect()
 }
 
@@ -2514,7 +2561,7 @@ impl FrameSelection {
                     loader_frame_indices(claimed, visible, max_frames),
                 )
             }
-            FrameSampling::Even | FrameSampling::Interval => {
+            FrameSampling::Even | FrameSampling::EvenRounded | FrameSampling::Interval => {
                 let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
                 (
                     total_frames,
@@ -2581,7 +2628,17 @@ impl FrameSelection {
     ///
     /// `None` unless it picks out exactly the selection it is standing in for,
     /// so a selection it cannot describe still gets the explicit list and the
-    /// caller's existing fallback.
+    /// caller's existing fallback. Two spreads are described: the floored one
+    /// (`Even`) and the nearest-frame one (`EvenRounded`). The connector
+    /// rounds the nearest frame's ties to even, as the reference does, where
+    /// ffmpeg's `round` is half away from zero, and a tie whose floor is even
+    /// is common (about one clip in five between 101 and 767 picks), so the
+    /// nearest-frame expression spells ties-to-even out of `floor`, `gt`, `eq`
+    /// and `mod`: `floor(x) + (frac > 0.5) + (frac == 0.5 and floor(x) odd)`.
+    /// Its position is `step * (last / denom)`, the picker's own arithmetic
+    /// (`i * step` with the stride rounded once, as the reference's linspace
+    /// computes it): `(step * last) / denom` lands on the other side of a tie
+    /// for some steps, and ffmpeg evaluates in the same doubles.
     fn spread_select_filter(&self) -> Option<String> {
         let last = self.total_frames.checked_sub(1).filter(|last| *last > 0)?;
         let denom = self
@@ -2589,8 +2646,27 @@ impl FrameSelection {
             .len()
             .checked_sub(1)
             .filter(|denom| *denom > 0)?;
+        let floored = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
+        let stride = last as f64 / denom as f64;
+        let nearest_to_even = |step: f64| (step * stride).round_ties_even() as usize;
+        if self.is_described_by(last, denom, floored) {
+            return Some(format!(
+                "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
+            ));
+        }
+        if self.is_described_by(last, denom, nearest_to_even) {
+            let x = format!("round(n*{denom}/{last})*({last}/{denom})");
+            return Some(format!(
+                "select='eq(n\\,floor({x})+gt({x}-floor({x})\\,0.5)+eq({x}-floor({x})\\,0.5)*mod(floor({x})\\,2))'"
+            ));
+        }
+        None
+    }
+
+    /// Whether `eq(n, frame_at(round(n * denom / last)))` over the stream picks
+    /// out exactly this selection's distinct frames.
+    fn is_described_by(&self, last: usize, denom: usize, frame_at: impl Fn(f64) -> usize) -> bool {
         let step_of = |index: usize| (index as f64 * denom as f64 / last as f64).round();
-        let frame_at = |step: f64| (step * last as f64 / denom as f64).floor() as usize;
         // A fixed point is by definition something the formula produces, and the
         // formula produces one frame per step, so the candidates are counted by
         // the frames asked for rather than by the frames the file claims to hold.
@@ -2602,15 +2678,9 @@ impl FrameSelection {
                 described.push(index);
             }
         }
-        if !described
+        described
             .iter()
             .eq(self.unique_frames.iter().map(|(index, _)| index))
-        {
-            return None;
-        }
-        Some(format!(
-            "select='eq(n\\,floor(round(n*{denom}/{last})*{last}/{denom}))'"
-        ))
     }
 
     /// Repeat each distinct decoded frame so the result lines up with `frame_indices`.
@@ -3449,6 +3519,41 @@ mod tests {
     }
 
     #[test]
+    fn even_rounded_sampling_picks_the_reference_processors_frames() {
+        // The frames the Qwen3-VL family's reference video processor picks at
+        // its 2 fps rate, as the engine's own loader recorded them for these
+        // clips: trunc(duration x 2) frames, at least 4, never more than the
+        // clip has, at the nearest frames of an even spread (ties to even).
+        let cfg = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(
+            super::sampled_frame_indices(24, 24.0, cfg),
+            vec![0, 8, 15, 23]
+        );
+        assert_eq!(
+            super::sampled_frame_indices(120, 24.0, cfg),
+            vec![0, 13, 26, 40, 53, 66, 79, 93, 106, 119]
+        );
+        let thirty_seconds = super::sampled_frame_indices(720, 24.0, cfg);
+        assert_eq!(thirty_seconds.len(), 60);
+        assert_eq!(&thirty_seconds[..6], &[0, 12, 24, 37, 49, 61]);
+        let ten_minutes = super::sampled_frame_indices(14400, 24.0, cfg);
+        assert_eq!(ten_minutes.len(), 768);
+        assert_eq!(&ten_minutes[..8], &[0, 19, 38, 56, 75, 94, 113, 131]);
+        assert_eq!(ten_minutes[767], 14399);
+        // A clip shorter than the minimum gives each of its frames once.
+        assert_eq!(super::sampled_frame_indices(1, 30.0, cfg), vec![0]);
+        assert_eq!(super::sampled_frame_indices(3, 10.0, cfg), vec![0, 1, 2]);
+        // An unknown rate takes the maximum, bounded by the clip.
+        assert_eq!(
+            super::sampled_frame_indices(5, 0.0, cfg),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
     fn ffmpeg_decodes_carry_the_thread_budget_ahead_of_the_input() {
         let args = |autorotate: bool| {
             super::ffmpeg_decode_command(3, autorotate)
@@ -3860,51 +3965,159 @@ mod video_sampling_tests {
 
     #[test]
     fn a_long_selection_is_described_rather_than_listed() {
-        let long = VideoFetchConfig {
-            max_frames: 768,
-            ..cfg()
-        };
-        let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
-            .expect("frame rate and count are known");
-        assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+        // The nearest-frame spread spells ties-to-even out of floor, gt, eq and
+        // mod, as spread_select_filter documents; x is the picker's own position.
+        let x = "round(n*767/17999)*(17999/767)";
+        for (sampling, expected) in [
+            (
+                FrameSampling::Even,
+                r"select='eq(n\,floor(round(n*767/17999)*17999/767))'".to_string(),
+            ),
+            (
+                FrameSampling::EvenRounded,
+                format!(
+                    r"select='eq(n\,floor({x})+gt({x}-floor({x})\,0.5)+eq({x}-floor({x})\,0.5)*mod(floor({x})\,2))'"
+                ),
+            ),
+        ] {
+            let long = VideoFetchConfig {
+                max_frames: 768,
+                sampling,
+                ..cfg()
+            };
+            let selection = FrameSelection::from_metadata(metadata(Some(30.0), Some(18_000)), long)
+                .expect("frame rate and count are known");
+            assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
 
-        let filter = selection.select_filter();
-        assert_eq!(
-            filter,
-            r"select='eq(n\,floor(round(n*767/17999)*17999/767))'"
-        );
-        assert!(
-            filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
-            "ffmpeg refuses an expression this long as a list"
-        );
+            let filter = selection.select_filter();
+            assert_eq!(filter, expected, "{sampling:?}");
+            assert!(
+                filter.matches('+').count() < FFMPEG_MAX_SELECT_TERMS,
+                "ffmpeg refuses an expression this long as a list"
+            );
+        }
     }
 
     #[test]
     fn the_described_selection_covers_the_same_frames() {
-        for (total, max_frames) in [(9_000, 768), (18_000, 768), (36_000, 768), (7_500, 300)] {
-            let selection = FrameSelection::from_metadata(
-                metadata(Some(30.0), Some(total)),
-                VideoFetchConfig {
-                    max_frames,
-                    ..cfg()
-                },
-            )
-            .expect("frame rate and count are known");
-            let last = total - 1;
-            let denom = selection.frame_indices.len() - 1;
-            let described: Vec<usize> = (0..total)
-                .filter(|index| {
-                    let step = ((index * denom) as f64 / last as f64).round();
-                    (step * last as f64 / denom as f64).floor() as usize == *index
-                })
-                .collect();
-            let listed: Vec<usize> = selection
-                .unique_frames
-                .iter()
-                .map(|(index, _)| *index)
-                .collect();
-            assert_eq!(described, listed, "total={total} max_frames={max_frames}");
+        // ffmpeg evaluates the expression per frame with its own `round` (half
+        // away from zero); the clips include the parity set's 10-minute clip at
+        // 24 fps and the shapes the nearest-frame spread is checked against.
+        let cases = [
+            (30.0, 9_000, 768),
+            (30.0, 18_000, 768),
+            (30.0, 36_000, 768),
+            (30.0, 7_500, 300),
+            (24.0, 14_400, 768),
+            (30.0, 1_800, 768),
+            (24.0, 2_400, 768),
+            (24.0, 1_500, 768),
+            // 103 picks over 1238 frames: pick 51 falls on 618.5 exactly, a tie
+            // whose floor is even (the connector takes 618, ffmpeg's `round`
+            // would take 619).
+            (24.0, 1_238, 768),
+            (25.0, 1_289, 768),
+            // 139 picks over 1672 frames: step 69 is a tie in exact arithmetic
+            // (835.5) that the picker's `i * step` lands just under (835).
+            (24.0, 1_672, 768),
+        ];
+        for sampling in [FrameSampling::Even, FrameSampling::EvenRounded] {
+            for (fps, total, max_frames) in cases {
+                let selection = FrameSelection::from_metadata(
+                    metadata(Some(fps), Some(total)),
+                    VideoFetchConfig {
+                        max_frames,
+                        sampling,
+                        ..cfg()
+                    },
+                )
+                .expect("frame rate and count are known");
+                assert!(selection.unique_count() > FFMPEG_MAX_SELECT_TERMS);
+                let last = total - 1;
+                let denom = selection.frame_indices.len() - 1;
+                let frame_at = |step: f64| match sampling {
+                    // The picker's arithmetic: the stride rounded once, then scaled.
+                    FrameSampling::EvenRounded => {
+                        (step * (last as f64 / denom as f64)).round_ties_even() as usize
+                    }
+                    _ => (step * last as f64 / denom as f64).floor() as usize,
+                };
+                let described: Vec<usize> = (0..total)
+                    .filter(|index| {
+                        let step = ((index * denom) as f64 / last as f64).round();
+                        frame_at(step) == *index
+                    })
+                    .collect();
+                let listed: Vec<usize> = selection
+                    .unique_frames
+                    .iter()
+                    .map(|(index, _)| *index)
+                    .collect();
+                assert_eq!(
+                    described, listed,
+                    "{sampling:?} total={total} max_frames={max_frames}"
+                );
+                assert!(
+                    selection.spread_select_filter().is_some(),
+                    "{sampling:?} total={total} max_frames={max_frames}: not described"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn a_nearest_frame_tie_is_described_to_even() {
+        // 10 frames at 4 fps, 5 picks at 0, 2.25, 4.5, 6.75 and 9: the connector
+        // takes 0, 2, 4 (the tie, to even), 7 and 9. ffmpeg's `round` would take
+        // the tie to 5 and its `floor` would take 6.75 to 6; the ties-to-even
+        // expression picks this set. Five frames are still listed (under the
+        // term limit), but the description is there for a longer clip.
+        let rounded = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..cfg()
+        };
+        assert_eq!(sampled_frame_indices(10, 4.0, rounded), vec![0, 2, 4, 7, 9]);
+        let selection = FrameSelection::from_metadata(metadata(Some(4.0), Some(10)), rounded)
+            .expect("frame rate and count are known");
+        let described = selection
+            .spread_select_filter()
+            .expect("a tie to even is described");
+        assert!(described.contains("mod(floor("), "{described}");
+        assert_eq!(
+            selection.select_filter(),
+            r"select='eq(n\,0)+eq(n\,2)+eq(n\,4)+eq(n\,7)+eq(n\,9)'"
+        );
+    }
+
+    /// Every nearest-frame spread over the term limit is described, ties
+    /// included: a sweep over the clip lengths from 51 s to 400 s at the
+    /// common frame rates (every length at 24 fps, every 13th at the others),
+    /// where the half-away-from-zero form left about one clip in five listed.
+    #[test]
+    fn every_nearest_frame_spread_over_the_term_limit_is_described() {
+        let rounded = VideoFetchConfig {
+            max_frames: 768,
+            sampling: FrameSampling::EvenRounded,
+            ..cfg()
+        };
+        let mut checked = 0usize;
+        for (fps, stride) in [(24usize, 1usize), (25, 13), (30, 13), (60, 13)] {
+            for total in (51 * fps..=400 * fps).step_by(stride) {
+                let selection =
+                    FrameSelection::from_metadata(metadata(Some(fps as f64), Some(total)), rounded)
+                        .expect("frame rate and count are known");
+                if selection.unique_count() <= FFMPEG_MAX_SELECT_TERMS {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    selection.spread_select_filter().is_some(),
+                    "{fps} fps, {total} frames ({} picks): listed, not described",
+                    selection.unique_count()
+                );
+            }
+        }
+        assert!(checked > 8_000, "{checked} selections checked");
     }
 
     #[test]

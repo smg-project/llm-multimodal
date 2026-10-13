@@ -255,6 +255,14 @@ impl VisionProcessorRegistry {
             );
         }
 
+        // Nemotron-H Omni (the HF model_type and the released ids' spelling).
+        for pattern in ["nemotronh_nano_omni", "nemotron-3-nano-omni"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::NemotronOmniProcessor::new()),
+            );
+        }
+
         // Gemma 4 (the HF model_type and the released ids' spelling).
         for pattern in ["gemma4", "gemma-4"] {
             registry.register(pattern, Box::new(super::processors::Gemma4Processor::new()));

@@ -50,8 +50,8 @@ pub use processor::{
 };
 pub use processors::{
     DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,
-    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, Phi3VisionProcessor,
-    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3OmniVisionProcessor,
-    Qwen3VLProcessor,
+    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, NemotronOmniProcessor,
+    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
+    Qwen3OmniVisionProcessor, Qwen3VLProcessor,
 };
 pub use transforms::TransformError;

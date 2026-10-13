@@ -1216,6 +1216,106 @@ pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> 
     )
 }
 
+/// torch's antialiasing bicubic weights for one axis, computed as its CPU
+/// kernel does on a float tensor: the scale, kernel center and normalized
+/// weights in `f32` (the cubic itself in `f64`). Pillow's `f64` weights shift
+/// by up to ~5e-5 at large output indices, which moves sharp edges by ~0.01.
+fn torch_aa_bicubic_weights(
+    in_size: usize,
+    out_size: usize,
+) -> (Vec<(usize, usize)>, Vec<Vec<f32>>) {
+    let scale = in_size as f32 / out_size as f32;
+    let (support, invscale) = if scale >= 1.0 {
+        (2.0 * scale, 1.0 / scale)
+    } else {
+        (2.0, 1.0)
+    };
+    let mut bounds = Vec::with_capacity(out_size);
+    let mut weights = Vec::with_capacity(out_size);
+    for i in 0..out_size {
+        let center = (f64::from(scale) * (i as f64 + 0.5)) as f32;
+        let start = (f64::from(center - support) + 0.5).max(0.0) as usize;
+        let end = ((f64::from(center + support) + 0.5) as usize).min(in_size);
+        let mut w: Vec<f32> = (start..end)
+            .map(|j| {
+                let x = (f64::from(j as f32 - center) + 0.5) * f64::from(invscale);
+                pil_cubic(f64::from(x as f32)) as f32
+            })
+            .collect();
+        let total: f32 = w.iter().sum();
+        if total != 0.0 {
+            for wx in &mut w {
+                *wx /= total;
+            }
+        }
+        bounds.push((start, end - start));
+        weights.push(w);
+    }
+    (bounds, weights)
+}
+
+/// `torch.nn.functional.interpolate(mode="bicubic", antialias=True)` on the
+/// image as a float tensor: interleaved RGB bytes in, interleaved `f32`
+/// values on the byte scale out, nothing rounded. The kernel is Keys cubic
+/// `a = -0.5` widened by the downscale factor, with torch's `f32` weights;
+/// the width pass runs first.
+pub fn resize_bicubic_torch_aa_f32(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Result<Vec<f32>> {
+    let (in_w, in_h, out_w, out_h) = (
+        width as usize,
+        height as usize,
+        out_w as usize,
+        out_h as usize,
+    );
+    if data.len() != in_w.saturating_mul(in_h).saturating_mul(3) {
+        return Err(TransformError::ShapeError(format!(
+            "torch bicubic RGB source has {} bytes, expected {} for {width}x{height}",
+            data.len(),
+            in_w * in_h * 3
+        )));
+    }
+    if in_w == 0 || in_h == 0 || out_w == 0 || out_h == 0 {
+        return Err(TransformError::ShapeError(format!(
+            "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
+        )));
+    }
+    let (x_bounds, x_weights) = torch_aa_bicubic_weights(in_w, out_w);
+    let (y_bounds, y_weights) = torch_aa_bicubic_weights(in_h, out_h);
+
+    let mut rows = vec![0.0_f32; in_h * out_w * 3];
+    for y in 0..in_h {
+        let src = &data[y * in_w * 3..][..in_w * 3];
+        let dst = &mut rows[y * out_w * 3..][..out_w * 3];
+        for (ox, (&(start, count), weights)) in x_bounds.iter().zip(&x_weights).enumerate() {
+            let mut acc = [0.0_f32; 3];
+            for (k, &weight) in weights[..count].iter().enumerate() {
+                let pixel = &src[(start + k) * 3..][..3];
+                for c in 0..3 {
+                    acc[c] += weight * f32::from(pixel[c]);
+                }
+            }
+            dst[ox * 3..][..3].copy_from_slice(&acc);
+        }
+    }
+
+    let mut out = vec![0.0_f32; out_h * out_w * 3];
+    for (oy, (&(start, count), weights)) in y_bounds.iter().zip(&y_weights).enumerate() {
+        let dst = &mut out[oy * out_w * 3..][..out_w * 3];
+        for (k, &weight) in weights[..count].iter().enumerate() {
+            let src = &rows[(start + k) * out_w * 3..][..out_w * 3];
+            for (d, &v) in dst.iter_mut().zip(src) {
+                *d += weight * v;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Resize image preserving aspect ratio, fitting within max dimensions.
 pub fn resize_to_fit(
     image: &DynamicImage,

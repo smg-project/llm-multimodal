@@ -13,6 +13,19 @@ use crate::{
     vision::PreProcessorConfig,
 };
 
+/// The format of the encoder inputs a spec's processors emit, which decides
+/// the engines whose models can read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderInputFormat {
+    /// The model family's reference processor outputs, which every engine
+    /// serving the family reads.
+    Reference,
+    /// Images and video frames as patch rows with per-item grids, audio as mel
+    /// frames with per-clip lengths, for an engine whose model reads them
+    /// packed rather than the reference processor's tensors.
+    Packed,
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelRegistryError {
     #[error("unsupported model: {0}")]
@@ -193,6 +206,14 @@ pub trait ModelProcessorSpec: Send + Sync {
         false
     }
 
+    /// The format of the encoder inputs this spec's processors emit. The
+    /// gateway applies the spec only while every engine serving the model
+    /// reads that format; otherwise the model is handled as having no spec,
+    /// and its workers process media themselves.
+    fn encoder_input_format(&self) -> EncoderInputFormat {
+        EncoderInputFormat::Reference
+    }
+
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId>;
     fn placeholder_token_for(
@@ -221,6 +242,15 @@ pub trait ModelProcessorSpec: Send + Sync {
             }),
         }
     }
+    /// The text the model's chat template writes for one item of `modality`
+    /// when that is not the anchor token itself but several tokens (a
+    /// literal such as `<video>`). The gateway rewrites each occurrence in
+    /// the rendered prompt to the anchor before tokenizing; `None` when the
+    /// template writes the anchor.
+    fn rendered_marker_for(&self, _modality: Modality) -> Option<&'static str> {
+        None
+    }
+
     fn modality_limits(&self, metadata: &ModelMetadata)
         -> RegistryResult<HashMap<Modality, usize>>;
 

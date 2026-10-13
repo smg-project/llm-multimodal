@@ -394,6 +394,79 @@ pub fn resize(image: &DynamicImage, width: u32, height: u32, filter: FilterType)
     fir_image_to_dynamic(dst, width, height, image, filter)
 }
 
+// Match image 0.25's f32 Catmull-Rom weights, normalization, and sample order.
+fn catmull_rom_weights(input: u32, output: u32) -> Vec<(usize, Vec<f32>)> {
+    let ratio = input as f32 / output as f32;
+    let scale = ratio.max(1.0);
+    (0..output)
+        .map(|i| {
+            let center = (i as f32 + 0.5) * ratio;
+            let left = ((center - 2.0 * scale).floor() as i64).clamp(0, input as i64 - 1) as usize;
+            let right = ((center + 2.0 * scale).ceil() as i64).clamp(left as i64 + 1, input as i64)
+                as usize;
+            let mut weights: Vec<_> = (left..right)
+                .map(|j| {
+                    let a = ((j as f32 - (center - 0.5)) / scale).abs();
+                    (if a < 1.0 {
+                        9.0 * a.powi(3) - 15.0 * a.powi(2) + 6.0
+                    } else if a < 2.0 {
+                        -3.0 * a.powi(3) + 15.0 * a.powi(2) - 24.0 * a + 12.0
+                    } else {
+                        0.0
+                    }) / 6.0
+                })
+                .collect();
+            let sum: f32 = weights.iter().sum();
+            for w in &mut weights {
+                *w /= sum;
+            }
+            (left, weights)
+        })
+        .collect()
+}
+
+/// Match `image::imageops::resize(..., CatmullRom)` byte-for-byte for RGB8.
+/// Fuse both separable passes per output row: the temporary row stays in cache
+/// instead of materializing an RGBA32F image and sampling it column-first.
+/// Run on the caller: lazy decode holds an ImageFrame initialization cell,
+/// and pool workers may already be waiting for that cell to become ready.
+pub(crate) fn resize_catmull_rom_rgb(src: &RgbImage, width: u32, height: u32) -> RgbImage {
+    if src.width() == 0 || src.height() == 0 || width == 0 || height == 0 {
+        return image::imageops::resize(src, width, height, FilterType::CatmullRom);
+    }
+    let xs = catmull_rom_weights(src.width(), width);
+    let ys = catmull_rom_weights(src.height(), height);
+    let src_stride = src.width() as usize * 3;
+    let dst_stride = width as usize * 3;
+    let mut dst = RgbImage::new(width, height);
+    if dst.set_color_space(src.color_space()).is_err() {
+        return image::imageops::resize(src, width, height, FilterType::CatmullRom);
+    }
+    let mut row = vec![0.0f32; src_stride];
+    for (index, dst_row) in dst.as_mut().chunks_mut(dst_stride).enumerate() {
+        row.fill(0.0);
+        let (top, weights) = &ys[index];
+        for (dy, w) in weights.iter().enumerate() {
+            let start = (top + dy) * src_stride;
+            for (out, &value) in row.iter_mut().zip(&src.as_raw()[start..start + src_stride]) {
+                *out += value as f32 * w;
+            }
+        }
+        for (pixel, (left, weights)) in dst_row.as_chunks_mut::<3>().0.iter_mut().zip(&xs) {
+            let mut sums = [0.0f32; 3];
+            for (dx, w) in weights.iter().enumerate() {
+                for c in 0..3 {
+                    sums[c] += row[(left + dx) * 3 + c] * w;
+                }
+            }
+            for c in 0..3 {
+                pixel[c] = sums[c].clamp(0.0, 255.0).round() as u8;
+            }
+        }
+    }
+    dst
+}
+
 /// Resize borrowed interleaved RGB bytes without first materializing an
 /// `image::RgbImage` over an owned input buffer.
 pub fn resize_rgb_bytes(
@@ -1447,9 +1520,40 @@ pub fn bicubic_resize(tensor: &Array3<f32>, target_h: usize, target_w: usize) ->
 
 #[cfg(test)]
 mod tests {
+
     use image::Rgba;
 
     use super::*;
+
+    #[test]
+    fn catmull_rom_rgb_matches_image_resize() {
+        for (width, height, out_w, out_h) in [
+            (1, 17, 1, 7),
+            (17, 1, 7, 1),
+            (19, 13, 7, 5),
+            (97, 53, 28, 14),
+            (101, 77, 100, 76),
+            (64, 64, 64, 64),
+            (2240, 280, 2016, 252),
+            (3840, 2160, 2016, 1134),
+        ] {
+            let mut seed = 17u32;
+            let input = RgbImage::from_fn(width, height, |_, _| {
+                Rgb(std::array::from_fn(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    (seed >> 24) as u8
+                }))
+            });
+            let expected = image::imageops::resize(&input, out_w, out_h, FilterType::CatmullRom);
+            let actual = resize_catmull_rom_rgb(&input, out_w, out_h);
+            assert_eq!(
+                actual.as_raw(),
+                expected.as_raw(),
+                "{width}x{height} -> {out_w}x{out_h}"
+            );
+            assert_eq!(actual.color_space(), expected.color_space());
+        }
+    }
 
     #[test]
     fn pad_to_size_pil_centres_on_one_axis_only() {

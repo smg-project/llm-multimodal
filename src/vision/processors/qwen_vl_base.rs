@@ -1135,6 +1135,39 @@ impl QwenVLProcessorBase {
     }
 }
 
+/// The work one image of a batch costs, as the weight its run is balanced
+/// by: the source pixels (a resize reads every source row, so a large image
+/// shrunk to the budget costs its source, not its target) plus the target
+/// pixels (the patch layout and the write).
+fn image_work(image: &DynamicImage, target_width: u32, target_height: u32) -> usize {
+    let source = image.width() as usize * image.height() as usize;
+    let target = target_width as usize * target_height as usize;
+    source + target
+}
+
+/// The items of a batch spread over `tasks` runs by weight: taken heaviest
+/// first, each to the lightest run so far, so the runs hold about equal
+/// shares of the work and no run is empty; at most `tasks` runs, at most one
+/// per item. Within a run the items keep their order.
+fn weighted_runs<T>(items: Vec<T>, weights: &[usize], tasks: usize) -> Vec<Vec<T>> {
+    let tasks = tasks.clamp(1, items.len().max(1));
+    let mut order: Vec<usize> = (0..items.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(weights[index]));
+    let mut loads = vec![0usize; tasks];
+    let mut assignment = vec![0usize; items.len()];
+    for index in order {
+        let lightest = (0..tasks).min_by_key(|&run| loads[run]).unwrap_or(0);
+        loads[lightest] += weights[index];
+        assignment[index] = lightest;
+    }
+    let mut runs: Vec<Vec<T>> = (0..tasks).map(|_| Vec::new()).collect();
+    for (index, item) in items.into_iter().enumerate() {
+        runs[assignment[index]].push(item);
+    }
+    runs.retain(|run| !run.is_empty());
+    runs
+}
+
 /// What a batch of images needs before any pixel is touched: the per-image
 /// targets and grids, the totals and the normalization.
 struct ImageBatchPlan {
@@ -1273,7 +1306,8 @@ impl QwenVLProcessorBase {
         };
         let writer = WireWriter::new(&batch.norm, dtype)?;
         let element_size = writer.element_size();
-        let mut wire: Vec<u8> = vec![0u8; batch.total_patch_values * element_size];
+        let wire_len = batch.total_patch_values * element_size;
+        let mut wire: Vec<u8> = vec![0u8; wire_len];
         let mut bands = Vec::with_capacity(images.len());
         let mut remaining = wire.as_mut_slice();
         for plan in &batch.plans {
@@ -1284,37 +1318,61 @@ impl QwenVLProcessorBase {
         let filter = batch.filter;
         let writer = &writer;
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
-        parallel_scope(|scope| {
+        // One image's resize and patch layout into its band: the work of one
+        // task, whether it runs here or on the pool.
+        let per_image = |image: &DynamicImage, plan: &QwenImagePlan, band: &mut [u8]| {
+            let resized;
+            let img_ref = if plan.needs_resize {
+                resized = if filter == FilterType::CatmullRom {
+                    resize_bicubic_torch_aa(image, plan.target_width, plan.target_height)
+                } else {
+                    resize(image, plan.target_width, plan.target_height, filter)
+                };
+                &resized
+            } else {
+                image
+            };
+            self.patchify_image_rgb_wire_into(img_ref, plan.grid_h, plan.grid_w, band, writer)
+                .err()
+        };
+        let parallel_tasks = task_count(wire_len, images.len(), 1);
+        if parallel_tasks <= 1 {
+            // One image, the inline mode, or a pool busy with other
+            // operations: on the calling thread, image after image.
             for (((image, plan), band), error_slot) in images
                 .iter()
                 .zip(&batch.plans)
                 .zip(bands)
                 .zip(errors.iter_mut())
             {
-                scope.spawn(move |_| {
-                    let resized;
-                    let img_ref = if plan.needs_resize {
-                        resized = if filter == FilterType::CatmullRom {
-                            resize_bicubic_torch_aa(image, plan.target_width, plan.target_height)
-                        } else {
-                            resize(image, plan.target_width, plan.target_height, filter)
-                        };
-                        &resized
-                    } else {
-                        image
-                    };
-                    *error_slot = self
-                        .patchify_image_rgb_wire_into(
-                            img_ref,
-                            plan.grid_h,
-                            plan.grid_w,
-                            band,
-                            writer,
-                        )
-                        .err();
-                });
+                *error_slot = per_image(image, plan, band);
             }
-        });
+        } else {
+            // Exactly as many tasks as the split allows (or as there are
+            // images), filled by weight: no more queued on the pool than it
+            // has threads free for, and about an equal share of work each.
+            let per_image = &per_image;
+            let weights: Vec<usize> = images
+                .iter()
+                .zip(&batch.plans)
+                .map(|(image, plan)| image_work(image, plan.target_width, plan.target_height))
+                .collect();
+            let items = images
+                .iter()
+                .zip(&batch.plans)
+                .zip(bands)
+                .zip(errors.iter_mut())
+                .collect();
+            parallel_scope(|scope| {
+                for run in weighted_runs(items, &weights, parallel_tasks) {
+                    scope.spawn(move |_| {
+                        for (((image, plan), band), error_slot) in run {
+                            *error_slot = per_image(image, plan, band);
+                        }
+                    });
+                }
+            });
+        }
         if let Some(error) = errors.into_iter().flatten().next() {
             return Some(Err(error));
         }
@@ -1499,44 +1557,70 @@ impl VisionPreProcessor for QwenVLProcessorBase {
             remaining = rest;
         }
         let mut errors: Vec<Option<TransformError>> = (0..images.len()).map(|_| None).collect();
-        parallel_scope(|scope| {
+        // One image's resize and patch layout into its band: the work of one
+        // task, whether it runs here or on the pool.
+        let per_image = |image: &DynamicImage, plan: &QwenImagePlan, band: &mut [u8]| {
+            // BICUBIC (Qwen default) uses the torchvision `uint8` kernel the
+            // family's reference processors run; other filters keep the SIMD
+            // path.
+            let resized;
+            let img_ref = if plan.needs_resize {
+                resized = if filter == FilterType::CatmullRom {
+                    resize_bicubic_torch_aa(image, plan.target_width, plan.target_height)
+                } else {
+                    resize(image, plan.target_width, plan.target_height, filter)
+                };
+                &resized
+            } else {
+                image
+            };
+            // Patchify directly from RGB bytes to avoid the intermediate
+            // [C,H,W] tensor allocation. This matches the tensor path's
+            // channel/temporal/spatial order.
+            let mut out_idx = 0;
+            let outcome =
+                self.patchify_image_rgb_into(img_ref, plan.grid_h, plan.grid_w, band, &mut out_idx);
+            debug_assert!(outcome.is_err() || out_idx == band.len());
+            outcome.err()
+        };
+        let parallel_tasks = task_count(total_patch_values, images.len(), 1);
+        if parallel_tasks <= 1 {
+            // One image, the inline mode, or a pool busy with other
+            // operations: on the calling thread, image after image.
             for (((image, plan), band), error_slot) in images
                 .iter()
                 .zip(image_plans)
                 .zip(bands)
                 .zip(errors.iter_mut())
             {
-                scope.spawn(move |_| {
-                    // BICUBIC (Qwen default) uses the torchvision `uint8` kernel
-                    // the family's reference processors run; other filters keep
-                    // the SIMD path.
-                    let resized;
-                    let img_ref = if plan.needs_resize {
-                        resized = if filter == FilterType::CatmullRom {
-                            resize_bicubic_torch_aa(image, plan.target_width, plan.target_height)
-                        } else {
-                            resize(image, plan.target_width, plan.target_height, filter)
-                        };
-                        &resized
-                    } else {
-                        image
-                    };
-                    // Patchify directly from RGB bytes to avoid the intermediate
-                    // [C,H,W] tensor allocation. This matches the tensor path's
-                    // channel/temporal/spatial order.
-                    let mut out_idx = 0;
-                    let outcome = self.patchify_image_rgb_into(
-                        img_ref,
-                        plan.grid_h,
-                        plan.grid_w,
-                        band,
-                        &mut out_idx,
-                    );
-                    debug_assert!(outcome.is_err() || out_idx == band.len());
-                    *error_slot = outcome.err();
-                });
+                *error_slot = per_image(image, plan, band);
             }
-        });
+        } else {
+            // Exactly as many tasks as the split allows (or as there are
+            // images), filled by weight: no more queued on the pool than it
+            // has threads free for, and about an equal share of work each.
+            let per_image = &per_image;
+            let weights: Vec<usize> = images
+                .iter()
+                .zip(image_plans)
+                .map(|(image, plan)| image_work(image, plan.target_width, plan.target_height))
+                .collect();
+            let items = images
+                .iter()
+                .zip(image_plans)
+                .zip(bands)
+                .zip(errors.iter_mut())
+                .collect();
+            parallel_scope(|scope| {
+                for run in weighted_runs(items, &weights, parallel_tasks) {
+                    scope.spawn(move |_| {
+                        for (((image, plan), band), error_slot) in run {
+                            *error_slot = per_image(image, plan, band);
+                        }
+                    });
+                }
+            });
+        }
         if let Some(error) = errors.into_iter().flatten().next() {
             return Err(error);
         }
@@ -1654,7 +1738,42 @@ impl VisionPreProcessor for QwenVLProcessorBase {
         }
 
         let values_per_group = plan.grid_h * plan.grid_w * plan.patch_features;
+        // The temporal groups from `first_group` on, into `output_band`: the
+        // work of one band, whether it runs here or on the pool.
+        let fill_band = |first_group: usize,
+                         output_band: &mut [u8]|
+         -> Result<(), TransformError> {
+            for (group_offset, group_output) in output_band.chunks_mut(values_per_group).enumerate()
+            {
+                let temporal_index = first_group + group_offset;
+                let prepared = prepare_video_rgb_chunk(
+                    frames,
+                    temporal_index,
+                    temporal_patch_size,
+                    plan.target_width,
+                    plan.target_height,
+                    plan.filter,
+                    plan.do_resize,
+                )?;
+                let mut output_index = 0;
+                self.patchify_video_rgb_chunk_into(
+                    &prepared,
+                    plan.grid_h,
+                    plan.grid_w,
+                    group_output,
+                    &mut output_index,
+                )?;
+                debug_assert_eq!(output_index, group_output.len());
+            }
+            Ok(())
+        };
         let parallel_tasks = task_count(all_patches.len(), plan.grid_t, 1);
+        if parallel_tasks <= 1 {
+            // The whole clip on the calling thread: a small clip, the inline
+            // mode, or a pool busy with other operations.
+            fill_band(0, &mut all_patches)?;
+            return Self::finish_video(plan, all_patches);
+        }
         let groups_per_task = plan.grid_t.div_ceil(parallel_tasks);
         let mut errors = (0..parallel_tasks).map(|_| None).collect::<Vec<_>>();
         parallel_scope(|scope| {
@@ -1663,35 +1782,9 @@ impl VisionPreProcessor for QwenVLProcessorBase {
                 .zip(errors.iter_mut())
                 .enumerate()
             {
-                let first_group = task_index * groups_per_task;
+                let fill_band = &fill_band;
                 scope.spawn(move |_| {
-                    let outcome = (|| {
-                        for (group_offset, group_output) in
-                            output_band.chunks_mut(values_per_group).enumerate()
-                        {
-                            let temporal_index = first_group + group_offset;
-                            let prepared = prepare_video_rgb_chunk(
-                                frames,
-                                temporal_index,
-                                temporal_patch_size,
-                                plan.target_width,
-                                plan.target_height,
-                                plan.filter,
-                                plan.do_resize,
-                            )?;
-                            let mut output_index = 0;
-                            self.patchify_video_rgb_chunk_into(
-                                &prepared,
-                                plan.grid_h,
-                                plan.grid_w,
-                                group_output,
-                                &mut output_index,
-                            )?;
-                            debug_assert_eq!(output_index, group_output.len());
-                        }
-                        Ok::<_, TransformError>(())
-                    })();
-                    *error_slot = outcome.err();
+                    *error_slot = fill_band(task_index * groups_per_task, output_band).err();
                 });
             }
         });
@@ -1728,6 +1821,52 @@ impl VisionPreProcessor for QwenVLProcessorBase {
 
 #[cfg(test)]
 mod tests {
+    /// A large source shrunk to the pixel budget outweighs a small source
+    /// resized to the same budget: the resize reads every source row.
+    #[test]
+    fn image_work_counts_the_source_a_resize_reads() {
+        let big = DynamicImage::new_rgb8(4096, 3072);
+        let small = DynamicImage::new_rgb8(1000, 1000);
+        assert!(image_work(&big, 1148, 840) > 2 * image_work(&small, 1008, 1008));
+    }
+
+    /// The heaviest items go first, each to the lightest run: two large
+    /// images and a thumbnail on two runs put one large image in each.
+    #[test]
+    fn weighted_runs_put_the_heaviest_items_apart() {
+        let runs = weighted_runs(vec!["big-a", "big-b", "small"], &[100, 100, 1], 2);
+        let mut loads: Vec<usize> = runs
+            .iter()
+            .map(|run| {
+                run.iter()
+                    .map(|item| if item.starts_with("big") { 100 } else { 1 })
+                    .sum()
+            })
+            .collect();
+        loads.sort_unstable();
+        assert_eq!(loads, vec![100, 101]);
+    }
+
+    /// An uneven count still fills every run the split allows, and no run
+    /// is empty: nine items on eight runs make eight, five on four make
+    /// four, three on eight make three.
+    #[test]
+    fn weighted_runs_fill_every_run_the_split_allows() {
+        let runs =
+            |n: usize, tasks: usize| weighted_runs((0..n).collect::<Vec<_>>(), &vec![1; n], tasks);
+        assert_eq!(runs(9, 8).len(), 8);
+        assert_eq!(runs(5, 4).len(), 4);
+        assert_eq!(runs(3, 8).len(), 3);
+        assert!(runs(9, 8).iter().all(|run| !run.is_empty()));
+        let mut seen: Vec<usize> = runs(9, 8).into_iter().flatten().collect();
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            (0..9).collect::<Vec<_>>(),
+            "every item lands exactly once"
+        );
+    }
+
     use image::RgbImage;
 
     use super::*;

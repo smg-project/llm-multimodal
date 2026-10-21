@@ -72,6 +72,11 @@ MODELS = {
         "processor_class": "PixtralImageProcessor",
         "description": "Dynamic resolution with CLIP normalization and bicubic resize",
     },
+    "minimax_m3": {
+        "model_id": "MiniMaxAI/MiniMax-M3",
+        "processor_class": "MiniMaxM3VLImageProcessor",
+        "description": "Qwen2-VL patchify with MiniMax smart resize, CLIP normalization",
+    },
 }
 
 # Default test images
@@ -283,6 +288,12 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
         "processor_config": processor.to_dict(),
     }
 
+    # transformers 5.x serializes the pixel bounds only as
+    # size={"shortest_edge", "longest_edge"}; the Rust PreProcessorConfig reads
+    # the flat keys, so write them back with the values the processor resolved.
+    result["processor_config"]["min_pixels"] = min_pixels
+    result["processor_config"]["max_pixels"] = max_pixels
+
     if image_grid_thw is not None:
         result["image_grid_thw"] = np.array(image_grid_thw)
 
@@ -296,6 +307,126 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
         "temporal_patch_size": temporal_patch_size,
         "min_pixels": min_pixels,
         "max_pixels": max_pixels,
+    }
+
+    return result
+
+
+# MiniMax-M3's provider scaling contract raises an image whose short side is
+# under 112 px until the short side is exactly 112 px (aspect ratio kept)
+# before the Qwen-style smart resize runs. The hub image_processor.py does not
+# implement the floor, so the generator stages the raise itself, mirroring
+# `MiniMaxM3VisionProcessor::raise_images`.
+MINIMAX_M3_MIN_SHORT_SIDE = 112
+
+
+def minimax_m3_raise_to_short_side_floor(image: Image.Image, max_pixels: int) -> Image.Image:
+    """Raise an image below MiniMax-M3's 112 px short-side floor, as the
+    reference pipeline (and the Rust port) does before the smart resize."""
+    width, height = image.size
+    short = min(width, height)
+    if short == 0 or short >= MINIMAX_M3_MIN_SHORT_SIDE:
+        return image
+    long_side = round(max(width, height) * MINIMAX_M3_MIN_SHORT_SIDE / short)
+    raised = (
+        (MINIMAX_M3_MIN_SHORT_SIDE, long_side)
+        if width <= height
+        else (long_side, MINIMAX_M3_MIN_SHORT_SIDE)
+    )
+    if raised[0] * raised[1] > max_pixels:
+        raise RuntimeError(
+            f"raised image {raised} exceeds max_pixels={max_pixels}; "
+            "port the over-budget staging branch from the Rust processor"
+        )
+    try:
+        # The reference processor is torchvision-backed; raise with the same
+        # uint8 antialias bicubic kernel the Rust staging step matches.
+        import torchvision.transforms.v2.functional as tvF
+
+        tensor = tvF.to_image(image)
+        tensor = tvF.resize(
+            tensor,
+            [raised[1], raised[0]],
+            interpolation=tvF.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        return tvF.to_pil_image(tensor)
+    except ImportError:
+        return image.resize(raised, Image.BICUBIC)
+
+
+def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for MiniMax-M3 VL.
+
+    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
+    defaults:
+    1. Raise images under the 112 px short-side floor (provider contract)
+    2. Smart resize to fit within min/max pixel bounds
+    3. Align dimensions to (patch_size * merge_size) boundary
+    4. Normalize with CLIP mean/std
+    5. Returns image_grid_thw for position encoding
+
+    Default parameters:
+    - patch_size: 14
+    - merge_size: 2
+    - temporal_patch_size: 2
+    - min_pixels: 4 * 28 * 28 = 3,136
+    - max_pixels: 672 * 672 = 451,584
+    """
+    from transformers import AutoImageProcessor
+
+    # The image processor is registered under AutoImageProcessor in the model's
+    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
+    # full AutoProcessor.
+    img_processor = AutoImageProcessor.from_pretrained(
+        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Stage the provider contract's short-side floor (see above) before the
+    # hub processor's own smart resize.
+    max_pixels = getattr(img_processor, "max_pixels", None) or 576 * 28 * 28
+    image = minimax_m3_raise_to_short_side_floor(image, max_pixels)
+
+    # Process image
+    outputs = img_processor(images=image, return_tensors="np")
+    pixel_values = np.asarray(outputs["pixel_values"])
+    image_grid_thw = outputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = np.asarray(image_grid_thw)
+
+    # Get config values
+    patch_size = getattr(img_processor, "patch_size", 14)
+    merge_size = getattr(img_processor, "merge_size", 2)
+    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
+
+    # Calculate number of tokens: (T * H * W) / merge_size²
+    if image_grid_thw is not None:
+        grid_thw = image_grid_thw[0]
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
+    else:
+        num_tokens = None
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": img_processor.to_dict(),
+    }
+
+    if image_grid_thw is not None:
+        result["image_grid_thw"] = image_grid_thw
+
+    if num_tokens is not None:
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+        "temporal_patch_size": temporal_patch_size,
+        "min_pixels": getattr(img_processor, "min_pixels", None),
+        "max_pixels": getattr(img_processor, "max_pixels", None),
     }
 
     return result
@@ -632,6 +763,7 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> in
         "phi4_vision": generate_golden_phi4_vision,
         "llama4_vision": generate_golden_llama4_vision,
         "pixtral": generate_golden_pixtral,
+        "minimax_m3": generate_golden_minimax_m3,
     }.get(model_key)
 
     if generator_fn is None:

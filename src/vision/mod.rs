@@ -46,7 +46,8 @@ pub mod transforms;
 // preprocessing outputs.
 pub use preprocessor_config::PreProcessorConfig;
 pub use processor::{
-    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionProcessorRegistry,
+    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionPreprocessingContext,
+    VisionProcessorRegistry,
 };
 pub use processors::{
     DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,

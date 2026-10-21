@@ -64,6 +64,18 @@ impl PreprocessedEncoderInputs {
     }
 }
 
+/// Request-scoped inputs to one preprocessing call, beside the model's static
+/// [`PreProcessorConfig`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VisionPreprocessingContext {
+    /// Context tokens left for the call's images: the engine's context length
+    /// less the prompt's text tokens. A processor that sizes images by it keeps
+    /// back its own reserve and shares the rest among the call's images, so a
+    /// caller that sets it preprocesses a request's images in one call.
+    /// `None` sizes each image as if it were alone.
+    pub token_budget: Option<usize>,
+}
+
 /// Trait for model-specific vision preprocessors.
 ///
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
@@ -115,6 +127,18 @@ pub trait VisionPreProcessor: Send + Sync {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// [`preprocess`](Self::preprocess) under a request's context. A processor
+    /// whose output does not depend on the request keeps this default, which
+    /// ignores the context.
+    fn preprocess_with_context(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        _context: &VisionPreprocessingContext,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess(images, config)
+    }
 
     /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
     /// when the processor can lay the patches out and normalize them in one

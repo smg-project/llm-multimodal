@@ -48,7 +48,7 @@ pub use types::{
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};
 pub use vision::{
     DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionProcessorRegistry,
+    VisionPreProcessor, VisionPreprocessingContext, VisionProcessorRegistry,
 };
 
 /// Support for this crate's unit tests.

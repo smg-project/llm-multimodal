@@ -5,6 +5,7 @@ pub mod error;
 mod fetch_policy;
 pub use fetch_policy::effective_allowed_domains;
 pub mod hasher;
+#[cfg(feature = "hf-hub")]
 pub mod hub;
 pub mod jpeg_turbo;
 pub mod media;

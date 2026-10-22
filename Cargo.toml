@@ -40,7 +40,9 @@ rayon = "1.12"
 rustfft = "6.4"
 symphonia = { version = "0.6", default-features = false, features = ["all"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgproc", "videoio"], optional = true }
-reqwest = { version = "0.13.4", default-features = false, features = ["stream", "rustls"] }
+# No TLS backend: the media connector takes its `ClientBuilder` from the caller,
+# whose own reqwest features pick the backend.
+reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = { version = "1.0", features = ["preserve_order"] }
@@ -62,6 +64,9 @@ npyz = "0.9"
 zip = "9.0"
 # The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
 sha2 = "0.11"
+# The tests' clients use rustls with the ring provider they install, as in the
+# SMG workspace.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The wire benchmark measures the process's CPU time.
 rustix = { version = "1", default-features = false, features = ["time"] }

@@ -9,8 +9,11 @@
     clippy::print_stderr
 )]
 use image::{DynamicImage, RgbImage};
-use llm_multimodal::vision::{
-    preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
+use llm_multimodal::{
+    types::Modality,
+    vision::{
+        preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
+    },
 };
 
 fn make(w: u32, h: u32) -> DynamicImage {
@@ -55,8 +58,8 @@ const CASES: &[(u32, u32)] = &[(560, 420), (840, 560), (1280, 960)];
 const EXPECTED: &[u64] = &[0x776d46f52782791d, 0x12257fb9b357d2d1, 0xcfe5dc6b41292ea5];
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
-    let proc = Qwen3VLProcessor::new();
-    let res = proc.preprocess(&[make(w, h)], &config()).unwrap();
+    let proc = Qwen3VLProcessor::from_config_for(&config(), Modality::Image);
+    let res = proc.preprocess(&[make(w, h)]).unwrap();
     let flat = res.encoder_input_flat();
     (fnv1a_f32(flat.as_ref()), flat.len())
 }

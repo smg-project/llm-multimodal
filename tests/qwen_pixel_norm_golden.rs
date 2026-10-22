@@ -60,7 +60,7 @@ fn qwen_pixel_values_match_the_reference_processors() {
             .expect("preprocessor config");
         let processor = processor_for(name, &config);
         let output = processor
-            .preprocess(std::slice::from_ref(&image), &config)
+            .preprocess(std::slice::from_ref(&image))
             .expect("preprocess");
 
         let expected_shape: Vec<usize> = entry["shape"]

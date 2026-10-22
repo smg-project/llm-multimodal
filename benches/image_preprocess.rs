@@ -23,6 +23,7 @@ use llm_multimodal::{
         processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
         transforms, VisionPreProcessor,
     },
+    Modality,
 };
 
 /// Create a synthetic RGB image with some variation (not all zeros).
@@ -42,7 +43,6 @@ fn load_preprocessor_config(model_path: &str) -> Option<PreProcessorConfig> {
 // ── Full pipeline benchmarks ─────────────────────────────────────
 
 fn bench_qwen3_vl(c: &mut Criterion) {
-    let processor = Qwen3VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen3-VL-8B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -50,6 +50,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -67,7 +68,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -83,7 +84,7 @@ fn bench_qwen3_vl(c: &mut Criterion) {
             BenchmarkId::new("640x480", format!("batch{batch_size}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -102,14 +103,13 @@ fn bench_qwen3_vl(c: &mut Criterion) {
         let image = make_test_image(w, h);
         let images = [image];
         group.bench_with_input(BenchmarkId::new("single", label), &images, |b, imgs| {
-            b.iter(|| processor.preprocess(imgs, &config).unwrap());
+            b.iter(|| processor.preprocess(imgs).unwrap());
         });
     }
     group.finish();
 }
 
 fn bench_qwen2_vl(c: &mut Criterion) {
-    let processor = Qwen2VLProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/Qwen/Qwen2-VL-2B-Instruct").unwrap_or_else(|| {
             PreProcessorConfig::from_json(
@@ -117,6 +117,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             )
             .unwrap()
         });
+    let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[(224, 224), (640, 480), (1024, 768), (1920, 1080)];
 
@@ -128,7 +129,7 @@ fn bench_qwen2_vl(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -136,7 +137,6 @@ fn bench_qwen2_vl(c: &mut Criterion) {
 }
 
 fn bench_llama4(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -145,6 +145,7 @@ fn bench_llama4(c: &mut Criterion) {
                 )
                 .unwrap()
             });
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
 
     let sizes: &[(u32, u32)] = &[
         (224, 224),
@@ -162,7 +163,7 @@ fn bench_llama4(c: &mut Criterion) {
             BenchmarkId::new("single", format!("{w}x{h}")),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
     }
@@ -229,7 +230,6 @@ fn bench_individual_steps(c: &mut Criterion) {
 }
 
 fn bench_llama4_steps(c: &mut Criterion) {
-    let processor = Llama4VisionProcessor::new();
     let config =
         load_preprocessor_config("/raid/models/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8")
             .unwrap_or_else(|| {
@@ -238,6 +238,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
                 )
                 .unwrap()
             });
+    let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
 
     // 1024x768 is the worst case (1.8x slower than HF)
     let sizes: &[(u32, u32)] = &[(640, 480), (1024, 768), (1920, 1080)];
@@ -252,7 +253,7 @@ fn bench_llama4_steps(c: &mut Criterion) {
             &image,
             |b, img| {
                 let imgs = [img.clone()];
-                b.iter(|| processor.preprocess(&imgs, &config).unwrap());
+                b.iter(|| processor.preprocess(&imgs).unwrap());
             },
         );
 
@@ -492,7 +493,6 @@ const WIRE_DTYPES: [EncoderDtype; 2] = [EncoderDtype::BFloat16, EncoderDtype::Fl
 fn bench_wire_arms<P: VisionPreProcessor>(
     group: &mut BenchmarkGroup<'_, CpuTime>,
     processor: &P,
-    config: &PreProcessorConfig,
     class: &str,
     images: &[DynamicImage],
     with_float16: bool,
@@ -514,7 +514,7 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             |b, imgs| {
                 b.iter(|| {
                     processor
-                        .preprocess(imgs, config)
+                        .preprocess(imgs)
                         .unwrap()
                         .encoder_input
                         .into_bytes_as(dtype)
@@ -528,7 +528,7 @@ fn bench_wire_arms<P: VisionPreProcessor>(
             |b, imgs| {
                 b.iter(|| {
                     processor
-                        .preprocess_wire(imgs, config, dtype)
+                        .preprocess_wire(imgs, dtype)
                         .expect("the pixel-byte processors write wires")
                         .unwrap()
                         .encoder_input
@@ -563,7 +563,7 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
     )
     .unwrap();
 
-    let qwen3 = Qwen3VLProcessor::new();
+    let qwen3 = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
     // (width, height, measured in float16 too)
     let qwen3_classes: &[(u32, u32, bool)] = &[
         (320, 256, false),
@@ -587,11 +587,11 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
         let target = qwen3.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
         let images = [make_test_image(w, h)];
-        bench_wire_arms(&mut group, &qwen3, &config, &class, &images, with_float16);
+        bench_wire_arms(&mut group, &qwen3, &class, &images, with_float16);
     }
     group.finish();
 
-    let qwen2 = Qwen2VLProcessor::new();
+    let qwen2 = Qwen2VLProcessor::from_preprocessor_config(&config);
     let qwen2_classes: &[(u32, u32, bool)] = &[
         (644, 476, true),
         (640, 480, false),
@@ -607,7 +607,7 @@ fn bench_wire_write(c: &mut Criterion<CpuTime>) {
         let target = qwen2.smart_resize(h as usize, w as usize).unwrap();
         let class = wire_class(w, h, target);
         let images = [make_test_image(w, h)];
-        bench_wire_arms(&mut group, &qwen2, &config, &class, &images, with_float16);
+        bench_wire_arms(&mut group, &qwen2, &class, &images, with_float16);
     }
     group.finish();
 }

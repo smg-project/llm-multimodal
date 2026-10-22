@@ -10,8 +10,7 @@
 
 use image::{DynamicImage, RgbImage};
 use llm_multimodal::vision::{
-    preprocessor_config::PreProcessorConfig, processor::ModelSpecificValue,
-    processors::DeepseekV41Processor, VisionPreProcessor,
+    processor::ModelSpecificValue, processors::DeepseekV41Processor, VisionPreProcessor,
 };
 use serde::Deserialize;
 
@@ -113,7 +112,6 @@ fn preprocess_matches_the_reference_fingerprints() {
     assert!(document.cases.len() >= 12, "expected the recorded case set");
 
     let processor = DeepseekV41Processor::new();
-    let config = PreProcessorConfig::default();
     for case in &document.cases {
         let image = match &case.source {
             Source::Seed { seed } => make_seeded_image(case.width, case.height, *seed),
@@ -133,7 +131,7 @@ fn preprocess_matches_the_reference_fingerprints() {
         );
 
         let out = processor
-            .preprocess(std::slice::from_ref(&image), &config)
+            .preprocess(std::slice::from_ref(&image))
             .unwrap_or_else(|e| panic!("{}: preprocess failed: {e}", case.name));
 
         assert_eq!(

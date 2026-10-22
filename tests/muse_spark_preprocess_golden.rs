@@ -21,8 +21,7 @@ use llm_multimodal::{
     types::VideoSamplingInfo,
     vision::{
         preprocessor_config::PreProcessorConfig, processor::ModelSpecificValue,
-        processors::MuseSparkVisionProcessor, PreprocessedEncoderInputs, VisionPreProcessor,
-        VisionProcessorRegistry,
+        PreprocessedEncoderInputs, VideoClipOptions,
     },
     Modality, PromptReplacement, TokenId,
 };
@@ -241,7 +240,6 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         document.reference
     );
     let config = PreProcessorConfig::from_value(document.image_config).expect("image config");
-    let processor = MuseSparkVisionProcessor::new();
     let registry = ModelRegistry::new();
     let model_config = model_config();
     let metadata = ModelMetadata {
@@ -250,12 +248,15 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         config: &model_config,
     };
     let spec = registry.lookup(&metadata).expect("the family's spec");
+    let processor = spec
+        .vision_processor(&model_config, &config, Modality::Image)
+        .expect("the family's image processor");
 
     for case in &document.cases {
         let name = &case.name;
         let images = images_for(case);
         let out = processor
-            .preprocess(&images, &config)
+            .preprocess(&images)
             .unwrap_or_else(|e| panic!("{name}: preprocess: {e}"));
         let grid: Vec<i64> = match &case.grid_thw {
             serde_json::Value::Array(rows) if rows.first().is_some_and(|v| v.is_array()) => rows
@@ -282,7 +283,7 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         for (image, &count) in images.iter().zip(&tokens) {
             assert_eq!(
                 processor
-                    .calculate_num_tokens(image.width(), image.height(), &config)
+                    .calculate_num_tokens(image.width(), image.height())
                     .expect("count"),
                 count,
                 "{name}: calculate_num_tokens"
@@ -315,15 +316,24 @@ fn images_match_the_reference_fingerprints_and_expansions() {
         }
     }
 
-    // The registry resolves the family's processor by model_type and by id.
-    let processors = VisionProcessorRegistry::with_defaults();
-    for (model_id, model_type) in [
-        ("/models/local-checkpoint", Some("muse_spark")),
-        ("meta-models/Muse-Spark-open-816B-A42B-NVFP4", None),
+    // The family's spec, resolved by model_type and by id, builds its processor.
+    for (model_id, model_config) in [
+        (
+            "/models/local-checkpoint",
+            json!({"model_type": "muse_spark"}),
+        ),
+        ("meta-models/Muse-Spark-open-816B-A42B-NVFP4", json!({})),
     ] {
-        let found = processors
-            .find(model_id, model_type)
-            .unwrap_or_else(|| panic!("no processor for {model_id}"));
+        let metadata = ModelMetadata {
+            model_id,
+            tokenizer: &ByteTokenizer,
+            config: &model_config,
+        };
+        let found = registry
+            .lookup(&metadata)
+            .unwrap_or_else(|| panic!("no spec for {model_id}"))
+            .vision_processor(&model_config, &config, Modality::Image)
+            .unwrap_or_else(|e| panic!("no processor for {model_id}: {e}"));
         assert_eq!(found.model_name(), "muse_spark");
     }
 }
@@ -333,7 +343,6 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
     let document: GoldenDocument =
         serde_json::from_str(GOLDEN).expect("golden document must match the schema");
     let config = PreProcessorConfig::from_value(document.video_config).expect("video config");
-    let processor = MuseSparkVisionProcessor::new();
     let registry = ModelRegistry::new();
     let model_config = model_config();
     let metadata = ModelMetadata {
@@ -342,6 +351,9 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
         config: &model_config,
     };
     let spec = registry.lookup(&metadata).expect("the family's spec");
+    let processor = spec
+        .vision_processor(&model_config, &config, Modality::Video)
+        .expect("the family's video processor");
     let sampling = spec.video_frame_sampling_with(Some(&config));
     assert_eq!(
         sampling,
@@ -374,7 +386,7 @@ fn clips_match_the_reference_sampling_fingerprints_and_stamps() {
             })
             .collect();
         let out = processor
-            .preprocess_video(&frames, &config)
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(fetch.sample_fps))
             .unwrap_or_else(|e| panic!("{name}: preprocess_video: {e}"));
         assert_eq!(
             int_tensor(&out, "video_grid_thw"),

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use serde_json::Value;
+
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -10,7 +12,7 @@ use crate::{
     types::{
         FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{Glm53FlashProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 const IMAGE: &str = "<|image|>";
@@ -249,6 +251,29 @@ impl ModelProcessorSpec for Glm53FlashSpec {
             }
         }
         Ok(limits)
+    }
+
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Glm53FlashProcessor::from_config_for(preprocessor_config, modality).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(

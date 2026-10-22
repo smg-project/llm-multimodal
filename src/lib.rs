@@ -47,8 +47,8 @@ pub use types::{
 // Re-export vision processing components
 pub use vision::execution::{configure_parallelism, parallelism, Parallelism, POOL_THREADS_ENV};
 pub use vision::{
-    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig,
-    VisionPreProcessor, VisionPreprocessingContext, VisionProcessorRegistry,
+    DeepseekV41Processor, LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VideoClipOptions,
+    VisionPreProcessor, VisionPreprocessingContext,
 };
 
 /// Support for this crate's unit tests.

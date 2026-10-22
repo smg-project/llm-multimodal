@@ -19,8 +19,8 @@ use llm_multimodal::{
     audio::{DecodedAudio, ParakeetAudioProcessor},
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     vision::{
-        preprocessor_config::PreProcessorConfig, processors::NemotronOmniProcessor,
-        transforms::rgb_bytes, VisionPreProcessor,
+        processors::NemotronOmniProcessor, transforms::rgb_bytes, VideoClipOptions,
+        VisionPreProcessor,
     },
     RgbFrameRef,
 };
@@ -175,9 +175,7 @@ fn images_match_the_reference_tiler() {
                 .expect("fixture image decodes"),
             ),
         };
-        let out = processor
-            .preprocess(&[image], &PreProcessorConfig::default())
-            .expect("image preprocesses");
+        let out = processor.preprocess(&[image]).expect("image preprocesses");
         assert_eq!(
             out.feature_token_counts,
             vec![case.tokens],
@@ -226,7 +224,7 @@ fn video_frames_match_the_reference_sizing() {
             })
             .collect();
         let out = processor
-            .preprocess_video_rgb(&refs, &PreProcessorConfig::default())
+            .preprocess_video_rgb(&refs, &VideoClipOptions::sampled_at(2.0))
             .expect("video preprocesses");
         assert_eq!(
             out.feature_token_counts,

@@ -10,7 +10,7 @@ use crate::{
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, VisionPreProcessor},
 };
 
 /// The format of the encoder inputs a spec's processors emit, which decides
@@ -44,6 +44,12 @@ pub enum ModelRegistryError {
     UnsupportedModality {
         spec: &'static str,
         modality: Modality,
+    },
+    #[error("the {modality} processor of model spec {spec} cannot serve its preprocessor config: {reason}")]
+    InvalidPreprocessorConfig {
+        spec: &'static str,
+        modality: Modality,
+        reason: String,
     },
     #[error("model spec {spec} supports at most {limit} {modality} inputs; got {requested}")]
     ModalityLimitExceeded {
@@ -351,6 +357,27 @@ pub trait ModelProcessorSpec: Send + Sync {
                 .get(&modality)
                 .copied()
                 .or_else(|| modality_limit_override(modality))
+        })
+    }
+
+    /// Build the vision preprocessor of `modality` (image or video) for this
+    /// model from that modality's preprocessor config.
+    ///
+    /// The spec that owns a model's prompt and placeholder logic also selects
+    /// its vision processors, so the two cannot disagree. A caller builds each
+    /// processor once per loaded model and reuses it across requests; a
+    /// config the processor cannot serve is an error here rather than on a
+    /// request. A modality the spec does not preprocess is
+    /// [`ModelRegistryError::UnsupportedModality`].
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        _preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        Err(ModelRegistryError::UnsupportedModality {
+            spec: self.name(),
+            modality,
         })
     }
 

@@ -14,10 +14,11 @@
 use image::{DynamicImage, RgbImage};
 use llm_multimodal::{
     registry::{ModelMetadata, ModelRegistry, Tokenizer},
+    types::Modality,
     vision::{
         preprocessor_config::PreProcessorConfig, processor::ModelSpecificValue,
-        processors::Gemma4Processor, PreprocessedEncoderInputs, VisionPreProcessor,
-        VisionProcessorRegistry,
+        processors::Gemma4Processor, PreprocessedEncoderInputs, VideoClipOptions,
+        VisionPreProcessor,
     },
 };
 use serde::Deserialize;
@@ -203,9 +204,12 @@ fn preprocess_matches_the_reference_fingerprints() {
     );
     assert!(document.cases.len() >= 40, "expected the recorded case set");
 
-    let processor = Gemma4Processor::new();
     let image_config = PreProcessorConfig::from_json(IMAGE_CONFIG).expect("image config");
     let video_config = PreProcessorConfig::from_json(VIDEO_CONFIG).expect("video config");
+    let image_processor =
+        Gemma4Processor::from_config_for(&image_config, Modality::Image).expect("image processor");
+    let video_processor =
+        Gemma4Processor::from_config_for(&video_config, Modality::Video).expect("video processor");
     for case in &document.cases {
         let images = images_for(case);
         assert_eq!(
@@ -219,8 +223,8 @@ fn preprocess_matches_the_reference_fingerprints() {
         };
         match case.max_soft_tokens {
             280 => {
-                let out = processor
-                    .preprocess(&images, &image_config)
+                let out = image_processor
+                    .preprocess(&images)
                     .unwrap_or_else(|e| panic!("{}: preprocess failed: {e}", case.name));
                 assert_eq!(
                     out.feature_token_counts,
@@ -229,8 +233,8 @@ fn preprocess_matches_the_reference_fingerprints() {
                     case.name
                 );
                 assert_eq!(
-                    processor
-                        .calculate_num_tokens(case.width, case.height, &image_config)
+                    image_processor
+                        .calculate_num_tokens(case.width, case.height)
                         .unwrap(),
                     tokens,
                     "{}: calculate_num_tokens",
@@ -240,8 +244,8 @@ fn preprocess_matches_the_reference_fingerprints() {
             }
             70 => {
                 // The engine's video frames: the image processor at the video budget.
-                let out = processor
-                    .preprocess_video(&images, &video_config)
+                let out = video_processor
+                    .preprocess_video(&images, &VideoClipOptions::sampled_at(2.0))
                     .unwrap_or_else(|e| panic!("{}: preprocess_video failed: {e}", case.name));
                 assert_eq!(
                     out.feature_token_counts,
@@ -256,8 +260,8 @@ fn preprocess_matches_the_reference_fingerprints() {
     }
     for case in &document.video_cases {
         let frames = images_for(case);
-        let out = processor
-            .preprocess_video(&frames, &video_config)
+        let out = video_processor
+            .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
             .unwrap_or_else(|e| panic!("{}: preprocess_video failed: {e}", case.name));
         let Tokens::Many(per_frame) = &case.num_soft_tokens else {
             panic!("{}: a clip records one count per frame", case.name);
@@ -303,10 +307,10 @@ impl Tokenizer for VocabTokenizer {
     }
 }
 
-/// Both registries resolve the family: the model spec by `model_type`, the
-/// vision processor by id or `model_type`.
+/// The model spec resolves the family by `model_type` and builds its vision
+/// processor.
 #[test]
-fn both_registries_resolve_the_family() {
+fn the_spec_resolves_the_family_and_builds_its_processor() {
     let config = json!({
         "model_type": "gemma4",
         "image_token_id": 258880,
@@ -324,11 +328,9 @@ fn both_registries_resolve_the_family() {
     let spec = registry.lookup(&metadata).expect("gemma4 spec");
     assert_eq!(spec.name(), "gemma4");
     assert_eq!(spec.placeholder_token(&metadata).unwrap(), "<|image|>");
-    let processors = VisionProcessorRegistry::with_defaults();
     assert_eq!(
-        processors
-            .find("/models/local-checkpoint", Some("gemma4"))
+        spec.vision_processor(&config, &PreProcessorConfig::default(), Modality::Image)
             .map(|processor| processor.model_name()),
-        Some("gemma4")
+        Ok("gemma4")
     );
 }

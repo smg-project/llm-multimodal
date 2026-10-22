@@ -16,7 +16,7 @@ use std::{fs, path::Path, process::Command};
 use llm_multimodal::{
     vision::Qwen3VLProcessor, FieldLayout, MediaConnector, MediaConnectorConfig, MediaSource,
     Modality, ModelMetadata, ModelRegistry, ModelSpecificValue, PreProcessorConfig, Tokenizer,
-    VideoFetchConfig, VisionPreProcessor,
+    VideoClipOptions, VideoFetchConfig, VisionPreProcessor,
 };
 use serde_json::{json, Value};
 
@@ -107,9 +107,9 @@ async fn qwen3_vl_video_matches_the_reference_layout() {
     // The family's processor on those frames, with the family's video values.
     let config =
         PreProcessorConfig::from_value(golden["preprocessor_config"].clone()).expect("config");
-    let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
+    let processor = Qwen3VLProcessor::from_config_for(&config, Modality::Video);
     let output = processor
-        .preprocess_video(&frames, &config)
+        .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
         .expect("video preprocess");
 
     let expected_shape = as_usizes(&golden["outputs"]["pixel_values_videos"]["shape"]);

@@ -15,6 +15,7 @@ use llm_multimodal::{
         processors::{Qwen2VLProcessor, Qwen3VLProcessor},
         VisionPreProcessor,
     },
+    Modality,
 };
 
 fn image_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -83,8 +84,14 @@ fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicI
     )
     .unwrap();
     let processors: [(&str, Box<dyn VisionPreProcessor>); 2] = [
-        ("qwen3_vl", Box::new(Qwen3VLProcessor::new())),
-        ("qwen2_vl", Box::new(Qwen2VLProcessor::new())),
+        (
+            "qwen3_vl",
+            Box::new(Qwen3VLProcessor::from_config_for(&config, Modality::Image)),
+        ),
+        (
+            "qwen2_vl",
+            Box::new(Qwen2VLProcessor::from_preprocessor_config(&config)),
+        ),
     ];
     assert!(
         images.len() >= 10,
@@ -95,12 +102,12 @@ fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicI
     for (processor_name, processor) in &processors {
         for (file, image) in images {
             let batch = std::slice::from_ref(image);
-            let two_pass = match processor.preprocess(batch, &config) {
+            let two_pass = match processor.preprocess(batch) {
                 Ok(two_pass) => two_pass,
                 Err(error) => {
                     // A size the rule refuses is refused on both paths.
                     let one_pass = processor
-                        .preprocess_wire(batch, &config, EncoderDtype::BFloat16)
+                        .preprocess_wire(batch, EncoderDtype::BFloat16)
                         .expect("the pixel-byte processors write wires");
                     assert!(one_pass.is_err(), "{processor_name} {file}: {error}");
                     continue;
@@ -112,7 +119,7 @@ fn compare_the_one_pass_wire_with_the_two_pass_bytes(images: &[(String, DynamicI
                 EncoderDtype::Float32,
             ] {
                 let one_pass = processor
-                    .preprocess_wire(batch, &config, dtype)
+                    .preprocess_wire(batch, dtype)
                     .expect("the pixel-byte processors write wires")
                     .unwrap();
                 assert_eq!(

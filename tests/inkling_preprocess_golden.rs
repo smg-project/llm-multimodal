@@ -173,7 +173,6 @@ fn inkling_audio_preprocess_matches_checked_in_golden() {
 #[test]
 fn inkling_vision_preprocess_matches_checked_in_golden() {
     let golden = load_golden();
-    let processor = InklingImageProcessor::new();
     for case in &golden.vision_cases {
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
@@ -184,8 +183,10 @@ fn inkling_vision_preprocess_matches_checked_in_golden() {
             ..PreProcessorConfig::default()
         };
         let image = make_seeded_image(case.width, case.height, case.seed);
+        let processor =
+            InklingImageProcessor::from_preprocessor_config(&config).expect("valid config");
         let result = processor
-            .preprocess(&[image], &config)
+            .preprocess(&[image])
             .expect("Inkling vision preprocessing failed");
 
         assert_eq!(

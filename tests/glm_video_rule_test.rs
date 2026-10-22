@@ -9,8 +9,8 @@
 use llm_multimodal::{
     media::sampled_frame_indices, vision::Glm53FlashProcessor, FrameSampling, MediaItemInfo,
     Modality, ModelMetadata, ModelProcessorSpec, ModelRegistry, ModelSpecificValue,
-    PreProcessorConfig, RgbFrameRef, TokenId, Tokenizer, VideoFetchConfig, VideoSamplingInfo,
-    VisionPreProcessor,
+    PreProcessorConfig, RgbFrameRef, TokenId, Tokenizer, VideoClipOptions, VideoFetchConfig,
+    VideoSamplingInfo, VisionPreProcessor,
 };
 
 const IMAGE_ID: u32 = 154854;
@@ -135,8 +135,9 @@ fn a_clip_costs_what_it_costs_on_the_engines_own_server() {
         })
         .collect();
     let config = video_config();
-    let output = Glm53FlashProcessor::new()
-        .preprocess_video_rgb(&frames, &config)
+    let output = Glm53FlashProcessor::from_config_for(&config, Modality::Video)
+        .expect("video processor")
+        .preprocess_video_rgb(&frames, &VideoClipOptions::sampled_at(2.0))
         .expect("preprocessed clip");
     assert_eq!(grid(&output), vec![16, 68, 110]);
     assert_eq!(output.feature_token_counts, vec![16 * 34 * 55]);
@@ -209,8 +210,9 @@ fn a_clip_the_loader_keeps_whole_is_resampled_at_the_processors_rate() {
             data: &pixels,
         })
         .collect();
-    let output = Glm53FlashProcessor::new()
-        .preprocess_video_rgb(&frames, &config)
+    let output = Glm53FlashProcessor::from_config_for(&config, Modality::Video)
+        .expect("video processor")
+        .preprocess_video_rgb(&frames, &VideoClipOptions::sampled_at(2.0))
         .expect("preprocessed clip");
     assert_eq!(grid(&output), vec![4, 74, 122]);
     assert_eq!(output.feature_token_counts, vec![4 * 37 * 61]);

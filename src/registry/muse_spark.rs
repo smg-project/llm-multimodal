@@ -39,8 +39,11 @@ use crate::{
         VideoSamplingInfo,
     },
     vision::{
-        processors::muse_spark::{DEFAULT_MERGE_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE},
-        PreProcessorConfig,
+        processors::{
+            muse_spark::{DEFAULT_MERGE_SIZE, DEFAULT_TEMPORAL_PATCH_SIZE},
+            MuseSparkVisionProcessor,
+        },
+        PreProcessorConfig, VisionPreProcessor,
     },
 };
 
@@ -472,6 +475,23 @@ impl ModelProcessorSpec for MuseSparkSpec {
 
     /// No audio tower is a model without audio; a tower whose geometry the
     /// processor cannot serve is an error naming the field.
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                MuseSparkVisionProcessor::from_preprocessor_config(preprocessor_config),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn audio_processor(
         &self,
         model_config: &Value,

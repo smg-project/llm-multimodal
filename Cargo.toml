@@ -44,7 +44,6 @@ opencv = { version = "0.99.0", default-features = false, features = ["clang-runt
 # whose own reqwest features pick the backend.
 reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_bytes = "0.11"
 serde_json = { version = "1.0", features = ["preserve_order"] }
 tempfile = "3.27"
 thiserror = "2.0.18"

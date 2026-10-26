@@ -57,7 +57,8 @@ impl KimiK25Processor {
                 fixed_output_tokens: None,
                 transparent_bg_config: None,
                 transparent_bg_fill_stage: TransparentBgFillStage::BeforeResize,
-            }),
+            })
+            .with_preprocessor_config(config),
         }
     }
 
@@ -100,17 +101,16 @@ impl VisionPreProcessor for KimiK25Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        self.inner.preprocess_images(images, config)
+        self.inner.preprocess_images(images)
     }
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
         self.inner.calculate_num_tokens(width, height)
     }
     fn model_name(&self) -> &'static str {
         "kimi-k2.5"
     }
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }

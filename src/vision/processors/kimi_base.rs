@@ -75,6 +75,8 @@ pub(crate) struct ResizeConfig {
 
 #[derive(Debug, Clone)]
 pub(crate) struct KimiMoonViTProcessor {
+    mean: [f64; 3],
+    std: [f64; 3],
     patch_size: usize,
     merge_size: usize,
     in_patch_limit: usize,
@@ -85,8 +87,16 @@ pub(crate) struct KimiMoonViTProcessor {
 }
 
 impl KimiMoonViTProcessor {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+        self.mean = config.get_image_mean();
+        self.std = config.get_image_std();
+        self
+    }
+
     pub(crate) fn new(config: MoonViTConfig) -> Self {
         Self {
+            mean: PreProcessorConfig::default().get_image_mean(),
+            std: PreProcessorConfig::default().get_image_std(),
             patch_size: config.patch_size,
             merge_size: config.merge_size,
             in_patch_limit: config.in_patch_limit,
@@ -326,15 +336,14 @@ impl KimiMoonViTProcessor {
     pub(crate) fn preprocess_images(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
-        let mean = config.get_image_mean();
-        let std = config.get_image_std();
+        let mean = self.mean;
+        let std = self.std;
 
         // Pre-size the pooled batch buffer exactly (patch_features per patch =
         // 3 * patch_size^2; this is the data plane's hottest allocation).
@@ -494,7 +503,6 @@ mod tests {
 
     #[test]
     fn test_preprocess_4d_output() {
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             do_normalize: Some(true),
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
@@ -503,7 +511,9 @@ mod tests {
         };
 
         let image = create_test_image(600, 400, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = KimiK25Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
 
         // 4D output: [total_patches, 3, 14, 14]
         assert_eq!(result.encoder_input.ndim(), 4);
@@ -519,13 +529,12 @@ mod tests {
     #[test]
     fn test_preprocess_multiple_images() {
         let p = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
         let images = vec![
             create_test_image(600, 400, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = p.preprocess(&images, &config).unwrap();
+        let result = p.preprocess(&images).unwrap();
 
         assert_eq!(result.item_sizes.len(), 2);
         assert_eq!(result.feature_token_counts.len(), 2);
@@ -552,8 +561,7 @@ mod tests {
     #[test]
     fn test_calculate_num_tokens() {
         let p = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
-        let tokens = p.calculate_num_tokens(600, 400, &config);
+        let tokens = p.calculate_num_tokens(600, 400);
         assert_eq!(tokens, 330);
     }
 
@@ -574,7 +582,6 @@ mod tests {
 
     #[test]
     fn test_zero_padding_applied() {
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
@@ -584,7 +591,9 @@ mod tests {
         // 100x100 white image — after normalization: (255/255 - 0.5) / 0.5 = 1.0
         // Padded region: (0/255 - 0.5) / 0.5 = -1.0
         let image = create_test_image(100, 100, Rgb([255, 255, 255]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = KimiK25Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
 
         let flat = result.encoder_input_flat();
         // Padded region should be normalized black (-1.0)
@@ -605,14 +614,15 @@ mod tests {
     #[test]
     fn test_preprocess_tiny_image() {
         // 1x1 image should not panic — padded to 28x28
-        let p = KimiK25Processor::new();
         let config = PreProcessorConfig {
             image_mean: Some(KIMI_K25_MEAN.to_vec()),
             image_std: Some(KIMI_K25_STD.to_vec()),
             ..Default::default()
         };
         let image = create_test_image(1, 1, Rgb([128, 128, 128]));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = KimiK25Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
         assert_eq!(result.encoder_input.ndim(), 4);
         assert!(result.encoder_input.shape()[0] > 0);
         assert!(result.feature_token_counts[0] > 0);
@@ -621,8 +631,7 @@ mod tests {
     #[test]
     fn test_preprocess_empty_batch_returns_error() {
         let p = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
-        let result = p.preprocess(&[], &config);
+        let result = p.preprocess(&[]);
         assert!(result.is_err());
     }
 

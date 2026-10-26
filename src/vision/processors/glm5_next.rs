@@ -98,24 +98,15 @@ impl Glm5NextProcessor {
         let max_image_tokens = config
             .get_extra::<usize>("max_image_tokens")
             .unwrap_or(DEFAULT_MAX_IMAGE_TOKENS);
-        Self::with_config(
+        let mut processor = Self::with_config(
             patch_size,
             merge_size,
             temporal_patch_size,
             min_image_tokens,
             max_image_tokens,
-        )
-    }
-
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.has_structural_overrides()
-            || config.extra.contains_key("min_image_tokens")
-            || config.extra.contains_key("max_image_tokens")
-        {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
+        );
+        processor.inner = processor.inner.with_preprocessor_config(config);
+        processor
     }
 
     pub fn patch_size(&self) -> usize {
@@ -159,24 +150,20 @@ impl VisionPreProcessor for Glm5NextProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.preprocess(images, config)
+        self.inner.preprocess(images)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.calculate_num_tokens(width, height, config)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        self.inner.calculate_num_tokens(width, height)
     }
 
     fn model_name(&self) -> &'static str {
         self.inner.model_name()
     }
 
-    fn get_processed_size(&self, config: &PreProcessorConfig) -> Option<(u32, u32)> {
-        let processor = self.with_preprocessor_config(config);
-        processor.inner.get_processed_size(config)
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
+        self.inner.get_processed_size()
     }
 }
 
@@ -200,17 +187,14 @@ mod tests {
     #[test]
     fn glm_448_image_has_256_tokens() {
         let processor = Glm5NextProcessor::new();
-        let config = PreProcessorConfig::default();
-        assert_eq!(processor.calculate_num_tokens(448, 448, &config), 256);
+        assert_eq!(processor.calculate_num_tokens(448, 448), 256);
     }
 
     #[test]
     fn glm_preprocess_emits_grid_and_patch_counts() {
         let processor = Glm5NextProcessor::new();
         let image = DynamicImage::ImageRgb8(RgbImage::new(448, 448));
-        let out = processor
-            .preprocess(&[image], &PreProcessorConfig::default())
-            .unwrap();
+        let out = processor.preprocess(&[image]).unwrap();
         assert_eq!(out.feature_token_counts, vec![256]);
         match out.model_specific.get("image_grid_thw") {
             Some(ModelSpecificValue::IntTensor { data, shape }) => {

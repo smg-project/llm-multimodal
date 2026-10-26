@@ -16,7 +16,10 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::processors::deepseek_v41::COMPRESS_PAD_TO,
+    vision::{
+        processors::{deepseek_v41::COMPRESS_PAD_TO, DeepseekV41Processor},
+        PreProcessorConfig, VisionPreProcessor,
+    },
 };
 
 /// The placeholder text inlined at each image's position; the multimodal
@@ -51,6 +54,23 @@ impl DeepseekV41VisionSpec {
 }
 
 impl ModelProcessorSpec for DeepseekV41VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(DeepseekV41Processor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "deepseek_v41"
     }
@@ -175,9 +195,13 @@ mod tests {
         let tokenizer = TestTokenizer::new(&[]);
         let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         assert!(DeepseekV41VisionSpec.matches(&metadata(&tokenizer, &config)));
-        assert!(crate::VisionProcessorRegistry::with_defaults()
-            .find("/models/local-checkpoint", Some("deepseek_v41"))
-            .is_some());
+        assert!(DeepseekV41VisionSpec
+            .vision_processor(
+                &metadata(&tokenizer, &config),
+                &PreProcessorConfig::default(),
+                Modality::Image
+            )
+            .is_ok());
 
         // A text-only DeepSeek model with a neutral model id must not match.
         let other = json!({"model_type": "deepseek_v3"});

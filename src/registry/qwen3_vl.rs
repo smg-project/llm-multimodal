@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::Qwen3VLProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Qwen3VLVisionSpec;
@@ -125,6 +126,23 @@ impl Qwen3VLVisionSpec {
 }
 
 impl ModelProcessorSpec for Qwen3VLVisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(Qwen3VLProcessor::from_config_for(
+                config, modality,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "qwen3_vl"
     }

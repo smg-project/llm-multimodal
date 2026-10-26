@@ -6,6 +6,7 @@ use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::Glm5NextProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct Glm5NextVisionSpec;
@@ -22,6 +23,23 @@ impl Glm5NextVisionSpec {
 }
 
 impl ModelProcessorSpec for Glm5NextVisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(Glm5NextProcessor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "glm5_next"
     }
@@ -94,7 +112,8 @@ mod tests {
 
     use crate::{
         registry::{test_helpers::*, ModelMetadata, ModelRegistry},
-        types::ImageSize,
+        types::{ImageSize, Modality},
+        vision::PreProcessorConfig,
     };
 
     #[test]
@@ -120,5 +139,14 @@ mod tests {
             .unwrap();
         assert_eq!(replacements[0].tokens.len(), 256);
         assert!(replacements[0].tokens.iter().all(|&token| token == 154854));
+
+        let processor = spec
+            .vision_processor(&metadata, &PreProcessorConfig::default(), Modality::Image)
+            .expect("glm5_next image processor");
+        assert_eq!(processor.model_name(), "glm5_next");
+        assert_eq!(processor.calculate_num_tokens(448, 448), 256);
+        assert!(spec
+            .vision_processor(&metadata, &PreProcessorConfig::default(), Modality::Video)
+            .is_err());
     }
 }

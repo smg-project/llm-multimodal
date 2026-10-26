@@ -6,7 +6,10 @@ use crate::{
     audio::{AudioPreProcessor, InklingAudioProcessor},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::{processor::PreprocessedEncoderInputs, PreProcessorConfig},
+    vision::{
+        processor::PreprocessedEncoderInputs, processors::InklingImageProcessor,
+        PreProcessorConfig, VisionPreProcessor,
+    },
 };
 
 const IMAGE_MARKER_TOKEN: &str = "<|content_image|>";
@@ -35,6 +38,23 @@ impl InklingSpec {
 }
 
 impl ModelProcessorSpec for InklingSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(InklingImageProcessor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "inkling"
     }
@@ -94,11 +114,11 @@ impl ModelProcessorSpec for InklingSpec {
 
     fn audio_processor(
         &self,
-        model_config: &Value,
+        metadata: &ModelMetadata,
         preprocessor_config: &PreProcessorConfig,
     ) -> Option<Box<dyn AudioPreProcessor>> {
         Some(Box::new(InklingAudioProcessor::from_configs(
-            model_config,
+            metadata.config,
             preprocessor_config,
         )))
     }

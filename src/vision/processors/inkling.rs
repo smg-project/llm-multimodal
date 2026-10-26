@@ -23,6 +23,8 @@ const PAD_RAW_VALUE: f32 = -1.0 / 255.0;
 #[derive(Debug, Clone)]
 pub struct InklingImageProcessor {
     patch_size: usize,
+    mean: [f64; 3],
+    std: [f64; 3],
 }
 
 impl Default for InklingImageProcessor {
@@ -35,25 +37,21 @@ impl InklingImageProcessor {
     pub fn new() -> Self {
         Self {
             patch_size: DEFAULT_PATCH_SIZE,
+            mean: INKLING_IMAGE_MEAN,
+            std: INKLING_IMAGE_STD,
         }
     }
 
     pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
             patch_size: config.get_patch_size(DEFAULT_PATCH_SIZE),
+            mean: config.image_mean_3().unwrap_or(INKLING_IMAGE_MEAN),
+            std: config.image_std_3().unwrap_or(INKLING_IMAGE_STD),
         }
     }
 
     pub fn patch_size(&self) -> usize {
         self.patch_size
-    }
-
-    fn with_preprocessor_config(&self, config: &PreProcessorConfig) -> Self {
-        if config.patch_size.is_some() {
-            Self::from_preprocessor_config(config)
-        } else {
-            self.clone()
-        }
     }
 
     fn grid(&self, width: usize, height: usize) -> Result<(usize, usize), TransformError> {
@@ -130,26 +128,24 @@ impl VisionPreProcessor for InklingImageProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
 
-        let processor = self.with_preprocessor_config(config);
-        let mean = config.image_mean_3().unwrap_or(INKLING_IMAGE_MEAN);
-        let std = config.image_std_3().unwrap_or(INKLING_IMAGE_STD);
+        let mean = self.mean;
+        let std = self.std;
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
 
         let mut patches = Vec::new();
         let mut num_patches = Vec::with_capacity(images.len());
         for image in images {
-            let count = processor.fill_image_patches(image, &mean, &std, &mut patches)?;
+            let count = self.fill_image_patches(image, &mean, &std, &mut patches)?;
             num_patches.push(count);
         }
 
         let total_patches: usize = num_patches.iter().sum();
-        let patch = processor.patch_size;
+        let patch = self.patch_size;
         let tensor_shape = vec![total_patches, 2, patch, patch, 3];
         let vision_patches_bthwc = patches.clone();
         let encoder_input =
@@ -178,9 +174,8 @@ impl VisionPreProcessor for InklingImageProcessor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        let processor = self.with_preprocessor_config(config);
-        let Ok((grid_h, grid_w)) = processor.grid(width as usize, height as usize) else {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
+        let Ok((grid_h, grid_w)) = self.grid(width as usize, height as usize) else {
             return 0;
         };
         grid_h * grid_w
@@ -190,7 +185,7 @@ impl VisionPreProcessor for InklingImageProcessor {
         "inkling"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -232,10 +227,7 @@ mod tests {
     fn preprocess_outputs_inkling_patch_shape() {
         let processor = InklingImageProcessor::new();
         let result = processor
-            .preprocess(
-                &[image(80, 40, Rgb([128, 128, 128]))],
-                &PreProcessorConfig::default(),
-            )
+            .preprocess(&[image(80, 40, Rgb([128, 128, 128]))])
             .unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[3, 2, 40, 40, 3]);
@@ -254,13 +246,10 @@ mod tests {
     fn preprocess_multiple_images_are_flattened_by_patch_count() {
         let processor = InklingImageProcessor::new();
         let result = processor
-            .preprocess(
-                &[
-                    image(80, 40, Rgb([128, 128, 128])),
-                    image(1, 1, Rgb([255, 255, 255])),
-                ],
-                &PreProcessorConfig::default(),
-            )
+            .preprocess(&[
+                image(80, 40, Rgb([128, 128, 128])),
+                image(1, 1, Rgb([255, 255, 255])),
+            ])
             .unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[4, 2, 40, 40, 3]);
@@ -269,7 +258,6 @@ mod tests {
 
     #[test]
     fn patch_size_can_come_from_preprocessor_config() {
-        let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig {
             patch_size: Some(PatchSize {
                 height: Some(20),
@@ -278,8 +266,8 @@ mod tests {
             ..Default::default()
         };
 
-        let result = processor
-            .preprocess(&[image(40, 20, Rgb([0, 0, 0]))], &config)
+        let result = InklingImageProcessor::from_preprocessor_config(&config)
+            .preprocess(&[image(40, 20, Rgb([0, 0, 0]))])
             .unwrap();
 
         assert_eq!(result.encoder_input.shape(), &[3, 2, 20, 20, 3]);
@@ -289,10 +277,7 @@ mod tests {
     fn padding_uses_inkling_raw_pad_value_before_normalization() {
         let processor = InklingImageProcessor::new();
         let result = processor
-            .preprocess(
-                &[image(1, 1, Rgb([255, 255, 255]))],
-                &PreProcessorConfig::default(),
-            )
+            .preprocess(&[image(1, 1, Rgb([255, 255, 255]))])
             .unwrap();
         let flat = result.encoder_input_flat();
         let pad =

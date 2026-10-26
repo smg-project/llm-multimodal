@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::{
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
     vision::processor::PreprocessedEncoderInputs,
+    vision::{processors::MiniMaxM3Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct MiniMaxM3VisionSpec;
@@ -17,6 +18,23 @@ impl MiniMaxM3VisionSpec {
 }
 
 impl ModelProcessorSpec for MiniMaxM3VisionSpec {
+    fn vision_processor(
+        &self,
+        _metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(MiniMaxM3Processor::from_preprocessor_config(
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "minimax_m3_vl"
     }

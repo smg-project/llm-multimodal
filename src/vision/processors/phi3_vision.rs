@@ -231,11 +231,7 @@ impl Phi3VisionProcessor {
     }
 
     /// Process a single image through the full pipeline.
-    fn process_single_image(
-        &self,
-        image: &DynamicImage,
-        config: &PreProcessorConfig,
-    ) -> (Array4<f32>, (usize, usize), usize) {
+    fn process_single_image(&self, image: &DynamicImage) -> (Array4<f32>, (usize, usize), usize) {
         // 1. Convert to RGB
         let image = DynamicImage::ImageRgb8(image.to_rgb8());
 
@@ -245,16 +241,8 @@ impl Phi3VisionProcessor {
 
         // 3. To tensor [0, 1] and normalize
         let mut tensor = transforms::to_tensor(&hd_image);
-        let mean = config
-            .image_mean
-            .as_ref()
-            .map(|v| [v[0], v[1], v[2]])
-            .unwrap_or(self.mean);
-        let std = config
-            .image_std
-            .as_ref()
-            .map(|v| [v[0], v[1], v[2]])
-            .unwrap_or(self.std);
+        let mean = self.mean;
+        let std = self.std;
         transforms::normalize(&mut tensor, &mean, &std);
 
         // 4. Create global image (336x336)
@@ -300,7 +288,6 @@ impl VisionPreProcessor for Phi3VisionProcessor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
             return Err(TransformError::InvalidShape {
@@ -314,7 +301,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
         for image in images {
-            let (encoder_input, image_size, num_tokens) = self.process_single_image(image, config);
+            let (encoder_input, image_size, num_tokens) = self.process_single_image(image);
             all_pixel_values.push(encoder_input);
             all_image_sizes.push((image_size.1 as u32, image_size.0 as u32)); // (width, height)
             all_num_tokens.push(num_tokens);
@@ -377,7 +364,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> usize {
         // First apply HD transform to get the actual size
         let image = DynamicImage::new_rgb8(width, height);
         let hd_image = self.hd_transform(&image);
@@ -391,7 +378,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         "phi3-vision"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         // Phi3-Vision has dynamic size based on HD transform
         None
     }
@@ -478,10 +465,9 @@ mod tests {
     #[test]
     fn test_phi3_vision_preprocess() {
         let processor = Phi3VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let image = create_test_image(504, 504, Rgb([128, 128, 128]));
-        let result = processor.preprocess(&[image], &config).unwrap();
+        let result = processor.preprocess(&[image]).unwrap();
 
         assert_eq!(result.batch_size(), 1);
 
@@ -502,14 +488,13 @@ mod tests {
     #[test]
     fn test_phi3_vision_preprocess_multiple() {
         let processor = Phi3VisionProcessor::new();
-        let config = PreProcessorConfig::default();
 
         let images = vec![
             create_test_image(504, 504, Rgb([100, 100, 100])),
             create_test_image(400, 600, Rgb([150, 150, 150])),
         ];
 
-        let result = processor.preprocess(&images, &config).unwrap();
+        let result = processor.preprocess(&images).unwrap();
 
         assert_eq!(result.batch_size(), 2);
         assert_eq!(result.item_sizes.len(), 2);

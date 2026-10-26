@@ -4,14 +4,36 @@ use serde_json::{json, Value};
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{
+        processors::{LlavaNextProcessor, LlavaProcessor},
+        PreProcessorConfig, VisionPreProcessor,
+    },
 };
 
 pub(super) struct LlavaSpec;
 pub(super) struct LlavaNextSpec;
 
 impl ModelProcessorSpec for LlavaSpec {
+    fn vision_processor(
+        &self,
+        metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaProcessor::from_configs(
+                metadata.config,
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "llava"
     }
@@ -67,6 +89,24 @@ impl ModelProcessorSpec for LlavaSpec {
 }
 
 impl ModelProcessorSpec for LlavaNextSpec {
+    fn vision_processor(
+        &self,
+        metadata: &ModelMetadata,
+        config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaNextProcessor::from_configs(
+                metadata.config,
+                config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "llava_next"
     }
@@ -214,7 +254,7 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("llava spec");
         assert!(spec
-            .audio_processor(&config, &PreProcessorConfig::default())
+            .audio_processor(&metadata, &PreProcessorConfig::default())
             .is_none());
     }
 }

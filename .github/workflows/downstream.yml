@@ -31,6 +31,9 @@ jobs:
     name: smg (check + gateway multimodal tests)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - uses: actions/checkout@v6
         with:
@@ -39,19 +42,33 @@ jobs:
         with:
           repository: smg-project/smg
           path: smg
-      - name: Swap this revision into the smg workspace
-        # smg still consumes the crate as the workspace member
-        # crates/multimodal, so replacing the directory simulates the
-        # post-migration dependency. After smg switches to a crates.io
-        # dependency, replace this step with a [patch.crates-io] entry
-        # pointing at this revision. This job tracks smg's main HEAD: if it
-        # goes red with unresolved-import or cannot-find errors while the
-        # crate's own CI is green, smg's crate has drifted ahead of this
-        # lineage — re-sync smg-main instead of ignoring the failure.
-        run: rsync -a --delete --exclude .git --exclude target llm-multimodal/ smg/crates/multimodal/
+      - name: Point smg at this revision
+        # Two forms, depending on where smg main is in its migration:
+        # pre-cut-over smg consumes the crate as the workspace member
+        # crates/multimodal (replace the directory); post-cut-over smg uses a
+        # git dependency (patch its source to this revision). This job tracks
+        # smg's main HEAD: if it goes red with unresolved-import or
+        # cannot-find errors while the crate's own CI is green, smg's crate
+        # has drifted ahead of this lineage — re-sync main instead of
+        # ignoring the failure.
+        run: |
+          if grep -q 'path = "crates/multimodal"' smg/Cargo.toml; then
+            rsync -a --delete --exclude .git --exclude target llm-multimodal/ smg/crates/multimodal/
+          else
+            cat >> smg/Cargo.toml <<EOF
+          [patch."https://github.com/smg-project/llm-multimodal"]
+          llm-multimodal = { path = "$GITHUB_WORKSPACE/llm-multimodal" }
+          EOF
+          fi
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: "1.98.0"
+      # sccache on the GitHub Actions backend: shared compile cache across
+      # runs, no secrets needed (the trick smg's own CI relies on).
+      - uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: "v0.12.0"
+          disable_annotations: true
       - name: Install system dependencies
         # The well-known protobuf types (google/protobuf/*.proto) are not
         # shipped by the apt protobuf-compiler package, so use the official
@@ -64,18 +81,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
       # Run inside the smg checkout so its rust-toolchain.toml governs.
-      - name: Check the gateway
-        run: cd smg && cargo check -p smg
+      # The bindings consumers are check-only; the gateway itself is covered
+      # by the test build below (a superset of cargo check), so no separate
+      # cargo check -p smg — it would compile the same crates twice.
       - name: Check the Python binding (tokenspeed's wheel entry point)
         run: cd smg && cargo check --manifest-path bindings/python/Cargo.toml
+      - name: Check the Go binding
+        run: cd smg && cargo check --manifest-path bindings/golang/Cargo.toml
       - uses: taiki-e/install-action@cargo-nextest
       - name: Test the gateway's multimodal code
-        # Same "broad compile, narrow test" shape as the vllm job: the checks
-        # above build every target of the workspace, and here only the
-        # gateway tests that exercise this crate run — the multimodal router
-        # units plus the metrics/media-fault integration tests.
+        # Same "broad compile, narrow test" shape as the vllm job, narrowed
+        # one step further: only the four test binaries that contain
+        # multimodal/media tests are built (235 lib tests, 2 grpc_tests,
+        # 1 metrics_tests, 1 bin test), skipping the dozens of unrelated
+        # integration targets in model_gateway/tests.
         timeout-minutes: 30
-        run: cd smg && cargo nextest run -p smg -E 'test(multimodal) or test(media)'
+        run: cd smg && cargo nextest run -p smg --lib --bin smg --test grpc_tests --test metrics_tests -E 'test(multimodal) or test(media)'
 
   vllm:
     name: vllm (nextest -p vllm-chat -p vllm-server)

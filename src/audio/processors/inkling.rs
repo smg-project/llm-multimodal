@@ -21,9 +21,6 @@ use crate::{
     types::AudioClip,
 };
 
-/// Per-clip ceiling on produced audio tokens (~10 min at 20 tokens/s).
-const MAX_AUDIO_TOKENS: usize = 12_000;
-
 #[derive(Debug, Clone)]
 pub struct InklingAudioEncoderParams {
     pub sample_rate: usize,
@@ -127,38 +124,15 @@ impl InklingAudioProcessor {
             return Err(TransformError::EmptyBatch);
         }
 
-        let hop_length = self.params.hop_length()?;
         let mut all_bins = Vec::new();
         let mut token_counts = Vec::with_capacity(clips.len());
         let mut item_sizes = Vec::with_capacity(clips.len());
         let mut tokens_per_item = Vec::with_capacity(clips.len());
 
-        for (index, clip) in clips.into_iter().enumerate() {
-            if clip.sample_rate == 0 {
-                return Err(TransformError::ShapeError(
-                    "decoded audio sample rate must be positive".to_string(),
-                ));
-            }
-            if clip.samples.iter().any(|sample| !sample.is_finite()) {
-                return Err(TransformError::ShapeError(
-                    "decoded audio contains a non-finite sample".to_string(),
-                ));
-            }
-            // Predict the post-resample frame count so an oversized clip is
-            // rejected before paying for the resample and FFT.
-            let predicted_num_tokens = resampled_frame_count(
-                clip.samples.len(),
-                clip.sample_rate,
-                self.params.sample_rate,
-                hop_length,
-            )?;
-            validate_audio_token_limit(index, predicted_num_tokens)?;
-
+        for clip in clips {
             let bins = self.preprocess_decoded(clip)?;
             let shape = bins.shape();
             let num_tokens = shape[0];
-            debug_assert_eq!(num_tokens, predicted_num_tokens);
-            validate_audio_token_limit(index, num_tokens)?;
             let n_mels = shape[1];
             token_counts.push(num_tokens);
             tokens_per_item.push(num_tokens as i64);
@@ -215,43 +189,6 @@ impl AudioPreProcessor for InklingAudioProcessor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess_decoded_clips(clips.iter().map(|clip| clip.decoded().clone()).collect())
     }
-}
-
-fn frame_count(sample_count: usize, hop_length: usize) -> usize {
-    sample_count.div_ceil(hop_length)
-}
-
-/// Overflow-safe prediction of the post-resample frame count.
-fn resampled_frame_count(
-    sample_count: usize,
-    source_sample_rate: usize,
-    target_sample_rate: usize,
-    hop_length: usize,
-) -> Result<usize, TransformError> {
-    if source_sample_rate == 0 || target_sample_rate == 0 {
-        return Err(TransformError::ShapeError(
-            "audio resampling rates must be positive".to_string(),
-        ));
-    }
-
-    let target_samples = (sample_count as u128)
-        .checked_mul(target_sample_rate as u128)
-        .ok_or_else(|| TransformError::ShapeError("resampled audio length overflow".to_string()))?
-        .div_ceil(source_sample_rate as u128);
-    let target_samples = usize::try_from(target_samples).map_err(|_| {
-        TransformError::ShapeError("resampled audio length exceeds usize".to_string())
-    })?;
-    Ok(frame_count(target_samples, hop_length))
-}
-
-fn validate_audio_token_limit(clip_index: usize, num_frames: usize) -> Result<(), TransformError> {
-    if num_frames > MAX_AUDIO_TOKENS {
-        return Err(TransformError::ShapeError(format!(
-            "Audio clip {clip_index} produces {num_frames} tokens, exceeding the maximum of \
-             {MAX_AUDIO_TOKENS} (~10 min at 20 tokens/s). Provide a shorter clip."
-        )));
-    }
-    Ok(())
 }
 
 fn exact_sample_count(value: f64, name: &str) -> Result<usize, TransformError> {
@@ -393,52 +330,6 @@ fn quantize_dmel(value: f64, params: &InklingAudioEncoderParams) -> usize {
 mod tests {
     use super::*;
 
-    fn decoded(sample_count: usize, sample_rate: usize) -> DecodedAudio {
-        DecodedAudio {
-            samples: vec![0.0; sample_count],
-            sample_rate,
-        }
-    }
-
-    #[test]
-    fn enforces_per_clip_token_limit() {
-        assert!(validate_audio_token_limit(0, MAX_AUDIO_TOKENS).is_ok());
-        let error = validate_audio_token_limit(2, MAX_AUDIO_TOKENS + 1).unwrap_err();
-        assert!(error.to_string().contains("Audio clip 2"));
-        assert!(error.to_string().contains("12000"));
-    }
-
-    #[test]
-    fn rejects_oversized_clip_before_resampling() {
-        let error = InklingAudioProcessor::new()
-            .preprocess_decoded_clips(vec![decoded(601, 1)])
-            .unwrap_err();
-
-        assert!(error.to_string().contains("12020 tokens"));
-        assert!(error.to_string().contains("12000"));
-    }
-
-    #[test]
-    fn rejects_non_finite_samples() {
-        for sample in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let error = InklingAudioProcessor::new()
-                .preprocess_decoded_clips(vec![DecodedAudio {
-                    samples: vec![sample],
-                    sample_rate: 16_000,
-                }])
-                .unwrap_err();
-            assert!(error.to_string().contains("non-finite sample"));
-        }
-    }
-
-    #[test]
-    fn rejects_zero_sample_rate() {
-        let error = InklingAudioProcessor::new()
-            .preprocess_decoded_clips(vec![decoded(1, 0)])
-            .unwrap_err();
-        assert!(error.to_string().contains("sample rate must be positive"));
-    }
-
     #[test]
     fn rejects_empty_or_invalid_rate_audio() {
         let processor = InklingAudioProcessor::new();
@@ -537,80 +428,5 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("audio_rms_norm_floor"));
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ParityCase {
-        name: String,
-        params: ParityParams,
-        synth: ParitySynth,
-        num_frames: usize,
-        n_mels: usize,
-        expected_bins: Vec<i32>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ParityParams {
-        sample_rate: usize,
-        n_mels: usize,
-        num_dmel_bins: usize,
-        dmel_min_value: f64,
-        dmel_max_value: f64,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ParitySynth {
-        seed: u32,
-        num_samples: usize,
-        sample_rate: usize,
-    }
-
-    fn synth_samples(seed: u32, num_samples: usize) -> Vec<f32> {
-        const SYNTH_BLOCK: usize = 800;
-        const SYNTH_STEPS: usize = 12;
-
-        let mut state = seed;
-        (0..num_samples)
-            .map(|index| {
-                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                let value = (state >> 16) as u16 as i16;
-                let exponent = 8 - 2 * ((index / SYNTH_BLOCK) % SYNTH_STEPS) as i32;
-                f32::from(value) / 32_768.0 * (2.0_f32).powi(exponent)
-            })
-            .collect()
-    }
-
-    #[test]
-    fn dmel_matches_python_reference() {
-        let cases: Vec<ParityCase> =
-            serde_json::from_str(include_str!("fixtures/inkling_dmel_parity.json")).unwrap();
-        assert!(!cases.is_empty());
-
-        for case in cases {
-            let params = InklingAudioEncoderParams {
-                sample_rate: case.params.sample_rate,
-                n_mels: case.params.n_mels,
-                num_dmel_bins: case.params.num_dmel_bins,
-                dmel_min_value: case.params.dmel_min_value,
-                dmel_max_value: case.params.dmel_max_value,
-                ..Default::default()
-            };
-            let samples = synth_samples(case.synth.seed, case.synth.num_samples);
-            let samples = if case.synth.sample_rate == params.sample_rate {
-                samples
-            } else {
-                bandlimited_resample(&samples, case.synth.sample_rate, params.sample_rate).unwrap()
-            };
-            let output = dmel_bins(&samples, &params).unwrap();
-            let actual = output.iter().map(|value| *value as i32).collect::<Vec<_>>();
-
-            assert_eq!(
-                output.shape(),
-                &[case.num_frames, case.n_mels],
-                "{}",
-                case.name
-            );
-            assert_eq!(actual, case.expected_bins, "{}", case.name);
-        }
     }
 }

@@ -28,7 +28,7 @@ env:
 
 jobs:
   smg:
-    name: smg (cargo check -p smg)
+    name: smg (check + gateway multimodal tests)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -68,6 +68,14 @@ jobs:
         run: cd smg && cargo check -p smg
       - name: Check the Python binding (tokenspeed's wheel entry point)
         run: cd smg && cargo check --manifest-path bindings/python/Cargo.toml
+      - uses: taiki-e/install-action@cargo-nextest
+      - name: Test the gateway's multimodal code
+        # Same "broad compile, narrow test" shape as the vllm job: the checks
+        # above build every target of the workspace, and here only the
+        # gateway tests that exercise this crate run — the multimodal router
+        # units plus the metrics/media-fault integration tests.
+        timeout-minutes: 30
+        run: cd smg && cargo nextest run -p smg -E 'test(multimodal) or test(media)'
 
   vllm:
     name: vllm (nextest -p vllm-chat -p vllm-server)

@@ -63,15 +63,26 @@ jobs:
       - name: Install golden fixture dependencies
         run: python -m pip install -r .github/golden-fixtures-requirements.txt
 
+      - name: Mirror the smg workspace fixture layout
+        # The generator script and the Rust golden tests address fixtures as
+        # crates/multimodal/tests/... (the upstream smg workspace layout); this
+        # standalone repo keeps them at tests/..., so link the prefix.
+        run: |
+          mkdir -p crates
+          ln -s "$PWD" crates/multimodal
+
       - name: Generate vision golden fixtures
-        run: python scripts/generate_vision_golden.py --model ${{ matrix.model }}
+        # --strict makes a fixture that fails to generate fail this step (the
+        # Rust golden tests skip a missing fixture directory, so a silent
+        # generation failure would silently drop coverage).
+        run: python scripts/generate_vision_golden.py --model ${{ matrix.model }} --strict
 
       - name: Run vision golden tests
         timeout-minutes: 20
         env:
           LLM_MULTIMODAL_REQUIRE_GOLDEN: "1"
         run: |
-          cargo test --test vision_golden_tests ${{ matrix.test_filter }}
+          cargo test --test preprocess_tests ${{ matrix.test_filter }}
           if [ -n "${{ matrix.extra_filter }}" ]; then
-            cargo test --test vision_golden_tests ${{ matrix.extra_filter }}
+            cargo test --test preprocess_tests ${{ matrix.extra_filter }}
           fi

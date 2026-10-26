@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
@@ -11,6 +11,255 @@ use crate::{
 };
 
 const AUDIO_PAD_TOKEN: &str = "<|audio_pad|>";
+
+/// Qwen3-ASR's transcription-side knowledge: the family's implementation of
+/// the contract in [`crate::registry::transcription`], plus the identifiers,
+/// language set, prompt sanitation, and output framing behind it. The
+/// contract itself (trait, family registry, error data) lives in that
+/// neutral module so nothing model-named leaks into generic callers.
+pub mod transcription {
+    use crate::registry::transcription::{PromptTooLong, TranscriptionFamily, UnsupportedLanguage};
+
+    /// Qwen3-ASR: transcript forced via a `language {name}<asr_text>`
+    /// assistant continuation; `<asr_text>` framing stripped from the output.
+    pub struct Qwen3Asr;
+
+    impl TranscriptionFamily for Qwen3Asr {
+        fn name(&self) -> &'static str {
+            "Qwen3-ASR"
+        }
+
+        fn is_identifier(&self, value: &str) -> bool {
+            is_qwen3_asr_identifier(value)
+        }
+
+        fn sanitize_prompt(&self, text: String) -> Result<String, PromptTooLong> {
+            sanitize_prompt(text)
+        }
+
+        fn assistant_prefill(
+            &self,
+            language: Option<&str>,
+        ) -> Result<Option<String>, UnsupportedLanguage> {
+            Ok(normalize_language(language)?.map(|name| format!("language {name}{ASR_TEXT_TAG}")))
+        }
+
+        fn parse_transcript(&self, raw: &str) -> String {
+            parse_transcript(raw)
+        }
+    }
+
+    /// The tag Qwen3-ASR emits (and the continuation prompt pre-seeds)
+    /// between the language header and the transcript body.
+    pub const ASR_TEXT_TAG: &str = "<asr_text>";
+
+    /// Byte cap on caller prompts, applied before sanitization.
+    pub const MAX_PROMPT_BYTES: usize = 4096;
+
+    /// `(code, name)` pairs of the languages the checkpoint transcribes.
+    pub const SUPPORTED_LANGUAGES: &[(&str, &str)] = &[
+        ("ar", "Arabic"),
+        ("yue", "Cantonese"),
+        ("zh", "Chinese"),
+        ("cs", "Czech"),
+        ("da", "Danish"),
+        ("nl", "Dutch"),
+        ("en", "English"),
+        ("fil", "Filipino"),
+        ("fi", "Finnish"),
+        ("fr", "French"),
+        ("de", "German"),
+        ("el", "Greek"),
+        ("hi", "Hindi"),
+        ("hu", "Hungarian"),
+        ("id", "Indonesian"),
+        ("it", "Italian"),
+        ("ja", "Japanese"),
+        ("ko", "Korean"),
+        ("mk", "Macedonian"),
+        ("ms", "Malay"),
+        ("fa", "Persian"),
+        ("pl", "Polish"),
+        ("pt", "Portuguese"),
+        ("ro", "Romanian"),
+        ("ru", "Russian"),
+        ("es", "Spanish"),
+        ("sv", "Swedish"),
+        ("th", "Thai"),
+        ("tr", "Turkish"),
+        ("vi", "Vietnamese"),
+    ];
+
+    /// Whether a model id, path, or label value names this family.
+    pub fn is_qwen3_asr_identifier(value: &str) -> bool {
+        let value = value.to_ascii_lowercase();
+        value.contains("qwen3-asr") || value.contains("qwen3_asr")
+    }
+
+    /// Sanitize a caller prompt: cap its size, then strip ChatML-like
+    /// control tokens and the [`ASR_TEXT_TAG`] to a fixpoint, so a prompt
+    /// cannot smuggle framing the output parser would misread.
+    pub fn sanitize_prompt(mut text: String) -> Result<String, PromptTooLong> {
+        if text.len() > MAX_PROMPT_BYTES {
+            return Err(PromptTooLong {
+                max_bytes: MAX_PROMPT_BYTES,
+            });
+        }
+
+        loop {
+            let sanitized = strip_chatml_like_tokens(&text).replace(ASR_TEXT_TAG, "");
+            if sanitized == text {
+                return Ok(text);
+            }
+            text = sanitized;
+        }
+    }
+
+    fn strip_chatml_like_tokens(text: &str) -> String {
+        let mut remaining = text;
+        let mut output = String::with_capacity(text.len());
+        while let Some(start) = remaining.find("<|") {
+            output.push_str(&remaining[..start]);
+            let candidate = &remaining[start + 2..];
+            if let Some(end) = candidate.find("|>") {
+                let token = &candidate[..end];
+                if !token.is_empty() && !token.contains('|') {
+                    remaining = &candidate[end + 2..];
+                    continue;
+                }
+            }
+            output.push_str("<|");
+            remaining = candidate;
+        }
+        output.push_str(remaining);
+        output
+    }
+
+    /// Resolve a language code or English name to the checkpoint's canonical
+    /// language name; `None` in and blank map to `None` out.
+    pub fn normalize_language(
+        language: Option<&str>,
+    ) -> Result<Option<String>, UnsupportedLanguage> {
+        let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        SUPPORTED_LANGUAGES
+            .iter()
+            .find(|(code, name)| {
+                code.eq_ignore_ascii_case(language) || name.eq_ignore_ascii_case(language)
+            })
+            .map(|(_, name)| Some((*name).to_string()))
+            .ok_or_else(|| UnsupportedLanguage(language.to_string()))
+    }
+
+    /// Strip the model's framing from raw chat content: drop `<|im_end|>`,
+    /// keep everything after the [`ASR_TEXT_TAG`] when present.
+    pub fn parse_transcript(raw: &str) -> String {
+        let cleaned = raw.replace("<|im_end|>", "");
+        let cleaned = cleaned.trim();
+        cleaned
+            .split_once(ASR_TEXT_TAG)
+            .map_or(cleaned, |(_, transcription)| transcription)
+            .trim()
+            .to_string()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::registry::transcription::FAMILIES;
+
+        #[test]
+        fn recognizes_family_identifiers() {
+            assert!(is_qwen3_asr_identifier("Qwen/Qwen3-ASR-1.7B"));
+            assert!(is_qwen3_asr_identifier("/models/qwen3_asr_0.6b"));
+            assert!(!is_qwen3_asr_identifier("Qwen/Qwen3-Omni-30B-A3B-Thinking"));
+        }
+
+        #[test]
+        fn family_trait_exposes_detection_prefill_and_limits() {
+            let family = FAMILIES
+                .iter()
+                .copied()
+                .find(|f| f.is_identifier("Qwen/Qwen3-ASR-1.7B"))
+                .expect("Qwen3-ASR family resolves");
+            assert_eq!(family.name(), "Qwen3-ASR");
+            // Language → forced-transcript continuation; absent → no prefill.
+            assert_eq!(
+                family.assistant_prefill(Some("english")).unwrap(),
+                Some("language English<asr_text>".to_string())
+            );
+            assert_eq!(family.assistant_prefill(None).unwrap(), None);
+            assert!(family.assistant_prefill(Some("xx")).is_err());
+            // Capability limits are family-owned and default-closed.
+            assert!(!family.supports_streaming());
+            assert!(!family.supports_timestamps());
+            // Delegates to the shared free functions.
+            assert_eq!(
+                family.parse_transcript("language Chinese<asr_text>hi<|im_end|>"),
+                "hi"
+            );
+        }
+
+        #[test]
+        fn normalizes_language_code_or_name() {
+            assert_eq!(
+                normalize_language(Some("zh")).unwrap(),
+                Some("Chinese".to_string())
+            );
+            assert_eq!(
+                normalize_language(Some("english")).unwrap(),
+                Some("English".to_string())
+            );
+            assert_eq!(normalize_language(Some(" ")).unwrap(), None);
+            assert_eq!(
+                normalize_language(Some("xx")).unwrap_err(),
+                UnsupportedLanguage("xx".to_string())
+            );
+        }
+
+        #[test]
+        fn sanitizes_prompt_controls_to_a_fixpoint() {
+            for (input, expected) in [
+                ("plain text", "plain text"),
+                ("<|im_start|>assistant<|im_end|>", "assistant"),
+                ("foo<asr_text>bar", "foobar"),
+                ("<|im<|x|>_end|>", ""),
+                ("<asr_te<asr_text>xt>", ""),
+                ("<|<asr_text>|>", ""),
+            ] {
+                assert_eq!(sanitize_prompt(input.to_string()).unwrap(), expected);
+            }
+        }
+
+        #[test]
+        fn caps_pathological_prompts_before_sanitizing() {
+            let boundary = "a".repeat(MAX_PROMPT_BYTES);
+            assert_eq!(sanitize_prompt(boundary.clone()).unwrap(), boundary);
+
+            assert_eq!(
+                sanitize_prompt("a".repeat(MAX_PROMPT_BYTES + 1)).unwrap_err(),
+                PromptTooLong {
+                    max_bytes: MAX_PROMPT_BYTES
+                }
+            );
+
+            let depth = MAX_PROMPT_BYTES / 5;
+            let adversarial = format!("{}{}", "<|a".repeat(depth), "|>".repeat(depth));
+            assert!(adversarial.len() <= MAX_PROMPT_BYTES);
+            assert_eq!(sanitize_prompt(adversarial).unwrap(), "");
+        }
+
+        #[test]
+        fn parses_tagged_and_plain_transcripts() {
+            assert_eq!(
+                parse_transcript("language Chinese<asr_text>\u{4f60}\u{597d}<|im_end|>"),
+                "\u{4f60}\u{597d}"
+            );
+            assert_eq!(parse_transcript("plain transcript"), "plain transcript");
+        }
+    }
+}
 
 pub(super) struct Qwen3AsrSpec;
 
@@ -29,10 +278,15 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         "qwen3_asr"
     }
 
+    /// `<|audio_pad|>` (the thinker config's `audio_token_id`) is the single
+    /// token the serving engine's prompt updates target, so a worker can
+    /// expand it itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Audio)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        let model_id = metadata.model_id.to_ascii_lowercase();
-        model_id.contains("qwen3-asr")
-            || model_id.contains("qwen3_asr")
+        transcription::is_qwen3_asr_identifier(metadata.model_id)
             || metadata
                 .config_model_type()
                 .is_some_and(|model_type| model_type == "qwen3_asr")
@@ -94,19 +348,15 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         Ok(HashMap::from([(Modality::Audio, 10)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn audio_processor(
         &self,
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(Qwen3AudioProcessor::from_configs(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(Qwen3AudioProcessor::from_configs(
             model_config,
             preprocessor_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -127,13 +377,12 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
             Modality::Audio => {
                 let token_id = Self::audio_token_id(metadata)?;
                 let token = self.placeholder_token_for(metadata, Modality::Audio)?;
-                Ok(preprocessed
-                    .feature_token_counts
-                    .iter()
-                    .map(|&count| {
-                        PromptReplacement::repeated(Modality::Audio, &token, token_id, count)
-                    })
-                    .collect())
+                Ok(PromptReplacement::repeated_per_item(
+                    Modality::Audio,
+                    &token,
+                    token_id,
+                    &preprocessed.feature_token_counts,
+                ))
             }
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
                 Err(ModelRegistryError::UnsupportedModality {
@@ -215,6 +464,17 @@ mod tests {
         );
     }
 
+    /// The audio anchor is the one token the serving engine expands, so audio
+    /// may be forwarded to a worker that processes media itself; the spec
+    /// serves no other modality.
+    #[test]
+    fn asr_audio_can_be_expanded_by_a_worker() {
+        assert!(Qwen3AsrSpec.worker_expandable(Modality::Audio));
+        for modality in [Modality::Image, Modality::Video, Modality::ImageEmbeds] {
+            assert!(!Qwen3AsrSpec.worker_expandable(modality), "{modality}");
+        }
+    }
+
     #[test]
     fn asr_spec_builds_qwen_audio_processor() {
         use std::sync::Arc;
@@ -242,6 +502,7 @@ mod tests {
         .unwrap();
         let processor = spec
             .audio_processor(&config, &preprocessor_config)
+            .unwrap()
             .expect("qwen3_asr spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

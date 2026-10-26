@@ -12,7 +12,7 @@
 //!
 //! To regenerate golden outputs:
 //! ```bash
-//! python scripts/generate_vision_golden.py
+//! python crates/multimodal/scripts/generate_vision_golden.py
 //! ```
 
 #![expect(
@@ -29,25 +29,35 @@
     reason = "integration test helpers: assertion-like panics"
 )]
 
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+};
 
 use llm_multimodal::vision::{
-    Llama4VisionProcessor, LlavaProcessor, MiniMaxM3Processor, ModelSpecificValue,
+    Llama4VisionProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, ModelSpecificValue,
     Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, PreProcessorConfig,
     Qwen2VLProcessor, Qwen3VLProcessor, VisionPreProcessor,
 };
 use ndarray::{Array4, Array5};
 
+/// Open array `name` of the `.npz` archive at `path`: the archive is a zip whose members are the
+/// arrays as `.npy` files, read here in full and parsed as one.
+fn npz_member(path: &Path, name: &str) -> npyz::NpyFile<Cursor<Vec<u8>>> {
+    let file = File::open(path).expect("Failed to open golden file");
+    let mut archive = zip::ZipArchive::new(file).expect("Failed to parse npz");
+    let mut member = archive
+        .by_name(&npyz::npz::file_name_from_array_name(name))
+        .unwrap_or_else(|e| panic!("No {name}: {e}"));
+    let mut bytes = Vec::new();
+    member.read_to_end(&mut bytes).expect("Failed to read npz");
+    npyz::NpyFile::new(Cursor::new(bytes)).expect("Failed to parse npy")
+}
+
 /// Load a numpy .npz file and extract pixel_values
 fn load_golden_npz(path: &Path) -> Array4<f32> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    // Read pixel_values array (npz stores arrays without .npy extension in the lookup)
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     // Get shape from npy header
     let shape = reader.shape().to_vec();
@@ -93,13 +103,7 @@ fn max_diff(a: &Array4<f32>, b: &ndarray::ArrayD<f32>) -> f32 {
 
 /// Load image_grid_thw from npz file
 fn load_golden_grid_thw(path: &Path) -> Vec<i64> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_grid_thw")
-        .expect("Failed to read npz")
-        .expect("No image_grid_thw");
+    let reader = npz_member(path, "image_grid_thw");
 
     // Shape not needed, data is flat
     let _shape = reader.shape();
@@ -110,25 +114,11 @@ fn load_golden_grid_thw(path: &Path) -> Vec<i64> {
 
 /// Load num_tokens from npz file
 fn load_golden_num_tokens(path: &Path) -> usize {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_tokens");
+    let reader = npz_member(path, "num_tokens");
 
     // Read single value as i64
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
     data[0] as usize
-}
-
-fn skip_missing_fixture(message: String, command: &str) {
-    if std::env::var_os("LLM_MULTIMODAL_REQUIRE_GOLDEN").is_some() {
-        panic!("{message}. Run: {command}");
-    }
-    eprintln!("{message}, skipping test");
-    eprintln!("Run: {command}");
 }
 
 /// Run a golden test for a specific mode and image.
@@ -137,14 +127,13 @@ fn skip_missing_fixture(message: String, command: &str) {
 /// * `mode` - Either "llava" (standard CLIP) or "llava_pad" (expand-to-square mode)
 /// * `image_name` - Name of the test image (e.g., "square", "tall", "wide", "small")
 fn run_golden_test(mode: &str, image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden").join(mode);
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden").join(mode);
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for {mode}/{image_name} not found"),
-            "python scripts/generate_vision_golden.py",
-        );
+        eprintln!("Golden test fixtures for {mode}/{image_name} not found, skipping test");
+        eprintln!("Run: python crates/multimodal/scripts/generate_vision_golden.py");
         return;
     }
 
@@ -154,16 +143,14 @@ fn run_golden_test(mode: &str, image_name: &str) {
     let image = image::open(&image_path).expect("Failed to open image");
 
     let processor: Box<dyn VisionPreProcessor> = match mode {
-        "llava" => Box::new(LlavaProcessor::new()),
-        "llava_pad" => Box::new(LlavaProcessor::new_with_pad()),
+        "llava" => Box::new(LlavaProcessor::new().with_preprocessor_config(&config)),
+        "llava_pad" => Box::new(LlavaProcessor::new_with_pad().with_preprocessor_config(&config)),
         _ => panic!("Unknown test mode: {mode}"),
     };
 
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
-    let diff = max_diff(&golden, &result.encoder_input);
+    let diff = max_diff(&golden, &result.encoder_input.as_f32());
     println!("{mode} - {image_name} image - Max difference: {diff:.6}");
     println!("Golden shape: {:?}", golden.shape());
     println!("Rust shape: {:?}", result.encoder_input.shape());
@@ -289,21 +276,18 @@ fn test_llava_pad_golden_grayscale() {
 
 #[test]
 fn test_llava_token_count() {
-    let golden_dir = Path::new("tests/fixtures/golden/llava");
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llava");
 
     if !golden_dir.exists() {
-        skip_missing_fixture(
-            "Golden test fixtures not found".to_string(),
-            "python scripts/generate_vision_golden.py --model llava",
-        );
+        eprintln!("Golden test fixtures not found, skipping test");
         return;
     }
 
     let config = load_config(&golden_dir.join("preprocessor_config.json"));
-    let processor = LlavaProcessor::new();
+    let processor = LlavaProcessor::new().with_preprocessor_config(&config);
 
     // LLaVA 1.5 with 336x336 and patch_size=14: (336/14)^2 = 576 tokens
-    let tokens = processor.calculate_num_tokens(336, 336, &config);
+    let tokens = processor.calculate_num_tokens(336, 336).unwrap();
     assert_eq!(
         tokens, 576,
         "Expected 576 tokens for 336x336 with patch_size=14"
@@ -317,13 +301,7 @@ fn test_llava_token_count() {
 /// Load flattened pixel values from Qwen2-VL npz file.
 /// Returns (data, shape) where shape is (num_patches, patch_features).
 fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape = reader.shape().to_vec();
     assert_eq!(shape.len(), 2, "Expected 2D tensor for Qwen2-VL patches");
@@ -339,13 +317,14 @@ fn load_golden_qwen2_vl_pixels(path: &Path) -> (Vec<f32>, (usize, usize)) {
 /// 2. num_tokens calculation is correct
 /// 3. Pixel values match after reshaping to patch format
 fn run_qwen2_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/qwen2_vl");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen2_vl");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for qwen2_vl/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model qwen2_vl",
+        eprintln!("Golden test fixtures for qwen2_vl/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen2_vl"
         );
         return;
     }
@@ -361,9 +340,7 @@ fn run_qwen2_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen2VLProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -489,13 +466,14 @@ fn test_qwen2_vl_golden_grayscale() {
 /// - factor: 32 (vs 28)
 /// - normalization: [0.5, 0.5, 0.5] (vs CLIP)
 fn run_qwen3_vl_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/qwen3_vl");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/qwen3_vl");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for qwen3_vl/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model qwen3_vl",
+        eprintln!("Golden test fixtures for qwen3_vl/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model qwen3_vl"
         );
         return;
     }
@@ -511,9 +489,7 @@ fn run_qwen3_vl_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -636,13 +612,14 @@ fn test_qwen3_vl_golden_grayscale() {
 /// MiniMax-M3 shares Qwen2-VL's patchify pipeline (patch_size=14, merge_size=2,
 /// CLIP normalization) with MiniMax's max-pixel smart resize setting.
 fn run_minimax_m3_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/minimax_m3");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/minimax_m3");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for minimax_m3/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model minimax_m3",
+        eprintln!("Golden test fixtures for minimax_m3/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model minimax_m3"
         );
         return;
     }
@@ -657,10 +634,9 @@ fn run_minimax_m3_golden_test(image_name: &str) {
 
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
-    let processor = MiniMaxM3Processor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+        .expect("Failed to build MiniMax-M3 processor from config");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Extract image_grid_thw from result
     let rust_grid_thw = match result.model_specific.get("image_grid_thw") {
@@ -774,13 +750,7 @@ fn test_minimax_m3_golden_grayscale() {
 
 /// Load a 5D numpy .npz file for Phi3-Vision (batch, num_crops+1, C, H, W)
 fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape = reader.shape().to_vec();
     assert_eq!(shape.len(), 5, "Expected 5D tensor [B, N, C, H, W]");
@@ -802,13 +772,7 @@ fn load_golden_npz_5d(path: &Path) -> Array5<f32> {
 
 /// Load image_sizes from Phi3-Vision npz file (2D tensor [batch, 2])
 fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -822,13 +786,7 @@ fn load_phi3_image_sizes(path: &Path) -> Vec<(i64, i64)> {
 
 /// Load num_img_tokens from Phi3-Vision npz file
 fn load_phi3_num_img_tokens(path: &Path) -> Vec<usize> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_img_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_img_tokens");
+    let reader = npz_member(path, "num_img_tokens");
 
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
     data.into_iter().map(|v| v as usize).collect()
@@ -896,13 +854,14 @@ fn find_max_diff_location_5d(
 /// 3. num_img_tokens matches HuggingFace output
 /// 4. Pixel values match within tolerance
 fn run_phi3_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/phi3_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi3_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for phi3_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model phi3_vision",
+        eprintln!("Golden test fixtures for phi3_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi3_vision"
         );
         return;
     }
@@ -918,9 +877,7 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi3VisionProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -967,7 +924,8 @@ fn run_phi3_vision_golden_test(image_name: &str) {
     // Convert rust ArrayD to Array5 for comparison
     let rust_pixels = result
         .encoder_input
-        .clone()
+        .as_f32()
+        .into_owned()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
 
@@ -1053,13 +1011,7 @@ fn test_phi3_vision_golden_grayscale() {
 
 /// Load num_img_tokens from Phi4-Vision npz file
 fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("num_img_tokens")
-        .expect("Failed to read npz")
-        .expect("No num_img_tokens");
+    let reader = npz_member(path, "num_img_tokens");
 
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
     data.into_iter().map(|v| v as usize).collect()
@@ -1067,13 +1019,7 @@ fn load_phi4_num_img_tokens(path: &Path) -> Vec<usize> {
 
 /// Load image_sizes from Phi4-Vision npz file (2D tensor [batch, 2])
 fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
     let data: Vec<i64> = reader.into_vec().expect("Failed to read array");
@@ -1098,13 +1044,14 @@ fn load_phi4_image_sizes(path: &Path) -> Vec<(i64, i64)> {
 /// - Normalization: [0.5, 0.5, 0.5] (vs CLIP)
 /// - Default dynamic_hd: 36 (vs 16)
 fn run_phi4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/phi4_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/phi4_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for phi4_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model phi4_vision",
+        eprintln!("Golden test fixtures for phi4_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model phi4_vision"
         );
         return;
     }
@@ -1120,9 +1067,7 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Phi4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Check output shape
     let rust_shape = result.encoder_input.shape();
@@ -1167,7 +1112,8 @@ fn run_phi4_vision_golden_test(image_name: &str) {
     // Compare pixel values
     let rust_pixels = result
         .encoder_input
-        .clone()
+        .as_f32()
+        .into_owned()
         .into_dimensionality::<ndarray::Ix5>()
         .expect("Failed to convert to Ix5");
 
@@ -1253,13 +1199,7 @@ fn test_phi4_vision_golden_grayscale() {
 
 /// Load aspect_ratios from npz file for LLaMA 4
 fn load_llama4_aspect_ratios(path: &Path) -> Vec<(i64, i64)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("aspect_ratios")
-        .expect("Failed to read npz")
-        .expect("No aspect_ratios");
+    let reader = npz_member(path, "aspect_ratios");
 
     let shape = reader.shape().to_vec();
 
@@ -1275,13 +1215,7 @@ fn load_llama4_aspect_ratios(path: &Path) -> Vec<(i64, i64)> {
 
 /// Load pixel_values for LLaMA 4 Vision (3D: [num_tiles, C, H, W])
 fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("pixel_values")
-        .expect("Failed to read npz")
-        .expect("No pixel_values");
+    let reader = npz_member(path, "pixel_values");
 
     let shape: Vec<usize> = reader.shape().iter().map(|&s| s as usize).collect();
     let data: Vec<f32> = reader.into_vec().expect("Failed to read array");
@@ -1303,13 +1237,14 @@ fn load_llama4_pixels(path: &Path) -> (Vec<f32>, Vec<usize>) {
 /// - Normalization: [0.5, 0.5, 0.5] mean/std
 /// - Global tile added when num_tiles > 1
 fn run_llama4_vision_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/llama4_vision");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/llama4_vision");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for llama4_vision/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model llama4_vision",
+        eprintln!("Golden test fixtures for llama4_vision/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model llama4_vision"
         );
         return;
     }
@@ -1325,9 +1260,7 @@ fn run_llama4_vision_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = Llama4VisionProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Check aspect_ratios
     let rust_aspect_ratios: Vec<(i64, i64)> = match result.model_specific.get("aspect_ratios") {
@@ -1453,13 +1386,7 @@ fn test_llama4_vision_golden_grayscale() {
 
 /// Load image_sizes from npz file for Pixtral
 fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
-    let file = File::open(path).expect("Failed to open golden file");
-    let mut npz = npyz::npz::NpzArchive::new(file).expect("Failed to parse npz");
-
-    let reader = npz
-        .by_name("image_sizes")
-        .expect("Failed to read npz")
-        .expect("No image_sizes");
+    let reader = npz_member(path, "image_sizes");
 
     let shape = reader.shape().to_vec();
 
@@ -1487,13 +1414,14 @@ fn load_pixtral_image_sizes(path: &Path) -> Vec<(usize, usize)> {
 /// - Normalization: CLIP mean/std
 /// - No tiling - single output per image
 fn run_pixtral_golden_test(image_name: &str) {
-    let golden_dir = Path::new("tests/fixtures/golden/pixtral");
-    let image_path = Path::new("tests/fixtures/images").join(format!("{image_name}.jpg"));
+    let golden_dir = Path::new("crates/multimodal/tests/fixtures/golden/pixtral");
+    let image_path =
+        Path::new("crates/multimodal/tests/fixtures/images").join(format!("{image_name}.jpg"));
 
     if !golden_dir.exists() || !image_path.exists() {
-        skip_missing_fixture(
-            format!("Golden test fixtures for pixtral/{image_name} not found"),
-            "python scripts/generate_vision_golden.py --model pixtral",
+        eprintln!("Golden test fixtures for pixtral/{image_name} not found, skipping test");
+        eprintln!(
+            "Run: python crates/multimodal/scripts/generate_vision_golden.py --model pixtral"
         );
         return;
     }
@@ -1510,9 +1438,7 @@ fn run_pixtral_golden_test(image_name: &str) {
     // Process image with our Rust processor
     let image = image::open(&image_path).expect("Failed to open image");
     let processor = PixtralProcessor::from_preprocessor_config(&config);
-    let result = processor
-        .preprocess(&[image], &config)
-        .expect("Processing failed");
+    let result = processor.preprocess(&[image]).expect("Processing failed");
 
     // Check image_sizes from model_specific
     let rust_image_sizes: Vec<(usize, usize)> = match result.model_specific.get("image_sizes") {

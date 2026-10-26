@@ -5,8 +5,9 @@ use llm_multimodal::{
     AsyncMultiModalTracker, AudioSource, ImageFetchConfig, ImageSource, MediaConnector,
     MediaConnectorConfig, MediaContentPart, MediaSource, Modality,
 };
-use reqwest::Client;
 use tempfile::tempdir;
+
+use crate::common;
 
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";
@@ -47,17 +48,17 @@ fn wav_i16_mono(sample_rate: u32, samples: &[i16]) -> Vec<u8> {
     reason = "test helper: panic on failure is intentional"
 )]
 fn test_connector(allowed_path: Option<PathBuf>) -> MediaConnector {
-    let client = Client::builder()
+    let client = common::http_client_builder()
         .timeout(Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("client");
+        .no_proxy();
     MediaConnector::new(
         client,
         MediaConnectorConfig {
             allowed_domains: None,
+            allow_private_hosts: false,
             allowed_local_media_path: allowed_path,
             fetch_timeout: Duration::from_secs(5),
+            video_fetch_timeout: Duration::from_secs(5),
         },
     )
     .expect("media connector")
@@ -74,8 +75,8 @@ async fn fetch_image_from_inline_bytes() {
         )
         .await
         .expect("inline image");
-    assert_eq!(frame.data().width(), 1);
-    assert_eq!(frame.data().height(), 1);
+    assert_eq!(frame.size().width, 1);
+    assert_eq!(frame.size().height, 1);
     assert_eq!(frame.raw_bytes(), bytes.as_slice());
 }
 
@@ -92,7 +93,7 @@ async fn fetch_image_from_data_url() {
         .fetch_image(MediaSource::DataUrl(data_url), ImageFetchConfig::default())
         .await
         .expect("data url");
-    assert_eq!(frame.data().width(), 1);
+    assert_eq!(frame.size().width, 1);
     assert_eq!(frame.raw_bytes(), bytes.as_slice());
 }
 
@@ -111,7 +112,7 @@ async fn fetch_image_from_file() {
         )
         .await
         .expect("file png");
-    assert_eq!(frame.data().width(), 1);
+    assert_eq!(frame.size().width, 1);
     let expected = std::fs::canonicalize(&file_path).expect("canonical path");
     match frame.source() {
         ImageSource::File { path } => assert_eq!(path, &expected),

@@ -6,14 +6,14 @@ that are used to verify the Rust image preprocessors produce identical results.
 
 Usage:
     # Generate all golden outputs
-    python scripts/generate_vision_golden.py
+    python crates/multimodal/scripts/generate_vision_golden.py
 
     # Generate for specific model
-    python scripts/generate_vision_golden.py --model llava
+    python crates/multimodal/scripts/generate_vision_golden.py --model llava
 
     # Use specific image
-    python scripts/generate_vision_golden.py \
-        --image tests/fixtures/images/square.jpg
+    python crates/multimodal/scripts/generate_vision_golden.py \
+        --image crates/multimodal/tests/fixtures/images/square.jpg
 """
 
 import argparse
@@ -81,16 +81,16 @@ MODELS = {
 
 # Default test images
 DEFAULT_IMAGES = [
-    "tests/fixtures/images/square.jpg",
-    "tests/fixtures/images/tall.jpg",
-    "tests/fixtures/images/wide.jpg",
-    "tests/fixtures/images/small.jpg",
-    "tests/fixtures/images/tiny.jpg",
-    "tests/fixtures/images/very_tall.jpg",
-    "tests/fixtures/images/very_wide.jpg",
-    "tests/fixtures/images/large.jpg",
-    "tests/fixtures/images/odd_dims.jpg",
-    "tests/fixtures/images/grayscale.jpg",
+    "crates/multimodal/tests/fixtures/images/square.jpg",
+    "crates/multimodal/tests/fixtures/images/tall.jpg",
+    "crates/multimodal/tests/fixtures/images/wide.jpg",
+    "crates/multimodal/tests/fixtures/images/small.jpg",
+    "crates/multimodal/tests/fixtures/images/tiny.jpg",
+    "crates/multimodal/tests/fixtures/images/very_tall.jpg",
+    "crates/multimodal/tests/fixtures/images/very_wide.jpg",
+    "crates/multimodal/tests/fixtures/images/large.jpg",
+    "crates/multimodal/tests/fixtures/images/odd_dims.jpg",
+    "crates/multimodal/tests/fixtures/images/grayscale.jpg",
 ]
 
 
@@ -236,8 +236,8 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     Default parameters:
     - patch_size: 14
     - merge_size: 2
-    - min_pixels: 4 * 28 * 28 = 3,136
-    - max_pixels: 16,384 * 28 * 28 = 12,845,056
+    - min_pixels: 256 * 28 * 28 = 200,704
+    - max_pixels: 1280 * 28 * 28 = 1,003,520
     - temporal_patch_size: 2
     """
     try:
@@ -259,8 +259,19 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
     patch_size = processor.patch_size
     merge_size = processor.merge_size
     temporal_patch_size = getattr(processor, "temporal_patch_size", 2)
+    # transformers < 5 exposes the pixel bounds as attributes; 5.x keeps them
+    # only in size={"shortest_edge": min_pixels, "longest_edge": max_pixels}.
+    size = getattr(processor, "size", None) or {}
     min_pixels = getattr(processor, "min_pixels", None)
     max_pixels = getattr(processor, "max_pixels", None)
+    if min_pixels is None:
+        min_pixels = size.get("shortest_edge") if hasattr(size, "get") else None
+    if max_pixels is None:
+        max_pixels = size.get("longest_edge") if hasattr(size, "get") else None
+    if min_pixels is None or max_pixels is None:
+        raise RuntimeError(
+            f"could not resolve Qwen2-VL pixel bounds from processor (size={size!r})"
+        )
 
     # Calculate number of tokens
     # tokens = (T * H * W) / merge_size²
@@ -277,6 +288,12 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
         "processor_config": processor.to_dict(),
     }
 
+    # transformers 5.x serializes the pixel bounds only as
+    # size={"shortest_edge", "longest_edge"}; the Rust PreProcessorConfig reads
+    # the flat keys, so write them back with the values the processor resolved.
+    result["processor_config"]["min_pixels"] = min_pixels
+    result["processor_config"]["max_pixels"] = max_pixels
+
     if image_grid_thw is not None:
         result["image_grid_thw"] = np.array(image_grid_thw)
 
@@ -290,6 +307,126 @@ def generate_golden_qwen2_vl(image_path: str, output_dir: str) -> dict:
         "temporal_patch_size": temporal_patch_size,
         "min_pixels": min_pixels,
         "max_pixels": max_pixels,
+    }
+
+    return result
+
+
+# MiniMax-M3's provider scaling contract raises an image whose short side is
+# under 112 px until the short side is exactly 112 px (aspect ratio kept)
+# before the Qwen-style smart resize runs. The hub image_processor.py does not
+# implement the floor, so the generator stages the raise itself, mirroring
+# `MiniMaxM3VisionProcessor::raise_images`.
+MINIMAX_M3_MIN_SHORT_SIDE = 112
+
+
+def minimax_m3_raise_to_short_side_floor(image: Image.Image, max_pixels: int) -> Image.Image:
+    """Raise an image below MiniMax-M3's 112 px short-side floor, as the
+    reference pipeline (and the Rust port) does before the smart resize."""
+    width, height = image.size
+    short = min(width, height)
+    if short == 0 or short >= MINIMAX_M3_MIN_SHORT_SIDE:
+        return image
+    long_side = round(max(width, height) * MINIMAX_M3_MIN_SHORT_SIDE / short)
+    raised = (
+        (MINIMAX_M3_MIN_SHORT_SIDE, long_side)
+        if width <= height
+        else (long_side, MINIMAX_M3_MIN_SHORT_SIDE)
+    )
+    if raised[0] * raised[1] > max_pixels:
+        raise RuntimeError(
+            f"raised image {raised} exceeds max_pixels={max_pixels}; "
+            "port the over-budget staging branch from the Rust processor"
+        )
+    try:
+        # The reference processor is torchvision-backed; raise with the same
+        # uint8 antialias bicubic kernel the Rust staging step matches.
+        import torchvision.transforms.v2.functional as tvF
+
+        tensor = tvF.to_image(image)
+        tensor = tvF.resize(
+            tensor,
+            [raised[1], raised[0]],
+            interpolation=tvF.InterpolationMode.BICUBIC,
+            antialias=True,
+        )
+        return tvF.to_pil_image(tensor)
+    except ImportError:
+        return image.resize(raised, Image.BICUBIC)
+
+
+def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
+    """Generate golden output for MiniMax-M3 VL.
+
+    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
+    defaults:
+    1. Raise images under the 112 px short-side floor (provider contract)
+    2. Smart resize to fit within min/max pixel bounds
+    3. Align dimensions to (patch_size * merge_size) boundary
+    4. Normalize with CLIP mean/std
+    5. Returns image_grid_thw for position encoding
+
+    Default parameters:
+    - patch_size: 14
+    - merge_size: 2
+    - temporal_patch_size: 2
+    - min_pixels: 4 * 28 * 28 = 3,136
+    - max_pixels: 672 * 672 = 451,584
+    """
+    from transformers import AutoImageProcessor
+
+    # The image processor is registered under AutoImageProcessor in the model's
+    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
+    # full AutoProcessor.
+    img_processor = AutoImageProcessor.from_pretrained(
+        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
+    )
+    image = Image.open(image_path).convert("RGB")
+    original_size = image.size
+
+    # Stage the provider contract's short-side floor (see above) before the
+    # hub processor's own smart resize.
+    max_pixels = getattr(img_processor, "max_pixels", None) or 576 * 28 * 28
+    image = minimax_m3_raise_to_short_side_floor(image, max_pixels)
+
+    # Process image
+    outputs = img_processor(images=image, return_tensors="np")
+    pixel_values = np.asarray(outputs["pixel_values"])
+    image_grid_thw = outputs.get("image_grid_thw")
+    if image_grid_thw is not None:
+        image_grid_thw = np.asarray(image_grid_thw)
+
+    # Get config values
+    patch_size = getattr(img_processor, "patch_size", 14)
+    merge_size = getattr(img_processor, "merge_size", 2)
+    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
+
+    # Calculate number of tokens: (T * H * W) / merge_size²
+    if image_grid_thw is not None:
+        grid_thw = image_grid_thw[0]
+        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
+    else:
+        num_tokens = None
+
+    result = {
+        "pixel_values": pixel_values,
+        "original_size": original_size,
+        "processor_config": img_processor.to_dict(),
+    }
+
+    if image_grid_thw is not None:
+        result["image_grid_thw"] = image_grid_thw
+
+    if num_tokens is not None:
+        result["num_tokens"] = num_tokens
+
+    # Add debug info
+    result["config_info"] = {
+        "patch_size": patch_size,
+        "merge_size": merge_size,
+        "temporal_patch_size": temporal_patch_size,
+        "min_pixels": getattr(img_processor, "min_pixels", None),
+        "max_pixels": getattr(img_processor, "max_pixels", None),
     }
 
     return result
@@ -612,81 +749,8 @@ def generate_golden_pixtral(image_path: str, output_dir: str) -> dict:
     return result
 
 
-def generate_golden_minimax_m3(image_path: str, output_dir: str) -> dict:
-    """Generate golden output for MiniMax-M3 VL.
-
-    The patchify pipeline is identical to Qwen2-VL, with MiniMax's smart resize
-    defaults:
-    1. Smart resize to fit within min/max pixel bounds
-    2. Align dimensions to (patch_size * merge_size) boundary
-    3. Normalize with CLIP mean/std
-    4. Returns image_grid_thw for position encoding
-
-    Default parameters:
-    - patch_size: 14
-    - merge_size: 2
-    - temporal_patch_size: 2
-    - min_pixels: 4 * 28 * 28 = 3,136
-    - max_pixels: 672 * 672 = 451,584
-    """
-    from transformers import AutoImageProcessor
-
-    # The image processor is registered under AutoImageProcessor in the model's
-    # auto_map; instantiate it directly to avoid the tokenizer dependency of the
-    # full AutoProcessor.
-    img_processor = AutoImageProcessor.from_pretrained(
-        "MiniMaxAI/MiniMax-M3", trust_remote_code=True
-    )
-    image = Image.open(image_path).convert("RGB")
-    original_size = image.size
-
-    # Process image
-    outputs = img_processor(images=image, return_tensors="pt")
-
-    # Convert to numpy for saving
-    pixel_values = outputs["pixel_values"].numpy()
-    image_grid_thw = outputs.get("image_grid_thw")
-    if image_grid_thw is not None:
-        image_grid_thw = image_grid_thw.numpy()
-
-    # Get config values
-    patch_size = getattr(img_processor, "patch_size", 14)
-    merge_size = getattr(img_processor, "merge_size", 2)
-    temporal_patch_size = getattr(img_processor, "temporal_patch_size", 2)
-
-    # Calculate number of tokens: (T * H * W) / merge_size²
-    if image_grid_thw is not None:
-        grid_thw = image_grid_thw[0]
-        num_tokens = int(np.prod(grid_thw) / (merge_size**2))
-    else:
-        num_tokens = None
-
-    result = {
-        "pixel_values": pixel_values,
-        "original_size": original_size,
-        "processor_config": img_processor.to_dict(),
-    }
-
-    if image_grid_thw is not None:
-        result["image_grid_thw"] = image_grid_thw
-
-    if num_tokens is not None:
-        result["num_tokens"] = num_tokens
-
-    # Add debug info
-    result["config_info"] = {
-        "patch_size": patch_size,
-        "merge_size": merge_size,
-        "temporal_patch_size": temporal_patch_size,
-        "min_pixels": getattr(img_processor, "min_pixels", None),
-        "max_pixels": getattr(img_processor, "max_pixels", None),
-    }
-
-    return result
-
-
-def generate_for_model(model_key: str, image_paths: list, output_dir: str):
-    """Generate golden outputs for a specific model."""
+def generate_for_model(model_key: str, image_paths: list, output_dir: str) -> int:
+    """Generate golden outputs for a specific model; returns the failure count."""
     print(f"\nGenerating golden outputs for {model_key}...")
 
     generator_fn = {
@@ -704,11 +768,13 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
 
     if generator_fn is None:
         print(f"  No generator for {model_key}, skipping")
-        return
+        return 0
 
+    failures = 0
     for image_path in image_paths:
         if not os.path.exists(image_path):
-            print(f"  Image not found: {image_path}, skipping")
+            failures += 1
+            print(f"  Image not found: {image_path}")
             continue
 
         image_name = Path(image_path).stem
@@ -716,14 +782,20 @@ def generate_for_model(model_key: str, image_paths: list, output_dir: str):
 
         try:
             data = generator_fn(image_path, output_dir)
-            if data is not None:
-                save_golden(model_key, image_name, data, output_dir)
-                print(f"    pixel_values shape: {data['pixel_values'].shape}")
-                print(
-                    f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
-                )
+            if data is None:
+                # The generator printed why (typically the processor class is
+                # missing from the installed transformers); no fixture was written.
+                failures += 1
+                continue
+            save_golden(model_key, image_name, data, output_dir)
+            print(f"    pixel_values shape: {data['pixel_values'].shape}")
+            print(
+                f"    pixel_values range: [{data['pixel_values'].min():.4f}, {data['pixel_values'].max():.4f}]"
+            )
         except Exception as e:
+            failures += 1
             print(f"    Error: {e}")
+    return failures
 
 
 def main():
@@ -735,8 +807,15 @@ def main():
     parser.add_argument(
         "--output-dir",
         "-o",
-        default="tests/fixtures/golden",
+        default="crates/multimodal/tests/fixtures/golden",
         help="Output directory for golden files",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Exit non-zero if any golden output fails to generate. CI uses this so a "
+        "processor API change cannot silently drop fixtures (the Rust golden tests skip "
+        "when a fixture directory is missing).",
     )
     args = parser.parse_args()
 
@@ -758,9 +837,14 @@ def main():
     print(f"Models: {models_to_generate}")
 
     # Generate golden outputs
+    failures = 0
     for model_key in models_to_generate:
-        generate_for_model(model_key, image_paths, args.output_dir)
+        failures += generate_for_model(model_key, image_paths, args.output_dir)
 
+    if failures:
+        print(f"\n{failures} golden output(s) failed to generate")
+        if args.strict:
+            sys.exit(1)
     print("\nDone!")
 
 

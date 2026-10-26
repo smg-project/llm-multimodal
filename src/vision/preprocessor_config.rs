@@ -6,43 +6,57 @@
 use std::collections::HashMap;
 
 use image::imageops::FilterType;
-use serde::{Deserialize, Deserializer};
-use serde_with::{serde_as, TryFromInto};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::transforms;
 
-/// Deserialization shape for HF size fields.
-///
-/// - Map format: `"size": {"height": 672, "width": 672}` (standard HuggingFace)
-/// - Array format: `"size": [672, 672]` -> treated as [height, width] (MiniMax M3)
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum SizeRepr {
-    Map(HashMap<String, u32>),
-    Array([u32; 2]),
-}
-
-impl TryFrom<SizeRepr> for HashMap<String, u32> {
-    type Error = &'static str;
-
-    fn try_from(value: SizeRepr) -> Result<Self, Self::Error> {
-        match value {
-            SizeRepr::Map(size) => Ok(size),
-            SizeRepr::Array([height, width]) => {
-                let mut size = HashMap::new();
-                size.insert("height".to_string(), height);
-                size.insert("width".to_string(), width);
-                Ok(size)
-            }
-        }
-    }
-}
-
 /// Struct to represent patch_size as dict {"height": x, "width": y}
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PatchSize {
     pub height: Option<u32>,
     pub width: Option<u32>,
+}
+
+/// Custom deserializer for `size`, which HuggingFace checkpoints write either
+/// as a mapping or as a bare `[height, width]` pair.
+///
+/// The mapping forms (`{"height": H, "width": W}`, `{"shortest_edge": S}`, and
+/// any other scalar keys such as `longest_edge`) pass through untouched. A
+/// two-element sequence — as MiniMax-M3 writes it, `"size": [672, 672]` — is
+/// normalized to `{"height": H, "width": W}` so every existing accessor keeps
+/// working. Without this the whole config fails to deserialize with
+/// "invalid type: sequence, expected a map".
+fn deserialize_size<'de, D>(deserializer: D) -> Result<Option<HashMap<String, u32>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum SizeSpec {
+        Map(HashMap<String, u32>),
+        Pair(Vec<u32>),
+    }
+
+    let Some(spec) = Option::<SizeSpec>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+
+    match spec {
+        SizeSpec::Map(map) => Ok(Some(map)),
+        SizeSpec::Pair(dims) => match dims.as_slice() {
+            [height, width] => Ok(Some(HashMap::from([
+                ("height".to_string(), *height),
+                ("width".to_string(), *width),
+            ]))),
+            // A single value is the shortest-edge spelling; anything else is
+            // not a size we can interpret.
+            [edge] => Ok(Some(HashMap::from([("shortest_edge".to_string(), *edge)]))),
+            other => Err(serde::de::Error::invalid_length(
+                other.len(),
+                &"a [height, width] pair or a single shortest-edge value",
+            )),
+        },
+    }
 }
 
 /// Custom deserializer for patch_size that handles both integer and dict formats.
@@ -129,8 +143,7 @@ where
 ///
 /// This struct captures the common fields across different vision model processors.
 /// Model-specific fields are accessed via the flexible `extra` field.
-#[serde_as]
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PreProcessorConfig {
     /// Processor class name (e.g., "CLIPImageProcessor", "Qwen2VLImageProcessor")
     #[serde(default)]
@@ -178,12 +191,10 @@ pub struct PreProcessorConfig {
 
     /// Target size for resizing
     /// Can be {"height": H, "width": W}, {"shortest_edge": S}, or [H, W]
-    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_size")]
     pub size: Option<HashMap<String, u32>>,
 
     /// Target size for center cropping
-    #[serde_as(deserialize_as = "Option<TryFromInto<SizeRepr>>")]
     #[serde(default)]
     pub crop_size: Option<HashMap<String, u32>>,
 
@@ -309,9 +320,14 @@ impl PreProcessorConfig {
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
         }
-        // Also extract Kimi-specific limits into the extra map
-        // so processors can read them via get_extra()
-        for key in ["in_patch_limit", "patch_limit_on_one_side"] {
+        // Also extract Kimi-specific limits and the K3 transparency settings
+        // into the extra map so processors can read them via get_extra()
+        for key in [
+            "in_patch_limit",
+            "patch_limit_on_one_side",
+            "transparent_bg_config",
+            "transparent_bg_fill_stage",
+        ] {
             if !config.extra.contains_key(key) {
                 if let Some(v) = media_cfg.get(key) {
                     config.extra.insert(key.to_string(), v.clone());
@@ -329,16 +345,6 @@ impl PreProcessorConfig {
             .and_then(|p| p.height)
             .map(|h| h as usize)
             .unwrap_or(default)
-    }
-
-    /// Whether this config changes Qwen-style processor structure or budgets.
-    pub(crate) fn has_structural_overrides(&self) -> bool {
-        self.patch_size.is_some()
-            || self.merge_size.is_some()
-            || self.min_pixels.is_some()
-            || self.max_pixels.is_some()
-            || self.temporal_patch_size.is_some()
-            || self.size.is_some()
     }
 
     /// Whether the declared processor type is image-only rather than video-capable.
@@ -465,6 +471,30 @@ impl PreProcessorConfig {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
+    /// A `usize` extra key, read strictly: `None` when the key is absent, the value when it is a
+    /// non-negative integer (an integral JSON float such as `2.0` included, for toolchains that
+    /// serialize integers as floats), else the value that could not be read, for the caller to
+    /// name in its error. The two forms are not interchangeable at the top: an integer is taken
+    /// as far as `u64` reaches, a float only up to `u32::MAX` (the rule the two processors
+    /// applied before it lived here). [`get_extra`](Self::get_extra) cannot serve here: it
+    /// swallows a type mismatch into `None`, and a silent default would change an alignment
+    /// factor or the token geometry, so the gateway's placeholder count would disagree with the
+    /// serving engine's with no trace.
+    pub fn extra_usize(&self, key: &str) -> Result<Option<usize>, &serde_json::Value> {
+        let Some(value) = self.extra.get(key) else {
+            return Ok(None);
+        };
+        if let Some(n) = value.as_u64() {
+            return Ok(Some(n as usize));
+        }
+        if let Some(f) = value.as_f64() {
+            if f >= 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX) {
+                return Ok(Some(f as usize));
+            }
+        }
+        Err(value)
+    }
+
     // Common default values
     pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
     pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
@@ -479,6 +509,9 @@ impl PreProcessorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vision::transforms::{
+        TransparentBgConfig, TransparentBgFillStage, TransparentBgPattern,
+    };
 
     #[test]
     fn test_parse_clip_config() {
@@ -543,11 +576,6 @@ mod tests {
         let json2 = r#"{"size": {"shortest_edge": 224}}"#;
         let config2 = PreProcessorConfig::from_json(json2).unwrap();
         assert_eq!(config2.get_target_size(), Some((224, 224)));
-
-        // Array format [height, width] (e.g. MiniMax M3)
-        let json3 = r#"{"size": [672, 672]}"#;
-        let config3 = PreProcessorConfig::from_json(json3).unwrap();
-        assert_eq!(config3.get_target_size(), Some((672, 672)));
     }
 
     #[test]
@@ -609,6 +637,46 @@ mod tests {
     }
 
     #[test]
+    fn extra_usize_reads_a_present_key_strictly_and_an_absent_one_as_none() {
+        let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+            "integer": 3,
+            "integral_float": 2.0,
+            "fractional": 2.5,
+            "negative": -1,
+            "text": "3",
+            "flag": true,
+            "huge_integer": 4_294_967_296_u64,
+            "huge_float": 4_294_967_296.0,
+            "largest_float": 4_294_967_295.0,
+        }))
+        .unwrap();
+        assert_eq!(config.extra_usize("absent"), Ok(None));
+        assert_eq!(config.extra_usize("integer"), Ok(Some(3)));
+        assert_eq!(
+            config.extra_usize("integral_float"),
+            Ok(Some(2)),
+            "an integral float is the integer it spells"
+        );
+        assert_eq!(
+            config.extra_usize("huge_integer"),
+            Ok(Some(4_294_967_296)),
+            "an integer is taken as far as u64 reaches"
+        );
+        assert_eq!(
+            config.extra_usize("largest_float"),
+            Ok(Some(4_294_967_295)),
+            "a float is taken up to u32::MAX"
+        );
+        for key in ["fractional", "negative", "text", "flag", "huge_float"] {
+            assert_eq!(
+                config.extra_usize(key),
+                Err(&config.extra[key]),
+                "{key}: a present value that is no non-negative integer is handed back"
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_kimi_nested_media_proc_cfg() {
         let json = r#"{
             "auto_map": {
@@ -637,5 +705,48 @@ mod tests {
 
         assert_eq!(config.get_patch_size(0), 14);
         assert_eq!(config.merge_size, Some(2));
+    }
+
+    #[test]
+    fn test_parse_kimi_k3_transparency_settings() {
+        // Verbatim excerpt from moonshotai/Kimi-K3's preprocessor_config.json.
+        let json = r#"{
+            "media_proc_cfg": {
+                "in_patch_limit": 65536,
+                "patch_size": 14,
+                "merge_kernel_size": 2,
+                "patch_limit_on_one_side": 512,
+                "transparent_bg_config": {
+                    "pattern": "chessboard",
+                    "chessboard_square_size": 8,
+                    "chessboard_square_on_top_left": true,
+                    "chessboard_white_value": 255,
+                    "chessboard_gray_value": 180
+                },
+                "transparent_bg_fill_stage": "after_resize"
+            }
+        }"#;
+
+        let config = PreProcessorConfig::from_json(json).unwrap();
+
+        assert_eq!(config.get_extra::<usize>("in_patch_limit"), Some(65536));
+        assert_eq!(
+            config.get_extra::<usize>("patch_limit_on_one_side"),
+            Some(512)
+        );
+
+        let bg = config
+            .get_extra::<TransparentBgConfig>("transparent_bg_config")
+            .expect("transparent_bg_config lifted out of media_proc_cfg");
+        assert_eq!(bg.pattern, TransparentBgPattern::Chessboard);
+        assert_eq!(bg.chessboard_square_size, 8);
+        assert!(bg.chessboard_square_on_top_left);
+        assert_eq!(bg.chessboard_white_value, 255);
+        assert_eq!(bg.chessboard_gray_value, 180);
+
+        assert_eq!(
+            config.get_extra::<TransparentBgFillStage>("transparent_bg_fill_stage"),
+            Some(TransparentBgFillStage::AfterResize)
+        );
     }
 }

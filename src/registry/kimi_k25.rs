@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{processors::KimiK25Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct KimiK25VisionSpec;
@@ -28,6 +29,9 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
+        // K2.5 only — K3 shares the `<|media_pad|>` fill token and the
+        // patchification layout, but neither the prompt shape nor the pixel
+        // pipeline. See `registry::kimi_k3` and `vision::processors::kimi_k3`.
         let id = metadata.model_id.to_ascii_lowercase();
         id.contains("kimi") && id.contains("k2")
             || metadata
@@ -50,8 +54,21 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
         Ok(HashMap::from([(Modality::Image, 10)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(KimiK25Processor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -61,18 +78,12 @@ impl ModelProcessorSpec for KimiK25VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let pad_token_id = Self::pad_token_id(metadata)?;
         let placeholder_token = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                PromptReplacement::repeated(
-                    Modality::Image,
-                    &placeholder_token,
-                    pad_token_id,
-                    num_tokens,
-                )
-            })
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -118,6 +129,28 @@ mod tests {
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("kimi_k25 spec");
         assert_eq!(spec.name(), "kimi_k25");
+    }
+
+    #[test]
+    fn kimi_k3_does_not_use_the_k25_spec() {
+        // K3's prompt carries per-image dimensions that this spec cannot emit,
+        // so it must route to `kimi_k3` by model_id and by model_type alike.
+        let tokenizer = TestTokenizer::new(&[("<|media_pad|>", 163605)]);
+        let config = json!({
+            "model_type": "kimi_k3",
+            "media_placeholder_token_id": 163605
+        });
+        let registry = ModelRegistry::new();
+
+        for model_id in ["moonshotai/Kimi-K3", "internal/checkpoint-final"] {
+            let metadata = ModelMetadata {
+                model_id,
+                tokenizer: &tokenizer,
+                config: &config,
+            };
+            let spec = registry.lookup(&metadata).expect("kimi_k3 spec");
+            assert_eq!(spec.name(), "kimi_k3", "model_id {model_id}");
+        }
     }
 
     #[test]

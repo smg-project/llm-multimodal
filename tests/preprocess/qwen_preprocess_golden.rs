@@ -1,12 +1,17 @@
 //! Mandatory HuggingFace golden checks for Qwen image preprocessing.
 #![allow(clippy::expect_used, clippy::panic)]
 
-use image::{DynamicImage, RgbImage};
-use llm_multimodal::vision::{
-    processor::ModelSpecificValue, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
-    VisionPreProcessor,
+use image::DynamicImage;
+use llm_multimodal::{
+    vision::{
+        processor::ModelSpecificValue, PreProcessorConfig, Qwen2VLProcessor, Qwen3VLProcessor,
+        VideoClipOptions, VisionPreProcessor,
+    },
+    Modality,
 };
 use serde::Deserialize;
+
+use super::make_seeded_image;
 
 #[derive(Deserialize)]
 struct GoldenDocument {
@@ -40,16 +45,6 @@ struct GoldenVideoCase {
 
 fn make_image(width: u32, height: u32) -> DynamicImage {
     make_seeded_image(width, height, 0)
-}
-
-fn make_seeded_image(width: u32, height: u32, seed: u8) -> DynamicImage {
-    DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
-        image::Rgb([
-            seed.wrapping_add(((x * 7 + y * 3) % 256) as u8),
-            seed.wrapping_add(((x * 5 + y * 11) % 256) as u8),
-            seed.wrapping_add(((x + y * 2) % 256) as u8),
-        ])
-    }))
 }
 
 fn image_grid(result: &llm_multimodal::vision::PreprocessedEncoderInputs) -> &[i64] {
@@ -93,9 +88,9 @@ fn config(mean: [f64; 3], std: [f64; 3]) -> PreProcessorConfig {
     }
 }
 
-fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, case: &GoldenCase) {
+fn check_case(processor: &dyn VisionPreProcessor, case: &GoldenCase) {
     let result = processor
-        .preprocess(&[make_image(case.width, case.height)], config)
+        .preprocess(&[make_image(case.width, case.height)])
         .expect("Qwen golden preprocessing failed");
     assert_eq!(result.encoder_input.shape(), case.shape);
 
@@ -103,8 +98,8 @@ fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, c
 
     let expected =
         u64::from_str_radix(&case.fnv1a_patch_u8, 16).expect("invalid golden FNV-1a fingerprint");
-    let values = result
-        .encoder_input
+    let encoder_f32 = result.encoder_input.as_f32();
+    let values = encoder_f32
         .as_slice_memory_order()
         .expect("Qwen encoder input must be contiguous");
     assert_eq!(
@@ -120,11 +115,7 @@ fn check_case(processor: &dyn VisionPreProcessor, config: &PreProcessorConfig, c
     );
 }
 
-fn check_video_case(
-    processor: &Qwen3VLProcessor,
-    config: &PreProcessorConfig,
-    case: &GoldenVideoCase,
-) {
+fn check_video_case(processor: &Qwen3VLProcessor, case: &GoldenVideoCase) {
     assert_eq!(case.model, "qwen3_vl");
     let seeds = [3, 101, 177];
     assert_eq!(case.frame_count, seeds.len());
@@ -133,15 +124,15 @@ fn check_video_case(
         .map(|seed| make_seeded_image(case.width, case.height, seed))
         .collect::<Vec<_>>();
     let result = processor
-        .preprocess_video(&frames, config)
+        .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
         .expect("Qwen video golden preprocessing failed");
     assert_eq!(result.encoder_input.shape(), case.shape);
     assert_eq!(video_grid(&result), &case.grid_thw);
 
     let expected = u64::from_str_radix(&case.fnv1a_patch_u8, 16)
         .expect("invalid video golden FNV-1a fingerprint");
-    let values = result
-        .encoder_input
+    let encoder_f32 = result.encoder_input.as_f32();
+    let values = encoder_f32
         .as_slice_memory_order()
         .expect("Qwen video encoder input must be contiguous");
     assert_eq!(
@@ -157,7 +148,7 @@ fn check_video_case(
 #[test]
 fn qwen_preprocessing_matches_huggingface_golden() {
     let golden: GoldenDocument = serde_json::from_str(include_str!(
-        "fixtures/golden/qwen_preprocess_fingerprints.json"
+        "../fixtures/golden/qwen_preprocess_fingerprints.json"
     ))
     .expect("invalid checked-in Qwen golden fixture");
     assert_eq!(golden.generator, "generate_qwen_preprocess_fingerprints.py");
@@ -170,26 +161,22 @@ fn qwen_preprocessing_matches_huggingface_golden() {
         "Qwen video golden coverage changed"
     );
 
-    let qwen2 = Qwen2VLProcessor::new();
-    let qwen2_config = PreProcessorConfig {
-        min_pixels: Some(256 * 28 * 28),
-        max_pixels: Some(1280 * 28 * 28),
-        ..config(
-            [0.48145466, 0.4578275, 0.40821073],
-            [0.26862954, 0.26130258, 0.27577711],
-        )
-    };
-    let qwen3 = Qwen3VLProcessor::new();
+    let qwen2 = Qwen2VLProcessor::from_preprocessor_config(&config(
+        [0.48145466, 0.4578275, 0.40821073],
+        [0.26862954, 0.26130258, 0.27577711],
+    ));
     let qwen3_config = config([0.5; 3], [0.5; 3]);
+    let qwen3 = Qwen3VLProcessor::from_config_for(&qwen3_config, Modality::Image);
+    let qwen3_video = Qwen3VLProcessor::from_config_for(&qwen3_config, Modality::Video);
 
     for case in &golden.cases {
         match case.model.as_str() {
-            "qwen2_vl" => check_case(&qwen2, &qwen2_config, case),
-            "qwen3_vl" => check_case(&qwen3, &qwen3_config, case),
+            "qwen2_vl" => check_case(&qwen2, case),
+            "qwen3_vl" => check_case(&qwen3, case),
             model => panic!("unknown Qwen golden model {model}"),
         }
     }
     for case in &golden.video_cases {
-        check_video_case(&qwen3, &qwen3_config, case);
+        check_video_case(&qwen3_video, case);
     }
 }

@@ -3,7 +3,7 @@
 
 torch
 torchvision
-transformers==5.12.1
+transformers==5.20.2
 pillow
 numpy
 scipy

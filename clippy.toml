@@ -1,0 +1,12 @@
+# Standalone equivalent of the smg workspace-root clippy.toml: the disallowed
+# methods this crate's #[expect(clippy::disallowed_methods)] sites wrap.
+# Pedantic lints apply to exported items too (the smg workspace sets this so
+# e.g. unused_self fires on the processors' public methods).
+avoid-breaking-exported-api = false
+disallowed-methods = [
+    { path = "tokio::task::spawn", reason = "Verify that it's okay for the gateway to shut down without waiting for this task" },
+    # The HTTP client takes the process-level TLS crypto provider and panics at build time without
+    # one: every client comes from a factory that installs it first, never from these directly.
+    { path = "reqwest::Client::new", reason = "Build HTTP clients through the crate's client factory (a test binary's common helper): it installs the process TLS crypto provider first, and reqwest's `rustls-no-provider` client panics at build time without one" },
+    { path = "reqwest::Client::builder", reason = "Build HTTP clients through the crate's client factory (a test binary's common helper): it installs the process TLS crypto provider first, and reqwest's `rustls-no-provider` client panics at build time without one" },
+]

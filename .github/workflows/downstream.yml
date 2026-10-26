@@ -1,0 +1,116 @@
+name: Downstream Integration
+
+# Pre-merge smoke tests against the two source-level consumers of this crate:
+# smg-project/smg (workspace member today, crates.io dependency after the
+# cut-over) and vllm-project/vllm (git dependency pinned to a rev of the
+# vllm-dev-rebase branch). Everything here runs on GitHub-hosted runners
+# against public repositories, so fork PRs get the same coverage without
+# touching any self-hosted infrastructure. GPU end-to-end lanes stay in the
+# consumer repositories.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - smg-main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smg:
+    name: smg (cargo check -p smg)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: llm-multimodal
+      - uses: actions/checkout@v6
+        with:
+          repository: smg-project/smg
+          path: smg
+      - name: Swap this revision into the smg workspace
+        # smg still consumes the crate as the workspace member
+        # crates/multimodal, so replacing the directory simulates the
+        # post-migration dependency. After smg switches to a crates.io
+        # dependency, replace this step with a [patch.crates-io] entry
+        # pointing at this revision. This job tracks smg's main HEAD: if it
+        # goes red with unresolved-import or cannot-find errors while the
+        # crate's own CI is green, smg's crate has drifted ahead of this
+        # lineage — re-sync smg-main instead of ignoring the failure.
+        run: rsync -a --delete --exclude .git --exclude target llm-multimodal/ smg/crates/multimodal/
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.98.0"
+      - name: Install system dependencies
+        # The well-known protobuf types (google/protobuf/*.proto) are not
+        # shipped by the apt protobuf-compiler package, so use the official
+        # protoc release, which bundles them (mirrors smg's own CI).
+        run: |
+          set -euo pipefail
+          wget -q https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip
+          sudo unzip -o -q protoc-32.0-linux-x86_64.zip -d /usr/local
+          protoc --version
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+      # Run inside the smg checkout so its rust-toolchain.toml governs.
+      - name: Check the gateway
+        run: cd smg && cargo check -p smg
+      - name: Check the Python binding (tokenspeed's wheel entry point)
+        run: cd smg && cargo check --manifest-path bindings/python/Cargo.toml
+
+  vllm:
+    name: vllm (nextest -p vllm-chat -p vllm-server)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: llm-multimodal
+      - uses: actions/checkout@v6
+        with:
+          repository: vllm-project/vllm
+          path: vllm
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: "1.95"
+          components: clippy
+      - uses: taiki-e/install-action@cargo-nextest
+      - name: Point vLLM's git dependency at this revision
+        # The guard answers exactly one question: if vLLM bumped its pin to
+        # this PR, would its checks stay green — so patch the dependency to
+        # this revision directly, with no merge of any other lineage.
+        run: |
+          cat >> vllm/rust/Cargo.toml <<EOF
+          [patch."https://github.com/smg-project/llm-multimodal"]
+          llm-multimodal = { path = "$GITHUB_WORKSPACE/llm-multimodal" }
+          EOF
+          cargo update --manifest-path vllm/rust/Cargo.toml -p llm-multimodal
+      # Run inside the vllm checkout so its rust-toolchain.toml (1.95)
+      # governs.
+      - name: Clippy
+        run: cd vllm && cargo clippy --manifest-path rust/Cargo.toml -p vllm-chat -p vllm-server --all-targets --all-features -- -D warnings
+      - name: Test
+        # Scope is deliberately narrow: only the tests that exercise this
+        # crate's APIs (vllm-chat's multimodal module, vllm-server's gRPC
+        # media handling). The rest of the two packages — template roundtrip
+        # tests that download live HF repos, the uv-scripted grammar replay —
+        # fails for reasons that have nothing to do with this crate (moving
+        # HF repos, missing tools) and would only train people to ignore the
+        # guard. Compile-level coverage stays broad: the clippy step above
+        # builds every target of both packages.
+        # nextest (one process per test) matches vLLM's own CI and avoids
+        # the shared-process tracing subscriber races that flake the
+        # multimodal timing tests under cargo test.
+        timeout-minutes: 30
+        run: cd vllm && cargo nextest run --manifest-path rust/Cargo.toml -p vllm-chat -p vllm-server --all-features -E 'test(multimodal::) or test(grpc::media)'

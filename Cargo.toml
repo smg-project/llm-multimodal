@@ -4,7 +4,7 @@ version = "1.14.0"
 edition = "2021"
 description = "Multimodal processing for vision and other modalities"
 license = "Apache-2.0"
-repository = "https://github.com/smg-project/smg"
+repository = "https://github.com/smg-project/llm-multimodal"
 authors = [
     "Simo Lin <linsimo.mark@gmail.com>",
     "Chang Su <mckvtl@gmail.com>",
@@ -30,7 +30,7 @@ opencv-video = ["dep:opencv"]
 zune-core = "=0.5.3"
 base64 = "0.23"
 hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"], optional = true }
-bytes = { workspace = true, features = ["serde"] }
+bytes = { version = "1.12.0", features = ["serde"] }
 fast_image_resize = { version = "6.0.0", features = ["image"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "tiff", "webp"] }
 libloading = "0.8"
@@ -40,32 +40,36 @@ rayon = "1.12"
 rustfft = "6.4"
 symphonia = { version = "0.6", default-features = false, features = ["all"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "imgproc", "videoio"], optional = true }
-reqwest = { workspace = true, features = ["stream"] }
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# No TLS backend: the media connector takes its `ClientBuilder` from the caller,
+# whose own reqwest features pick the backend.
+reqwest = { version = "0.13.4", default-features = false, features = ["stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
 tempfile = "3.27"
-thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "fs", "io-util", "net", "rt-multi-thread", "process", "time"] }
-tracing.workspace = true
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["sync", "fs", "io-util", "net", "rt-multi-thread", "process", "time"] }
+tracing = "0.1"
 url = "2.5.8"
-futures.workspace = true
+futures = "0.3"
 
-# Workspace crates
-anyhow.workspace = true
-blake3.workspace = true
+anyhow = "1.0"
+blake3 = "1.8"
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
-http.workspace = true
+http = "1.4.2"
 # The golden tests read `.npz` fixtures: a zip archive whose members are the arrays as `.npy` files.
 npyz = "0.9"
 zip = "9.0"
 # The dump example for bellwether's multimodal fixtures digests its artifacts with SHA-256, as the fixtures do.
 sha2 = "0.11"
+# The tests' clients use rustls with the ring provider they install, as in the
+# SMG workspace.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # The wire benchmark measures the process's CPU time.
 rustix = { version = "1", default-features = false, features = ["time"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 
 [build-dependencies]
 cc = "1"
@@ -84,5 +88,10 @@ harness = false
 name = "minimax_m3_preprocess"
 harness = false
 
-[lints]
-workspace = true
+# Standalone replacement for the upstream `[lints] workspace = true`: only the
+# lints this crate's #[expect] attributes rely on (the smg workspace enables
+# many more; see its workspace Cargo.toml). disallowed_methods is configured
+# by the repo-root clippy.toml, mirroring the smg workspace root.
+[lints.clippy]
+disallowed_methods = "warn"
+unused_self = "warn"

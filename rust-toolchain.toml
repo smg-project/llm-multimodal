@@ -1,0 +1,6 @@
+# Pinned to match smg-project/smg (scripts/ci_install_rust.sh) so clippy and
+# rustfmt findings are identical on both sides of the sync. A floating
+# toolchain drifts away from smg's lint baseline as releases age.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

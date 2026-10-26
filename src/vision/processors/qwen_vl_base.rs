@@ -522,7 +522,7 @@ impl QwenVLProcessorBase {
             num_patches,
             output_values,
             tokens: self.calculate_tokens_from_grid(grid_t, grid_h, grid_w),
-            second_per_grid: temporal_patch_size as f32 / sample_fps,
+            second_per_grid: (temporal_patch_size as f64 / sample_fps) as f32,
             filter: self.transforms.filter,
             do_resize: self.transforms.do_resize,
             norm: self.transforms.norm,
@@ -1918,7 +1918,7 @@ mod tests {
     /// The tensor path's oracle for the byte path: the raw 0..255 planes
     /// mapped through the per-byte table the bytes carry, the reference's
     /// fused arithmetic (the table itself is checked against the reference
-    /// processors in `tests/qwen_pixel_norm_golden.rs`).
+    /// processors in `tests/preprocess/qwen_pixel_norm_golden.rs`).
     fn tensor_through_table(image: &DynamicImage, mean: &[f64; 3], std: &[f64; 3]) -> Array3<f32> {
         let table = pixel_norm(&PreProcessorConfig::default(), *mean, *std, 1).table_f32();
         let mut tensor = to_tensor_no_norm(image);

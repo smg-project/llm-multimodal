@@ -82,7 +82,7 @@ jobs:
         env:
           LLM_MULTIMODAL_REQUIRE_GOLDEN: "1"
         run: |
-          cargo test --test vision_golden_tests ${{ matrix.test_filter }}
+          cargo test --test preprocess_tests ${{ matrix.test_filter }}
           if [ -n "${{ matrix.extra_filter }}" ]; then
-            cargo test --test vision_golden_tests ${{ matrix.extra_filter }}
+            cargo test --test preprocess_tests ${{ matrix.extra_filter }}
           fi

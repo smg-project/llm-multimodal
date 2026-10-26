@@ -37,7 +37,10 @@ pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
     ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
-pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
+pub use tracker::{
+    AsyncMultiModalTracker, FetchObserver, FetchOutcome, FetchReport, FetchSourceKind,
+    TrackerOutput,
+};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,
@@ -54,6 +57,7 @@ pub use vision::{
 /// Support for this crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use image::{DynamicImage, Rgb, RgbImage};
     use rustls::crypto::ring;
 
     /// The HTTP client builder for the tests' media connectors. The library
@@ -67,5 +71,11 @@ pub(crate) mod test_support {
     pub(crate) fn http_client_builder() -> reqwest::ClientBuilder {
         let _ = ring::default_provider().install_default();
         reqwest::Client::builder()
+    }
+
+    /// A solid image of the given size and colour: what the vision tests
+    /// build their inputs with.
+    pub(crate) fn create_test_image(width: u32, height: u32, color: Rgb<u8>) -> DynamicImage {
+        DynamicImage::from(RgbImage::from_pixel(width, height, color))
     }
 }

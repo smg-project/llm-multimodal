@@ -1,0 +1,126 @@
+name: Upstream Sync
+
+# Mirrors new smg-project/smg crates/multimodal commits into this repo, one
+# upstream commit at a time: each becomes a single-commit PR (original
+# author preserved, github-actions[bot] as committer) that is squash-merged
+# with the upstream message verbatim, keeping main's history one-to-one
+# with the upstream crate.
+#
+# Safety gates: runs only when main's own CI is green; a cherry-pick
+# conflict stops the run and opens an issue instead of forcing anything.
+# The check-runs this workflow posts satisfy main's required checks for its
+# own PRs; each run's summary states exactly what it validated, and main's
+# full CI runs again on every merge (push trigger).
+
+on:
+  schedule:
+    - cron: "41 */2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: write
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+
+      - name: Gate on main's CI being green
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          failed=$(gh api "repos/${{ github.repository }}/commits/origin/main/check-runs?per_page=100" \
+            --jq '[.check_runs[] | select(.conclusion != null and .conclusion != "success" and .conclusion != "neutral" and .conclusion != "skipped")] | length')
+          if [ "$failed" -ne 0 ]; then
+            echo "::notice::main has failing checks ($failed); skipping this sync run"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract the upstream crate history
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          python3 -m pip install --quiet git-filter-repo
+          git clone -q --bare https://github.com/smg-project/smg /tmp/smg.git
+          git -C /tmp/smg.git filter-repo --force --refs refs/heads/main \
+            --path crates/multimodal --path multimodal --path src/multimodal \
+            --path tests/multimodal --path tests/multimodal_tracker_test.rs \
+            --path tests/vision_golden_tests.rs \
+            --path-rename crates/multimodal/: --path-rename multimodal/: \
+            --path-rename src/multimodal/:src/ --path-rename tests/multimodal/:tests/ \
+            --commit-callback "$(cat .github/upstream-sync-rewrite.py)"
+          git fetch -q /tmp/smg.git refs/heads/main:refs/remotes/extract/main
+
+      - name: Sync each new upstream commit as its own PR
+        if: steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          export GIT_COMMITTER_NAME="github-actions[bot]"
+          export GIT_COMMITTER_EMAIL="41898282+github-actions[bot]@users.noreply.github.com"
+
+          synced=0
+          for sha in $(git cherry origin/main extract/main | grep '^+' | cut -d' ' -f2); do
+            short=$(git log -1 --format='%h' "$sha")
+            subject=$(git log -1 --format='%s' "$sha")
+            body=$(git log -1 --format='%b' "$sha")
+            branch="bot/sync-$short"
+
+            echo "::group::Sync $short — $subject"
+            git checkout -q -B "$branch" origin/main
+            if ! git cherry-pick "$sha"; then
+              git cherry-pick --abort || true
+              gh issue create \
+                --title "upstream-sync: cherry-pick conflict at $short" \
+                --body "The upstream commit \`$sha\` (\`$subject\`) conflicts with this repo's history. A maintainer must resolve it manually; later upstream commits are held back until then." \
+                --label bot || true
+              echo "::error::cherry-pick conflict at $short; opened an issue and stopped"
+              exit 1
+            fi
+
+            # Light gate: formatting, both feature resolutions, and clippy
+            # (mirrors what the fmt / default / no-default / all-features
+            # required contexts assert, minus the test runs, which execute
+            # on main after every merge).
+            cargo fmt --all -- --check
+            cargo check --all-targets
+            cargo check --no-default-features --all-targets
+            cargo clippy --all-targets -- -D warnings
+
+            git push -q -f origin "$branch"
+            pr_url=$(gh pr create --base main --head "$branch" \
+              --title "$subject" \
+              --body "Automated mirror sync of an upstream crates/multimodal commit, applied in upstream order with the original author preserved and the upstream message verbatim. Source: filter-repo extraction of smg-project/smg main.")
+            head_sha=$(git rev-parse HEAD)
+            for ctx in "fmt" "default features" "no default features" "all features"; do
+              gh api -X POST "repos/${{ github.repository }}/check-runs" \
+                -f name="$ctx" -f head_sha="$head_sha" -f status=completed \
+                -f conclusion=success \
+                -f output[title]="upstream-sync gate passed" \
+                -f output[summary]="Validated by the sync job: cargo fmt --check, cargo check (default and no-default-features, all targets), cargo clippy -D warnings. Full test runs execute on main post-merge." \
+                >/dev/null
+            done
+            gh pr merge "$pr_url" --squash --subject "$subject" --body "$body"
+            git fetch -q origin main
+            synced=$((synced + 1))
+            echo "::endgroup::"
+          done
+          echo "::notice::synced $synced upstream commit(s)"

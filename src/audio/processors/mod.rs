@@ -2,6 +2,7 @@
 
 mod inkling;
 mod muse_spark;
+mod nemotron_transcribe;
 mod parakeet;
 mod qwen3_audio;
 
@@ -13,3 +14,5 @@ pub use muse_spark::{
 };
 pub use parakeet::{ParakeetAudioParams, ParakeetAudioProcessor, ParakeetConfigError};
 pub use qwen3_audio::{Qwen3AudioParams, Qwen3AudioProcessor};
+
+pub(crate) use nemotron_transcribe::{NemotronTranscribeAudioProcessor, NEMOTRON_AUDIO_LENGTH_KEY};

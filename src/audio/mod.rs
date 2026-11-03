@@ -13,3 +13,5 @@ pub use processors::{
     ParakeetConfigError, Qwen3AudioParams, Qwen3AudioProcessor, MUSE_SPARK_AUDIO_SAMPLES_PER_TOKEN,
     MUSE_SPARK_AUDIO_SAMPLE_RATE, MUSE_SPARK_SAMPLES_PER_AUDIO_KEY,
 };
+
+pub(crate) use processors::{NemotronTranscribeAudioProcessor, NEMOTRON_AUDIO_LENGTH_KEY};

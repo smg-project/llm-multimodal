@@ -13,3 +13,8 @@ pub use processors::{
     ParakeetConfigError, Qwen3AudioParams, Qwen3AudioProcessor, MUSE_SPARK_AUDIO_SAMPLES_PER_TOKEN,
     MUSE_SPARK_AUDIO_SAMPLE_RATE, MUSE_SPARK_SAMPLES_PER_AUDIO_KEY,
 };
+
+pub use processors::{
+    NemotronTranscribeAudioParams, NemotronTranscribeAudioProcessor, NemotronTranscribeConfigError,
+    NEMOTRON_AUDIO_LENGTH_KEY, NEMOTRON_MAX_PADDED_AUDIO_BYTES,
+};

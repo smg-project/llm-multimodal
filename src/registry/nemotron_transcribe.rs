@@ -6,7 +6,10 @@ use std::collections::HashMap;
 use serde_json::Value;
 
 use crate::{
-    audio::{AudioPreProcessor, NemotronTranscribeAudioProcessor, NEMOTRON_AUDIO_LENGTH_KEY},
+    audio::{
+        AudioPreProcessor, NemotronTranscribeAudioProcessor, NemotronTranscribeConfigError,
+        NEMOTRON_AUDIO_LENGTH_KEY,
+    },
     registry::{
         MediaPartOrder, ModalityHooks, ModelMetadata, ModelProcessorSpec, ModelRegistryError,
         RegistryResult,
@@ -169,12 +172,15 @@ impl ModelProcessorSpec for NemotronTranscribeSpec {
         config: &Value,
         _preprocessor: &PreProcessorConfig,
     ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
-        let processor = NemotronTranscribeAudioProcessor::from_config(config).map_err(|error| {
-            ModelRegistryError::InvalidConfigField {
-                field: error.field,
-                reason: error.reason,
-            }
-        })?;
+        let processor =
+            NemotronTranscribeAudioProcessor::from_config(config).map_err(|error| match error {
+                NemotronTranscribeConfigError::Missing { field } => {
+                    ModelRegistryError::MissingConfigField { field }
+                }
+                NemotronTranscribeConfigError::Invalid { field, reason } => {
+                    ModelRegistryError::InvalidConfigField { field, reason }
+                }
+            })?;
         Ok(Some(Box::new(processor)))
     }
 }
@@ -221,6 +227,25 @@ mod tests {
             };
             assert!(!NemotronTranscribeSpec.matches(&metadata));
         }
+    }
+
+    #[test]
+    fn preserves_missing_and_invalid_config_diagnostics() {
+        let spec = NemotronTranscribeSpec;
+        let preprocessor = PreProcessorConfig::default();
+        assert!(matches!(
+            spec.audio_processor(&json!({}), &preprocessor),
+            Err(ModelRegistryError::MissingConfigField { field })
+                if field == "audio_config.preprocessor.sample_rate"
+        ));
+        assert!(matches!(
+            spec.audio_processor(
+                &json!({"audio_config": {"preprocessor": {"sample_rate": null}}}),
+                &preprocessor,
+            ),
+            Err(ModelRegistryError::InvalidConfigField { field, .. })
+                if field == "audio_config.preprocessor.sample_rate"
+        ));
     }
 
     #[test]

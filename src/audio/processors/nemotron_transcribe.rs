@@ -14,19 +14,27 @@ use crate::{
     types::AudioClip,
 };
 
-pub(crate) const NEMOTRON_AUDIO_LENGTH_KEY: &str = "audio_signal_length";
+pub const NEMOTRON_AUDIO_LENGTH_KEY: &str = "audio_signal_length";
 
+/// Maximum bytes in the dense, right-padded f32 waveform batch (256 MiB).
+/// Checked before resampling or allocating the output tensor. This is a
+/// processor output limit, independent of the decoder's per-clip byte limit;
+/// decoded inputs and one clip's resampling scratch are additional memory.
+pub const NEMOTRON_MAX_PADDED_AUDIO_BYTES: usize = 256 * 1024 * 1024;
+
+/// A required geometry field is absent, or a supplied value is invalid.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("invalid {field}: {reason}")]
-pub(crate) struct NemotronTranscribeConfigError {
-    pub field: String,
-    pub reason: String,
+pub enum NemotronTranscribeConfigError {
+    #[error("missing {field}")]
+    Missing { field: String },
+    #[error("invalid {field}: {reason}")]
+    Invalid { field: String, reason: String },
 }
 
 /// Geometry consumed by vLLM's native audio tower, resolved from either its
 /// normalized config or the published NeMo checkpoint's perception config.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct NemotronTranscribeAudioParams {
+pub struct NemotronTranscribeAudioParams {
     pub sample_rate: usize,
     pub hop_length: usize,
     pub n_fft: usize,
@@ -35,13 +43,16 @@ pub(crate) struct NemotronTranscribeAudioParams {
 
 impl NemotronTranscribeAudioParams {
     pub fn from_config(config: &Value) -> Result<Self, NemotronTranscribeConfigError> {
-        let invalid = |field: &str, reason: &str| NemotronTranscribeConfigError {
+        let invalid = |field: &str, reason: &str| NemotronTranscribeConfigError::Invalid {
             field: field.to_string(),
             reason: reason.to_string(),
         };
         let positive = |value: Option<&Value>, field: &str| {
+            let value = value.ok_or_else(|| NemotronTranscribeConfigError::Missing {
+                field: field.to_string(),
+            })?;
             value
-                .and_then(Value::as_u64)
+                .as_u64()
                 .and_then(|v| usize::try_from(v).ok())
                 .filter(|v| *v > 0)
                 .ok_or_else(|| invalid(field, "expected a positive integer"))
@@ -156,7 +167,7 @@ impl NemotronTranscribeAudioParams {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct NemotronTranscribeAudioProcessor {
+pub struct NemotronTranscribeAudioProcessor {
     params: NemotronTranscribeAudioParams,
 }
 
@@ -167,10 +178,15 @@ impl NemotronTranscribeAudioProcessor {
         })
     }
 
+    pub fn params(&self) -> &NemotronTranscribeAudioParams {
+        &self.params
+    }
+
     /// Batched waveforms right-padded to a common width. The native tower
     /// slices each row to its true post-minimum-pad `audio_signal_length`.
-    #[cfg(test)]
-    fn preprocess_decoded(
+    /// Rejects batches exceeding [`NEMOTRON_MAX_PADDED_AUDIO_BYTES`] before
+    /// resampling or allocating their output tensor.
+    pub fn preprocess_decoded(
         &self,
         clips: &[DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
@@ -179,50 +195,71 @@ impl NemotronTranscribeAudioProcessor {
 
     fn preprocess_refs<'a>(
         &self,
-        clips: impl ExactSizeIterator<Item = &'a DecodedAudio>,
+        clips: impl ExactSizeIterator<Item = &'a DecodedAudio> + Clone,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if clips.len() == 0 {
+        self.preprocess_refs_with_budget(clips, NEMOTRON_MAX_PADDED_AUDIO_BYTES)
+    }
+
+    fn preprocess_refs_with_budget<'a>(
+        &self,
+        clips: impl ExactSizeIterator<Item = &'a DecodedAudio> + Clone,
+        max_bytes: usize,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        let batch_size = clips.len();
+        if batch_size == 0 {
             return Err(TransformError::EmptyBatch);
         }
-        let mut samples = Vec::new();
-        let mut lengths = Vec::with_capacity(clips.len());
-        let mut counts = Vec::with_capacity(clips.len());
-        let mut sizes = Vec::with_capacity(clips.len());
-        for (index, clip) in clips.enumerate() {
+        // Match the resampler's ceil(input_samples * target_rate / source_rate).
+        // Inspect the entire batch before allocating or resampling any clip:
+        // a short clip beside a long one still consumes a full padded row.
+        let mut width = 0;
+        for (index, clip) in clips.clone().enumerate() {
             if clip.sample_rate == 0
                 || clip.samples.is_empty()
                 || clip.samples.iter().any(|s| !s.is_finite())
             {
                 return Err(TransformError::ShapeError(format!("invalid audio clip at batch index {index}: expected finite samples and a positive sample rate")));
             }
-            let start = samples.len();
-            if clip.sample_rate == self.params.sample_rate {
-                samples.extend_from_slice(&clip.samples);
+            let length = resampled_length(
+                clip.samples.len(),
+                clip.sample_rate,
+                self.params.sample_rate,
+            )?
+            .max(self.params.hop_length);
+            u32::try_from(length)
+                .map_err(|_| TransformError::ShapeError("audio length exceeds u32".to_string()))?;
+            width = width.max(length);
+        }
+        let elements = padded_batch_elements(batch_size, width, max_bytes)?;
+        let mut samples = reserved_vec(elements, "padded audio batch")?;
+        samples.resize(elements, 0.0);
+        let mut lengths = reserved_vec(batch_size, "audio lengths")?;
+        let mut counts = reserved_vec(batch_size, "audio token counts")?;
+        let mut sizes = reserved_vec(batch_size, "audio item sizes")?;
+        for (clip, row) in clips.zip(samples.chunks_exact_mut(width)) {
+            // Borrow native-rate clips; keep at most one resampled clip alive.
+            let resampled;
+            let waveform = if clip.sample_rate == self.params.sample_rate {
+                &clip.samples
             } else {
-                samples.extend(bandlimited_resample(
-                    &clip.samples,
-                    clip.sample_rate,
-                    self.params.sample_rate,
-                )?);
-            }
-            let length = (samples.len() - start).max(self.params.hop_length);
+                resampled =
+                    bandlimited_resample(&clip.samples, clip.sample_rate, self.params.sample_rate)?;
+                &resampled
+            };
+            let length = waveform.len().max(self.params.hop_length);
             let size = u32::try_from(length)
                 .map_err(|_| TransformError::ShapeError("audio length exceeds u32".to_string()))?;
-            samples.resize(start + length, 0.0);
+            // Keep a mismatch in the shared resampler's sizing a typed error.
+            let target = row.get_mut(..waveform.len()).ok_or_else(|| {
+                TransformError::ShapeError("resampled audio exceeds preflight width".to_string())
+            })?;
+            target.copy_from_slice(waveform);
             lengths.push(i64::from(size));
             sizes.push((size, 1));
             counts.push(self.params.token_count(length));
         }
-        let width = lengths.iter().copied().max().unwrap_or(0) as usize;
-        let mut batch = Array2::zeros((lengths.len(), width));
-        let mut offset = 0;
-        for (mut row, &length) in batch.outer_iter_mut().zip(&lengths) {
-            let length = length as usize;
-            for (target, &sample) in row.iter_mut().zip(&samples[offset..offset + length]) {
-                *target = sample;
-            }
-            offset += length;
-        }
+        let batch = Array2::from_shape_vec((batch_size, width), samples)
+            .map_err(|error| TransformError::ShapeError(error.to_string()))?;
         Ok(
             PreprocessedEncoderInputs::new(batch, counts, sizes).with_extra(
                 NEMOTRON_AUDIO_LENGTH_KEY,
@@ -230,6 +267,45 @@ impl NemotronTranscribeAudioProcessor {
             ),
         )
     }
+}
+
+fn resampled_length(
+    samples: usize,
+    source_rate: usize,
+    target_rate: usize,
+) -> Result<usize, TransformError> {
+    let length = (samples as u128 * target_rate as u128).div_ceil(source_rate as u128);
+    usize::try_from(length)
+        .map_err(|_| TransformError::ShapeError("resampled audio length exceeds usize".to_string()))
+}
+
+fn padded_batch_elements(
+    batch_size: usize,
+    width: usize,
+    max_bytes: usize,
+) -> Result<usize, TransformError> {
+    let elements = batch_size.checked_mul(width).ok_or_else(|| {
+        TransformError::ShapeError("padded audio batch element count overflow".to_string())
+    })?;
+    let bytes = elements
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| {
+            TransformError::ShapeError("padded audio batch byte count overflow".to_string())
+        })?;
+    if bytes > max_bytes {
+        return Err(TransformError::ShapeError(format!(
+            "padded audio batch requires {bytes} bytes, exceeding the {max_bytes}-byte output limit"
+        )));
+    }
+    Ok(elements)
+}
+
+fn reserved_vec<T>(capacity: usize, label: &str) -> Result<Vec<T>, TransformError> {
+    let mut values = Vec::new();
+    values.try_reserve_exact(capacity).map_err(|error| {
+        TransformError::ShapeError(format!("failed to allocate {label}: {error}"))
+    })?;
+    Ok(values)
 }
 
 impl AudioPreProcessor for NemotronTranscribeAudioProcessor {
@@ -349,6 +425,89 @@ mod tests {
     }
 
     #[test]
+    fn padded_batch_budget_counts_padding_and_accepts_exact_limit() {
+        let processor = NemotronTranscribeAudioProcessor::from_config(&config()).unwrap();
+        let clips = [clip(1, 16000), clip(161, 16000)];
+        let required_bytes = 2 * 161 * std::mem::size_of::<f32>();
+        assert!(processor
+            .preprocess_refs_with_budget(clips.iter(), required_bytes)
+            .is_ok());
+        let error = processor
+            .preprocess_refs_with_budget(clips.iter(), required_bytes - 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("output limit"), "{error}");
+        // One low-rate sample expands to 16,000 output samples. Budgeting
+        // must use the resampled length, before invoking the resampler.
+        let clips = [clip(1, 1)];
+        let error = processor
+            .preprocess_refs_with_budget(clips.iter(), 640)
+            .unwrap_err();
+        assert!(error.to_string().contains("64000 bytes"), "{error}");
+    }
+
+    #[test]
+    fn padded_batch_sizing_rejects_overflow_without_allocating() {
+        assert!(padded_batch_elements(usize::MAX, 2, usize::MAX).is_err());
+        assert!(padded_batch_elements(1, usize::MAX, usize::MAX).is_err());
+        assert!(resampled_length(usize::MAX, 1, 16000).is_err());
+        assert_eq!(resampled_length(161, 48000, 16000).unwrap(), 54);
+        assert_eq!(padded_batch_elements(2, 160, 1280).unwrap(), 320);
+    }
+
+    #[test]
+    fn equal_length_rows_preserve_distinct_samples() {
+        let processor = NemotronTranscribeAudioProcessor::from_config(&config()).unwrap();
+        let clips = [
+            clip(160, 16000),
+            DecodedAudio {
+                samples: (0..160).map(|sample| sample as f32 / 160.0).collect(),
+                sample_rate: 16000,
+            },
+        ];
+        let output = processor.preprocess_decoded(&clips).unwrap();
+        assert_eq!(output.encoder_input.shape(), &[2, 160]);
+        for (row, clip) in output.encoder_input.as_f32().outer_iter().zip(&clips) {
+            assert_eq!(row.as_slice().unwrap(), clip.samples);
+        }
+    }
+
+    #[test]
+    fn distinguishes_missing_fields_from_invalid_values() {
+        for field in ["sample_rate", "hop_length", "n_fft"] {
+            let mut config = config();
+            config["audio_config"]["preprocessor"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            let path = format!("audio_config.preprocessor.{field}");
+            assert_eq!(
+                NemotronTranscribeAudioParams::from_config(&config),
+                Err(NemotronTranscribeConfigError::Missing {
+                    field: path.clone()
+                })
+            );
+            for value in [Value::Null, json!(0), json!("invalid")] {
+                config["audio_config"]["preprocessor"][field] = value;
+                assert!(matches!(
+                    NemotronTranscribeAudioParams::from_config(&config),
+                    Err(NemotronTranscribeConfigError::Invalid { field, .. }) if field == path
+                ));
+            }
+        }
+        let mut config = config();
+        config["audio_config"]["asr_encoder"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subsampling_factor");
+        assert_eq!(
+            NemotronTranscribeAudioParams::from_config(&config),
+            Err(NemotronTranscribeConfigError::Missing {
+                field: "audio_config.asr_encoder.subsampling_factor".to_string()
+            })
+        );
+    }
+
+    #[test]
     fn resamples_before_counting_and_rejects_invalid_audio() {
         let processor = NemotronTranscribeAudioProcessor::from_config(&config()).unwrap();
         let output = processor
@@ -426,145 +585,5 @@ mod tests {
             .preprocess_decoded(&[decoded])
             .unwrap();
         assert!(output.encoder_input.as_f32().iter().all(|s| s.abs() < 1e-6));
-    }
-}
-
-#[cfg(test)]
-mod native_parity {
-    use super::*;
-
-    #[tokio::test]
-    async fn matches_native_vllm_waveform_oracle() {
-        let fixture: Value = serde_json::from_str(include_str!(
-            "../../../tests/fixtures/nemotron_transcribe_native.json"
-        ))
-        .unwrap();
-        let processor = NemotronTranscribeAudioProcessor::from_config(
-            &serde_json::json!({"audio_config":fixture["config"]}),
-        )
-        .unwrap();
-        for case in fixture["cases"].as_array().unwrap() {
-            let name = case["name"].as_str().unwrap();
-            let rate = case["sample_rate"].as_u64().unwrap() as usize;
-            let decoded = if let Some(wav) = case["input_wav"].as_str() {
-                let bytes = std::fs::read(
-                    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                        .join("tests/fixtures/nemotron_transcribe")
-                        .join(wav),
-                )
-                .unwrap();
-                crate::audio::decode_audio_mono_f32(&bytes).await.unwrap()
-            } else if let Some(count) = case["input_num_samples"].as_u64() {
-                DecodedAudio {
-                    samples: vec![case["constant_sample"].as_f64().unwrap() as f32; count as usize],
-                    sample_rate: rate,
-                }
-            } else {
-                let input = case["input_samples"].as_array().unwrap();
-                if input[0].is_array() {
-                    // Exercise the production decoder's channel reduction with
-                    // lossless float WAV, not an independently averaged input.
-                    let channels_first = input.len() == 2;
-                    let frames = if channels_first {
-                        input[0].as_array().unwrap().len()
-                    } else {
-                        input.len()
-                    };
-                    let mut wav = Vec::new();
-                    wav.extend_from_slice(b"RIFF");
-                    wav.extend_from_slice(&(36 + frames as u32 * 8).to_le_bytes());
-                    wav.extend_from_slice(b"WAVEfmt ");
-                    wav.extend_from_slice(&16u32.to_le_bytes());
-                    wav.extend_from_slice(&3u16.to_le_bytes());
-                    wav.extend_from_slice(&2u16.to_le_bytes());
-                    wav.extend_from_slice(&(rate as u32).to_le_bytes());
-                    wav.extend_from_slice(&(rate as u32 * 8).to_le_bytes());
-                    wav.extend_from_slice(&8u16.to_le_bytes());
-                    wav.extend_from_slice(&32u16.to_le_bytes());
-                    wav.extend_from_slice(b"data");
-                    wav.extend_from_slice(&(frames as u32 * 8).to_le_bytes());
-                    let interleaved: Vec<f32> = if channels_first {
-                        input[0]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .zip(input[1].as_array().unwrap())
-                            .flat_map(|(left, right)| {
-                                [
-                                    left.as_f64().unwrap() as f32,
-                                    right.as_f64().unwrap() as f32,
-                                ]
-                            })
-                            .collect()
-                    } else {
-                        input
-                            .iter()
-                            .flat_map(|frame| {
-                                frame
-                                    .as_array()
-                                    .unwrap()
-                                    .iter()
-                                    .map(|v| v.as_f64().unwrap() as f32)
-                            })
-                            .collect()
-                    };
-                    for sample in interleaved {
-                        wav.extend_from_slice(&sample.to_le_bytes());
-                    }
-                    crate::audio::decode_audio_mono_f32(&wav).await.unwrap()
-                } else {
-                    DecodedAudio {
-                        samples: input.iter().map(|v| v.as_f64().unwrap() as f32).collect(),
-                        sample_rate: rate,
-                    }
-                }
-            };
-            let output = processor.preprocess_decoded(&[decoded]).unwrap();
-            let length = case["expected_length"].as_u64().unwrap() as usize;
-            assert_eq!(output.encoder_input.shape(), &[1, length], "{name}");
-            assert_eq!(
-                output.feature_token_counts,
-                [case["expected_tokens"].as_u64().unwrap() as usize],
-                "{name}"
-            );
-            match &output.model_specific[NEMOTRON_AUDIO_LENGTH_KEY] {
-                ModelSpecificValue::IntTensor { data, shape } => {
-                    assert_eq!(data, &[length as i64], "{name}");
-                    assert_eq!(shape, &[1]);
-                }
-                _ => panic!("expected int64 lengths"),
-            }
-            let expected = if let Some(samples) = case["expected_samples"].as_array() {
-                samples
-                    .iter()
-                    .map(|v| v.as_f64().unwrap() as f32)
-                    .collect::<Vec<_>>()
-            } else {
-                let mut samples = vec![
-                    case["constant_sample"].as_f64().unwrap() as f32;
-                    case["input_num_samples"].as_u64().unwrap() as usize
-                ];
-                samples.resize(length, 0.0);
-                samples
-            };
-            let mut max_error = 0.0f32;
-            for (index, (actual, expected)) in output
-                .encoder_input
-                .as_f32()
-                .iter()
-                .zip(expected)
-                .enumerate()
-            {
-                max_error = max_error.max((actual - expected).abs());
-                // Float32 sinc kernels use a different summation order from
-                // torch's convolution; same-rate waveform values remain exact.
-                let tolerance = if rate == 16_000 { 0.0 } else { 1e-5 };
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "{name} sample {index}: {actual} != {expected}"
-                );
-            }
-            eprintln!("{name}: max waveform error {max_error:e}");
-        }
     }
 }

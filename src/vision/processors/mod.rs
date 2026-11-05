@@ -23,6 +23,8 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 //! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
+//! - **Nemotron VL / Omni** (`nemotron_vl`): the same family in vLLM's tensor layout, tiled or
+//!   dynamic-resolution images and video frames, geometry read from the model config
 
 pub mod deepseek_v41;
 pub mod gemma4;
@@ -36,6 +38,7 @@ pub mod minimax_m3;
 pub mod moonvit;
 pub mod muse_spark;
 pub mod nemotron_omni;
+pub mod nemotron_vl;
 pub mod phi3_vision;
 pub mod phi4_vision;
 pub mod pixtral;
@@ -55,6 +58,7 @@ pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use minimax_m3::MiniMaxM3VisionProcessor;
 pub use muse_spark::MuseSparkVisionProcessor;
 pub use nemotron_omni::NemotronOmniProcessor;
+pub use nemotron_vl::NemotronVlProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

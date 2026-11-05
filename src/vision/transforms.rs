@@ -1196,33 +1196,55 @@ pub fn resize_bicubic_torch_aa_f32(
     let (x_bounds, x_weights) = torch_aa_bicubic_weights(in_w, out_w);
     let (y_bounds, y_weights) = torch_aa_bicubic_weights(in_h, out_h);
 
-    let mut rows = vec![0.0_f32; in_h * out_w * 3];
-    for y in 0..in_h {
-        let src = &data[y * in_w * 3..][..in_w * 3];
-        let dst = &mut rows[y * out_w * 3..][..out_w * 3];
-        for (ox, (&(start, count), weights)) in x_bounds.iter().zip(&x_weights).enumerate() {
-            let mut acc = [0.0_f32; 3];
-            for (k, &weight) in weights[..count].iter().enumerate() {
-                let pixel = &src[(start + k) * 3..][..3];
-                for c in 0..3 {
-                    acc[c] += weight * f32::from(pixel[c]);
+    let row_out = out_w * 3;
+    let mut rows = vec![0.0_f32; in_h * row_out];
+    par_rows(&mut rows, row_out, |y0, band| {
+        for (i, dst) in band.chunks_exact_mut(row_out).enumerate() {
+            let src = &data[(y0 + i) * in_w * 3..][..in_w * 3];
+            for (ox, (&(start, count), weights)) in x_bounds.iter().zip(&x_weights).enumerate() {
+                let mut acc = [0.0_f32; 3];
+                for (k, &weight) in weights[..count].iter().enumerate() {
+                    let pixel = &src[(start + k) * 3..][..3];
+                    for c in 0..3 {
+                        acc[c] += weight * f32::from(pixel[c]);
+                    }
+                }
+                dst[ox * 3..][..3].copy_from_slice(&acc);
+            }
+        }
+    });
+
+    let mut out = vec![0.0_f32; out_h * row_out];
+    par_rows(&mut out, row_out, |y0, band| {
+        for (i, dst) in band.chunks_exact_mut(row_out).enumerate() {
+            let (start, count) = y_bounds[y0 + i];
+            for (k, &weight) in y_weights[y0 + i][..count].iter().enumerate() {
+                let src = &rows[(start + k) * row_out..][..row_out];
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += weight * v;
                 }
             }
-            dst[ox * 3..][..3].copy_from_slice(&acc);
         }
-    }
-
-    let mut out = vec![0.0_f32; out_h * out_w * 3];
-    for (oy, (&(start, count), weights)) in y_bounds.iter().zip(&y_weights).enumerate() {
-        let dst = &mut out[oy * out_w * 3..][..out_w * 3];
-        for (k, &weight) in weights[..count].iter().enumerate() {
-            let src = &rows[(start + k) * out_w * 3..][..out_w * 3];
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d += weight * v;
-            }
-        }
-    }
+    });
     Ok(out)
+}
+
+/// `fill(first_row, band)` over `out` (rows of `row_len` values), rows banded
+/// across the pool; each row is computed alone, so the banding changes nothing.
+fn par_rows<T: Send>(out: &mut [T], row_len: usize, fill: impl Fn(usize, &mut [T]) + Sync) {
+    let rows = out.len() / row_len;
+    let tasks = par_threads(size_of_val(out), rows);
+    if tasks <= 1 {
+        fill(0, out);
+        return;
+    }
+    let band_rows = rows.div_ceil(tasks);
+    let fill = &fill;
+    parallel_scope(|scope| {
+        for (i, band) in out.chunks_mut(band_rows * row_len).enumerate() {
+            scope.spawn(move |_| fill(i * band_rows, band));
+        }
+    });
 }
 
 /// Resize image preserving aspect ratio, fitting within max dimensions.
@@ -1655,6 +1677,55 @@ mod tests {
             pad_to_size_pil(&wide, 42_882, 42, Rgb([127, 127, 127])),
             Err(TransformError::ShapeError(_))
         ));
+    }
+
+    /// The float torch resize banded across the pool equals the same sums
+    /// taken row by row on one thread, bit for bit (a full-HD video frame).
+    #[test]
+    fn resize_bicubic_torch_aa_f32_banding_is_bit_identical() {
+        let (in_w, in_h, out_w, out_h) = (1920, 1080, 896, 504);
+        let mut seed = 7u32;
+        let data: Vec<u8> = (0..in_w * in_h * 3)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (seed >> 16) as u8
+            })
+            .collect();
+        let got = resize_bicubic_torch_aa_f32(
+            &data,
+            in_w as u32,
+            in_h as u32,
+            out_w as u32,
+            out_h as u32,
+        )
+        .unwrap();
+
+        let (xb, xw) = torch_aa_bicubic_weights(in_w, out_w);
+        let (yb, yw) = torch_aa_bicubic_weights(in_h, out_h);
+        let mut rows = vec![0.0_f32; in_h * out_w * 3];
+        for y in 0..in_h {
+            for (ox, (&(start, count), w)) in xb.iter().zip(&xw).enumerate() {
+                for c in 0..3 {
+                    let mut acc = 0.0_f32;
+                    for k in 0..count {
+                        acc += w[k] * f32::from(data[(y * in_w + start + k) * 3 + c]);
+                    }
+                    rows[(y * out_w + ox) * 3 + c] = acc;
+                }
+            }
+        }
+        let mut want = vec![0.0_f32; out_h * out_w * 3];
+        for (oy, (&(start, count), w)) in yb.iter().zip(&yw).enumerate() {
+            for k in 0..count {
+                for i in 0..out_w * 3 {
+                    want[oy * out_w * 3 + i] += w[k] * rows[(start + k) * out_w * 3 + i];
+                }
+            }
+        }
+        assert!(got
+            .iter()
+            .zip(&want)
+            .all(|(a, b)| a.to_bits() == b.to_bits()));
     }
 
     /// The raw-RGB torchvision `uint8` resizer must be byte-for-byte identical

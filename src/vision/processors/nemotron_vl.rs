@@ -27,25 +27,30 @@
 //!   `frame_duration_ms`; the engine pairs frames into tubelets of
 //!   `video_temporal_patch_size`.
 //!
-//! Every resize is torch's antialiased bicubic on the image as floats,
-//! unrounded, then `(x / 255 - mean) / std`. A transparent image is first
-//! composited onto white, as the engine's image loader does.
+//! Every resize is torch's antialiased bicubic. By default it runs on the
+//! image as floats, unrounded, then `(x / 255 - mean) / std`. The
+//! [`device_normalizing`](VisionPreProcessor::device_normalizing) processor
+//! instead emits the bytes as torch's uint8 kernel resizes them, for an
+//! engine that normalizes on device. A transparent image is first composited
+//! onto white, as the engine's image loader does.
 
 use std::{borrow::Cow, collections::HashMap};
 
 use image::DynamicImage;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{Array4, ArrayD, IxDyn};
 use serde_json::Value;
 
 use crate::{
-    encoder_inputs::ModelSpecificValue,
+    encoder_inputs::{EncoderInput, ModelSpecificValue, PixelNorm},
     types::{FieldLayout, RgbFrameRef, VideoSamplingInfo},
     vision::{
         processor::{
             PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor,
             VisionPreprocessingContext,
         },
-        transforms::{resize_bicubic_torch_aa_f32, rgb_bytes, TransformError},
+        transforms::{
+            resize_bicubic_torch_aa_f32, resize_bicubic_torch_aa_rgb, rgb_bytes, TransformError,
+        },
     },
 };
 
@@ -192,15 +197,34 @@ fn target_ratios(max_tiles: usize) -> Vec<(usize, usize)> {
     ratios
 }
 
+/// An image or frame resized as the engine resizes it, interleaved RGB.
+enum Resized<'a> {
+    /// Bytes, as stored or as torch's uint8 kernel resized them.
+    Bytes(Cow<'a, [u8]>),
+    /// Torch's float resize on the byte scale, unrounded.
+    Floats(Vec<f32>),
+}
+
+/// Encoder input under construction, channel-major per image or frame.
+enum Pixels {
+    Bytes(Vec<u8>),
+    Floats(Vec<f32>),
+}
+
 /// C-RADIO preprocessor for the Nemotron VL / Omni family.
 #[derive(Debug, Clone)]
 pub struct NemotronVlProcessor {
     geometry: NemotronVlGeometry,
+    /// Emit resized bytes for an engine that normalizes on device.
+    device_normalize: bool,
 }
 
 impl NemotronVlProcessor {
     pub fn new(geometry: NemotronVlGeometry) -> Self {
-        Self { geometry }
+        Self {
+            geometry,
+            device_normalize: false,
+        }
     }
 
     pub fn geometry(&self) -> &NemotronVlGeometry {
@@ -401,13 +425,15 @@ impl NemotronVlProcessor {
     }
 
     /// `raw` (`width x height` RGB) resized to `out_w x out_h` as the engine's
-    /// `_bicubic_resize_and_normalize` resizes it: interleaved floats on the
-    /// byte scale, the bytes themselves when the size does not change.
-    fn resized(
-        raw: &[u8],
+    /// `_bicubic_resize_and_normalize` resizes it: in bytes for an engine
+    /// that normalizes on device, else in floats on the byte scale. The bytes
+    /// stay as they are when the size does not change.
+    fn resized<'a>(
+        &self,
+        raw: &'a [u8],
         (width, height): (usize, usize),
         (out_w, out_h): (usize, usize),
-    ) -> Result<Vec<f32>, TransformError> {
+    ) -> Result<Resized<'a>, TransformError> {
         if width.checked_mul(height).and_then(|n| n.checked_mul(3)) != Some(raw.len()) {
             return Err(TransformError::ShapeError(format!(
                 "a {width}x{height} RGB frame needs {width}*{height}*3 bytes, got {}",
@@ -415,18 +441,33 @@ impl NemotronVlProcessor {
             )));
         }
         if (width, height) == (out_w, out_h) {
-            return Ok(raw.iter().copied().map(f32::from).collect());
+            return Ok(Resized::Bytes(Cow::Borrowed(raw)));
         }
         let (w, h, ow, oh) = (width as u32, height as u32, out_w as u32, out_h as u32);
-        resize_bicubic_torch_aa_f32(raw, w, h, ow, oh)
+        Ok(if self.device_normalize {
+            Resized::Bytes(Cow::Owned(
+                resize_bicubic_torch_aa_rgb(raw, w, h, ow, oh)?.into_raw(),
+            ))
+        } else {
+            Resized::Floats(resize_bicubic_torch_aa_f32(raw, w, h, ow, oh)?)
+        })
+    }
+
+    /// An empty encoder input with room for `len` values.
+    fn pixels(&self, len: usize) -> Pixels {
+        if self.device_normalize {
+            Pixels::Bytes(Vec::with_capacity(len))
+        } else {
+            Pixels::Floats(Vec::with_capacity(len))
+        }
     }
 
     /// Append the `(x, y, w, h)` window of a resized image `stride` pixels
-    /// wide, channel-major, as `(x / 255 - mean) / std`.
+    /// wide, channel-major: bytes as they are, else `(x / 255 - mean) / std`.
     fn push_window(
         &self,
-        out: &mut Vec<f32>,
-        resized: &[f32],
+        out: &mut Pixels,
+        resized: &Resized<'_>,
         stride: usize,
         (x0, y0, w, h): (usize, usize, usize, usize),
     ) {
@@ -434,20 +475,51 @@ impl NemotronVlProcessor {
         let std = self.geometry.norm_std.map(|s| s as f32);
         for c in 0..3 {
             for y in y0..y0 + h {
-                let row = &resized[(y * stride + x0) * 3..][..w * 3];
-                out.extend(
-                    row.iter()
-                        .skip(c)
-                        .step_by(3)
-                        .map(|&v| (v / 255.0 - mean[c]) / std[c]),
-                );
+                let span = (y * stride + x0) * 3..(y * stride + x0 + w) * 3;
+                let normalize = |v: f32| (v / 255.0 - mean[c]) / std[c];
+                match (&mut *out, resized) {
+                    (Pixels::Bytes(out), Resized::Bytes(src)) => {
+                        out.extend(src[span].iter().skip(c).step_by(3));
+                    }
+                    (Pixels::Floats(out), Resized::Bytes(src)) => out.extend(
+                        src[span]
+                            .iter()
+                            .skip(c)
+                            .step_by(3)
+                            .map(|&v| normalize(f32::from(v))),
+                    ),
+                    (Pixels::Floats(out), Resized::Floats(src)) => {
+                        out.extend(src[span].iter().skip(c).step_by(3).map(|&v| normalize(v)));
+                    }
+                    (Pixels::Bytes(_), Resized::Floats(_)) => {
+                        unreachable!("a byte destination is only handed byte resizes")
+                    }
+                }
             }
         }
     }
 
-    fn encoder_input(data: Vec<f32>, shape: [usize; 4]) -> Result<ArrayD<f32>, TransformError> {
-        ArrayD::from_shape_vec(IxDyn(&shape), data)
-            .map_err(|e| TransformError::ShapeError(format!("{shape:?}: {e}")))
+    fn encoder_input(
+        &self,
+        pixels: Pixels,
+        shape: [usize; 4],
+    ) -> Result<EncoderInput, TransformError> {
+        let shape_error =
+            |e: ndarray::ShapeError| TransformError::ShapeError(format!("{shape:?}: {e}"));
+        Ok(match pixels {
+            Pixels::Bytes(data) => EncoderInput::bytes(
+                Array4::from_shape_vec(shape, data).map_err(shape_error)?,
+                PixelNorm {
+                    scale: 1.0 / 255.0,
+                    offset: self.geometry.norm_mean.map(|m| m as f32),
+                    divisor: self.geometry.norm_std.map(|s| s as f32),
+                    channel_block: shape[2] * shape[3],
+                },
+            ),
+            Pixels::Floats(data) => {
+                EncoderInput::F32(ArrayD::from_shape_vec(IxDyn(&shape), data).map_err(shape_error)?)
+            }
+        })
     }
 
     /// One batch of a call's tiled images.
@@ -464,14 +536,14 @@ impl NemotronVlProcessor {
             .iter()
             .map(|&(columns, rows)| self.tile_count(columns, rows))
             .sum();
-        let mut pixels = Vec::with_capacity(total_tiles * 3 * side * side);
+        let mut pixels = self.pixels(total_tiles * 3 * side * side);
         let mut tiles_per_image = Vec::with_capacity(images.len());
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         for (image, &(columns, rows)) in images.iter().zip(&plans) {
             let (width, height, raw) = Self::rgb_on_white(image);
             let (out_w, out_h) = (columns * side, rows * side);
-            let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
+            let resized = self.resized(&raw, (width, height), (out_w, out_h))?;
             for row in 0..rows {
                 for column in 0..columns {
                     self.push_window(
@@ -484,7 +556,7 @@ impl NemotronVlProcessor {
             }
             let tiles = self.tile_count(columns, rows);
             if tiles > columns * rows {
-                let thumbnail = Self::resized(&raw, (width, height), (side, side))?;
+                let thumbnail = self.resized(&raw, (width, height), (side, side))?;
                 self.push_window(&mut pixels, &thumbnail, side, (0, 0, side, side));
             }
             tiles_per_image.push(tiles as i64);
@@ -492,7 +564,7 @@ impl NemotronVlProcessor {
             item_sizes.push((image.width(), image.height()));
         }
         Ok(PreprocessedEncoderInputs::new(
-            Self::encoder_input(pixels, [total_tiles, 3, side, side])?,
+            self.encoder_input(pixels, [total_tiles, 3, side, side])?,
             feature_token_counts,
             item_sizes,
         )
@@ -520,12 +592,12 @@ impl NemotronVlProcessor {
             .map(|((rows, cols), image)| {
                 let (width, height, raw) = Self::rgb_on_white(image);
                 let (out_w, out_h) = (cols * p, rows * p);
-                let resized = Self::resized(&raw, (width, height), (out_w, out_h))?;
-                let mut pixels = Vec::with_capacity(3 * out_w * out_h);
+                let resized = self.resized(&raw, (width, height), (out_w, out_h))?;
+                let mut pixels = self.pixels(3 * out_w * out_h);
                 self.push_window(&mut pixels, &resized, out_w, (0, 0, out_w, out_h));
                 let tokens = rows * cols / (shuffle * shuffle);
                 Ok(PreprocessedEncoderInputs::new(
-                    Self::encoder_input(pixels, [1, 3, out_h, out_w])?,
+                    self.encoder_input(pixels, [1, 3, out_h, out_w])?,
                     vec![tokens],
                     vec![(image.width(), image.height())],
                 )
@@ -565,7 +637,7 @@ impl NemotronVlProcessor {
             )));
         }
         let (out_h, out_w) = self.plan_video_size(first.width, first.height);
-        let mut pixels = Vec::with_capacity(frames.len() * 3 * out_w * out_h);
+        let mut pixels = self.pixels(frames.len() * 3 * out_w * out_h);
         for frame in frames {
             if (frame.width, frame.height) != (first.width, first.height) {
                 return Err(TransformError::ShapeError(format!(
@@ -574,7 +646,7 @@ impl NemotronVlProcessor {
                 )));
             }
             let size = (frame.width as usize, frame.height as usize);
-            let resized = Self::resized(frame.data, size, (out_w, out_h))?;
+            let resized = self.resized(frame.data, size, (out_w, out_h))?;
             self.push_window(&mut pixels, &resized, out_w, (0, 0, out_w, out_h));
         }
         let p = self.geometry.patch_size;
@@ -582,7 +654,7 @@ impl NemotronVlProcessor {
             self.geometry.tubelets(frames.len()) * self.geometry.frame_tokens(out_h / p, out_w / p);
         let indices: Vec<i64> = sampling.frame_indices.iter().map(|&i| i as i64).collect();
         Ok(PreprocessedEncoderInputs::new(
-            Self::encoder_input(pixels, [frames.len(), 3, out_h, out_w])?,
+            self.encoder_input(pixels, [frames.len(), 3, out_h, out_w])?,
             vec![tokens],
             vec![(first.width, first.height)],
         )
@@ -669,6 +741,13 @@ impl VisionPreProcessor for NemotronVlProcessor {
         sampling: Option<&VideoSamplingInfo>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.preprocess_frames(frames, sampling)
+    }
+
+    fn device_normalizing(&self) -> Option<Box<dyn VisionPreProcessor>> {
+        Some(Box::new(Self {
+            device_normalize: true,
+            ..self.clone()
+        }))
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -926,6 +1005,72 @@ mod tests {
         // The thumbnail squeezes both halves into one tile.
         assert_eq!(values[[2, 0, 0, 0]], black);
         assert!((values[[2, 0, 0, 511]] - white).abs() < 1e-4);
+    }
+
+    /// The device-normalizing processor sends the same pixels as bytes, with
+    /// the norm that turns them into the float processor's values up to the
+    /// uint8 rounding. Smooth gradients: at a sharp edge the float resize
+    /// overshoots 0..=255, where the uint8 one clamps, as in the engine.
+    #[test]
+    fn device_normalizing_sends_bytes_with_their_norm() {
+        let mut image = image::RgbImage::new(700, 300);
+        for (x, y, px) in image.enumerate_pixels_mut() {
+            *px = image::Rgb([
+                (x * 255 / 699) as u8,
+                (y * 255 / 299) as u8,
+                ((x + y) * 255 / 998) as u8,
+            ]);
+        }
+        let images = [DynamicImage::from(image)];
+        for kind in ["v2", "omni", "super"] {
+            let floats = processor(kind);
+            let bytes = floats.device_normalizing().unwrap();
+            let float_out = floats.preprocess(&images).unwrap();
+            let byte_out = bytes.preprocess(&images).unwrap();
+            assert_eq!(
+                float_out.feature_token_counts,
+                byte_out.feature_token_counts
+            );
+            let EncoderInput::U8 { patches, norm } = &byte_out.encoder_input else {
+                panic!("{kind}: bytes expected");
+            };
+            assert_eq!(patches.shape(), float_out.encoder_input.shape());
+            assert_eq!(norm.channel_block, patches.shape()[2] * patches.shape()[3]);
+            let values = float_out.encoder_input.as_f32();
+            let worst = patches
+                .indexed_iter()
+                .map(|(at, &b)| {
+                    let c = at[1];
+                    let restored = (f32::from(b) * norm.scale - norm.offset[c]) / norm.divisor[c];
+                    (restored - values[at]).abs() * norm.divisor[c] * 255.0
+                })
+                .fold(0.0, f32::max);
+            // Two levels of the torch uint8 kernel's taps, plus rounding.
+            assert!(worst <= 2.5, "{kind}: {worst} levels apart");
+        }
+        let frame = vec![77u8; 64 * 48 * 3];
+        let refs = [RgbFrameRef {
+            width: 64,
+            height: 48,
+            data: &frame,
+        }];
+        let sampling = VideoSamplingInfo {
+            source_fps: 30.0,
+            frame_indices: vec![0],
+        };
+        let video = processor("omni")
+            .device_normalizing()
+            .unwrap()
+            .preprocess_video_rgb_sampled(
+                &refs,
+                &VideoClipOptions::sampled_at(30.0),
+                Some(&sampling),
+            )
+            .unwrap();
+        let EncoderInput::U8 { patches, .. } = &video.encoder_input else {
+            panic!("video: bytes expected");
+        };
+        assert!(patches.iter().all(|&b| b == 77));
     }
 
     /// Frame sizes `get_video_target_size_and_feature_size` gives these clips.

@@ -239,6 +239,15 @@ pub trait VisionPreProcessor: Send + Sync {
         self.preprocess_video_rgb(frames, clip)
     }
 
+    /// This processor for a destination that normalizes pixels on device:
+    /// one that emits the resized bytes as
+    /// [`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8) with
+    /// their [`PixelNorm`](crate::encoder_inputs::PixelNorm) in place of
+    /// normalized floats. `None` when the processor has no such mode.
+    fn device_normalizing(&self) -> Option<Box<dyn VisionPreProcessor>> {
+        None
+    }
+
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert

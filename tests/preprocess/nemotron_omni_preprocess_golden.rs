@@ -8,7 +8,9 @@
 //! seeded or fixture images and frames, and synthetic tones.
 //! Grids, clip frames and token counts must match exactly; values are checked
 //! at sampled positions and through their sums, within tolerances that cover
-//! the float resize order and the pure-Rust FFT.
+//! the float resize order and the pure-Rust FFT. The fixture holds pixels
+//! packed (`(patches, 3 * 16 * 16)` rows); the vLLM-layout processor's
+//! `(n, 3, H, W)` pixels are packed the same way to compare.
 #![allow(clippy::expect_used, clippy::panic)]
 #![expect(clippy::print_stdout, reason = "integration tests: diagnostic output")]
 
@@ -18,10 +20,11 @@ use llm_multimodal::{
     audio::{DecodedAudio, ParakeetAudioProcessor},
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     vision::{
-        processors::NemotronOmniProcessor, transforms::rgb_bytes, VideoClipOptions,
-        VisionPreProcessor,
+        processors::{nemotron_vl::NemotronVlGeometry, NemotronOmniProcessor, NemotronVlProcessor},
+        transforms::rgb_bytes,
+        VideoClipOptions, VisionPreProcessor,
     },
-    RgbFrameRef,
+    RgbFrameRef, VideoSamplingInfo,
 };
 use serde::Deserialize;
 
@@ -271,6 +274,145 @@ fn audio_matches_the_reference_extractor() {
             values.as_slice().expect("standard layout"),
             &case.summary,
             AUDIO_TOL,
+        );
+    }
+}
+
+const PATCH: usize = 16;
+
+/// The vLLM-layout processor for the checkpoint geometry the fixture was generated for.
+fn processor() -> NemotronVlProcessor {
+    NemotronVlProcessor::new(
+        NemotronVlGeometry::from_model_config(&serde_json::json!({
+            "patch_size": 16, "downsample_ratio": 0.5, "force_image_size": 512,
+            "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+            "norm_std": [0.26862954, 0.26130258, 0.27577711],
+            "vision_config": {
+                "args": {"min_num_patches": 1024, "max_num_patches": 13312},
+                "video_target_num_patches": 1024,
+                "video_temporal_patch_size": 2,
+                "video_maintain_aspect_ratio": true
+            }
+        }))
+        .expect("checkpoint geometry"),
+    )
+}
+
+/// `(n, 3, H, W)` pixels as the engine's `DynamicResolutionImageTiler.stack`
+/// packs them: `c (py yy) (px xx) -> (py px) (c yy xx)` per image.
+fn packed(values: &[f32], shape: &[usize]) -> Vec<f32> {
+    let &[n, c, h, w] = shape else {
+        panic!("NCHW pixels, got {shape:?}")
+    };
+    let mut out = Vec::with_capacity(values.len());
+    for item in 0..n {
+        for py in 0..h / PATCH {
+            for px in 0..w / PATCH {
+                for channel in 0..c {
+                    for yy in 0..PATCH {
+                        let row = ((item * c + channel) * h + py * PATCH + yy) * w + px * PATCH;
+                        out.extend_from_slice(&values[row..row + PATCH]);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn reference_layout_images_match_the_reference_tiler() {
+    let golden: Golden = serde_json::from_str(GOLDEN).expect("golden fixture parses");
+    let processor = processor();
+    for case in &golden.images {
+        let (name, image) = match &case.source {
+            Source::Seed {
+                width,
+                height,
+                seed,
+            } => (
+                format!("seed {seed} {width}x{height}"),
+                make_seeded_image(*width, *height, *seed),
+            ),
+            Source::File { file } => (
+                file.clone(),
+                image::open(format!(
+                    "{}/tests/fixtures/images/{file}",
+                    env!("CARGO_MANIFEST_DIR")
+                ))
+                .expect("fixture image decodes"),
+            ),
+        };
+        let out = processor.preprocess(&[image]).expect("image preprocesses");
+        assert_eq!(
+            out.feature_token_counts,
+            vec![case.tokens],
+            "{name}: tokens"
+        );
+        let size = (case.rows as u32 * 16, case.cols as u32 * 16);
+        assert!(
+            matches!(out.model_specific.get("imgs_sizes"), Some(ModelSpecificValue::TupleVec(sizes)) if sizes == &[size]),
+            "{name}: grid"
+        );
+        let values = out.encoder_input.as_f32();
+        compare(
+            &name,
+            &packed(values.as_slice().expect("standard layout"), values.shape()),
+            &case.summary,
+            IMAGE_TOL,
+        );
+    }
+}
+
+#[test]
+fn reference_layout_video_frames_match_the_reference_sizing() {
+    let golden: Golden = serde_json::from_str(GOLDEN).expect("golden fixture parses");
+    let processor = processor();
+    for case in &golden.videos {
+        let VideoSource {
+            width,
+            height,
+            seeds,
+        } = &case.source;
+        let name = format!("video {width}x{height} x{}", seeds.len());
+        let frames: Vec<_> = seeds
+            .iter()
+            .map(|&seed| make_seeded_image(*width, *height, seed))
+            .collect();
+        let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
+        let refs: Vec<_> = rgb
+            .iter()
+            .map(|(_, _, data)| RgbFrameRef {
+                width: *width,
+                height: *height,
+                data,
+            })
+            .collect();
+        let sampling = VideoSamplingInfo {
+            source_fps: 2.0,
+            frame_indices: (0..refs.len()).collect(),
+        };
+        let out = processor
+            .preprocess_video_rgb_sampled(
+                &refs,
+                &VideoClipOptions::sampled_at(2.0),
+                Some(&sampling),
+            )
+            .expect("video preprocesses");
+        assert_eq!(
+            out.feature_token_counts,
+            vec![case.tokens],
+            "{name}: tokens"
+        );
+        let shape = out.encoder_input.shape();
+        let grid = [shape[0], shape[2] / PATCH, shape[3] / PATCH].map(|v| v as i64);
+        assert_eq!(grid.as_slice(), case.grid.as_slice(), "{name}: grid");
+        let values = out.encoder_input.as_f32();
+        compare(
+            &name,
+            &packed(values.as_slice().expect("standard layout"), values.shape()),
+            &case.summary,
+            IMAGE_TOL,
         );
     }
 }

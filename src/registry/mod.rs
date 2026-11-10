@@ -9,6 +9,7 @@ mod llava;
 mod minimax_m3;
 mod muse_spark;
 mod nemotron_omni;
+mod nemotron_vl;
 mod phi3_v;
 pub mod qwen3_asr;
 mod qwen3_omni;
@@ -29,6 +30,7 @@ use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
 use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
+use nemotron_vl::NemotronVlSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -44,55 +46,91 @@ pub use traits::{
 
 pub struct ModelRegistry {
     specs: Vec<LazySpec>,
+    /// The only format the serving engine reads, when the registry was built
+    /// for one ([`for_format`](Self::for_format)).
+    format: Option<EncoderInputFormat>,
 }
 
 impl ModelRegistry {
     pub fn new() -> Self {
         Self {
-            specs: vec![
-                // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
-                LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
-                // Gemma 4 matches its own model_type / id only.
-                LazySpec::new(|| Box::new(Gemma4Spec)),
-                LazySpec::new(|| Box::new(Glm53FlashSpec)),
-                LazySpec::new(|| Box::new(InklingSpec)),
-                // Kimi-K3 must be registered before Kimi-K2.5: the two families
-                // share a transport layout but not a prompt shape.
-                LazySpec::new(|| Box::new(KimiK3VisionSpec)),
-                LazySpec::new(|| Box::new(KimiK25VisionSpec)),
-                LazySpec::new(|| Box::new(Llama4Spec)),
-                LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
-                // Muse Spark matches its own model_type / architecture / id only.
-                LazySpec::new(|| Box::new(MuseSparkSpec)),
-                // Nemotron-H Omni matches its own model_type only.
-                LazySpec::new(|| Box::new(NemotronOmniSpec)),
-                // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
-                LazySpec::new(|| Box::new(LlavaNextSpec)),
-                LazySpec::new(|| Box::new(LlavaSpec)),
-                LazySpec::new(|| Box::new(Qwen3AsrSpec)),
-                LazySpec::new(|| Box::new(Qwen3OmniSpec)),
-                // Qwen3-VL must be registered before QwenVL so "qwen3" matches first.
-                LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
-                LazySpec::new(|| Box::new(QwenVLVisionSpec)),
-                LazySpec::new(|| Box::new(Phi3VisionSpec)),
-            ],
+            specs: Self::default_specs(),
+            format: None,
         }
     }
 
-    pub fn lookup<'a>(&'a self, metadata: &ModelMetadata) -> Option<&'a dyn ModelProcessorSpec> {
-        for spec in &self.specs {
-            let spec_ref = spec.get();
-            if spec_ref.matches(metadata) {
-                return Some(spec_ref);
-            }
+    /// A registry for an engine that reads only `format`: it skips the specs
+    /// emitting another format, and for `Reference` adds the Nemotron VL /
+    /// Omni specs in vLLM's tensor layout. [`new`](Self::new) leaves those
+    /// out because the family's engines do not read one shared layout: the
+    /// default registry serves the Packed Nemotron-H Omni spec instead.
+    pub fn for_format(format: EncoderInputFormat) -> Self {
+        let mut specs = Self::default_specs();
+        if format == EncoderInputFormat::Reference {
+            // One spec per image layout; both match the family's architectures only.
+            specs.push(LazySpec::new(|| {
+                Box::new(NemotronVlSpec {
+                    dynamic_images: false,
+                })
+            }));
+            specs.push(LazySpec::new(|| {
+                Box::new(NemotronVlSpec {
+                    dynamic_images: true,
+                })
+            }));
         }
-        None
+        Self {
+            specs,
+            format: Some(format),
+        }
+    }
+
+    fn default_specs() -> Vec<LazySpec> {
+        vec![
+            // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
+            LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+            // Gemma 4 matches its own model_type / id only.
+            LazySpec::new(|| Box::new(Gemma4Spec)),
+            LazySpec::new(|| Box::new(Glm53FlashSpec)),
+            LazySpec::new(|| Box::new(InklingSpec)),
+            // Kimi-K3 must be registered before Kimi-K2.5: the two families
+            // share a transport layout but not a prompt shape.
+            LazySpec::new(|| Box::new(KimiK3VisionSpec)),
+            LazySpec::new(|| Box::new(KimiK25VisionSpec)),
+            LazySpec::new(|| Box::new(Llama4Spec)),
+            LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
+            // Muse Spark matches its own model_type / architecture / id only.
+            LazySpec::new(|| Box::new(MuseSparkSpec)),
+            // Nemotron-H Omni matches its own model_type only.
+            LazySpec::new(|| Box::new(NemotronOmniSpec)),
+            // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
+            LazySpec::new(|| Box::new(LlavaNextSpec)),
+            LazySpec::new(|| Box::new(LlavaSpec)),
+            LazySpec::new(|| Box::new(Qwen3AsrSpec)),
+            LazySpec::new(|| Box::new(Qwen3OmniSpec)),
+            // Qwen3-VL must be registered before QwenVL so "qwen3" matches first.
+            LazySpec::new(|| Box::new(Qwen3VLVisionSpec)),
+            LazySpec::new(|| Box::new(QwenVLVisionSpec)),
+            LazySpec::new(|| Box::new(Phi3VisionSpec)),
+        ]
+    }
+
+    /// The specs the serving engine can read, in lookup order.
+    fn readable_specs(&self) -> impl Iterator<Item = &dyn ModelProcessorSpec> {
+        self.specs.iter().map(LazySpec::get).filter(|spec| {
+            self.format
+                .is_none_or(|format| spec.encoder_input_format() == format)
+        })
+    }
+
+    pub fn lookup<'a>(&'a self, metadata: &ModelMetadata) -> Option<&'a dyn ModelProcessorSpec> {
+        self.readable_specs().find(|spec| spec.matches(metadata))
     }
 
     /// The names of the model families this registry has a spec for, in
     /// lookup order: what a refusal can list for the operator.
     pub fn spec_names(&self) -> Vec<&'static str> {
-        self.specs.iter().map(|spec| spec.get().name()).collect()
+        self.readable_specs().map(|spec| spec.name()).collect()
     }
 }
 

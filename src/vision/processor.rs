@@ -7,7 +7,10 @@ use image::DynamicImage;
 
 use super::transforms::TransformError;
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
+use crate::{
+    encoder_inputs::EncoderDtype,
+    types::{RgbFrameRef, VideoSamplingInfo},
+};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -165,6 +168,19 @@ pub trait VisionPreProcessor: Send + Sync {
         self.preprocess(images)
     }
 
+    /// [`preprocess_with_context`](Self::preprocess_with_context) split into
+    /// consecutive batches whose items, in order, are the call's images. A
+    /// processor whose items cannot share one encoder tensor (images of
+    /// different sizes kept whole) returns one batch per image, still planned
+    /// together under the context; the default is the single batch.
+    fn preprocess_items_with_context(
+        &self,
+        images: &[DynamicImage],
+        context: &VisionPreprocessingContext,
+    ) -> Result<Vec<PreprocessedEncoderInputs>, TransformError> {
+        Ok(vec![self.preprocess_with_context(images, context)?])
+    }
+
     /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
     /// when the processor can lay the patches out and normalize them in one
     /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
@@ -208,6 +224,28 @@ pub trait VisionPreProcessor: Send + Sync {
             "{} does not support RGB video preprocessing",
             self.model_name()
         )))
+    }
+
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) for a clip whose
+    /// decoder reported how its frames were sampled from the source, for a
+    /// processor whose outputs carry the frames' source indices or times. The
+    /// default ignores `sampling`.
+    fn preprocess_video_rgb_sampled(
+        &self,
+        frames: &[RgbFrameRef<'_>],
+        clip: &VideoClipOptions,
+        _sampling: Option<&VideoSamplingInfo>,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_video_rgb(frames, clip)
+    }
+
+    /// This processor for a destination that normalizes pixels on device:
+    /// one that emits the resized bytes as
+    /// [`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8) with
+    /// their [`PixelNorm`](crate::encoder_inputs::PixelNorm) in place of
+    /// normalized floats. `None` when the processor has no such mode.
+    fn device_normalizing(&self) -> Option<Box<dyn VisionPreProcessor>> {
+        None
     }
 
     /// Calculate the number of vision tokens for a given image size.

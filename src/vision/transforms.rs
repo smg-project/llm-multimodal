@@ -168,6 +168,34 @@ pub fn deinterleave_rgb_to_planes(
     scale: [f32; 3],
     bias: [f32; 3],
 ) {
+    deinterleave_rgb_with(rgb, r_plane, g_plane, b_plane, affine(scale, bias));
+}
+
+/// `byte * scale[c] + bias[c]` as a per-channel byte map.
+fn affine(scale: [f32; 3], bias: [f32; 3]) -> impl Fn(usize, u8) -> f32 + Copy + Send + Sync {
+    move |c, byte| f32::from(byte) * scale[c] + bias[c]
+}
+
+/// HF's fused rescale-and-normalize, `(byte - 255 * mean[c]) / (255 * std[c])`
+/// in f32, as a per-channel byte map. It rounds differently from
+/// `byte * scale + bias`, which matters when the result is later cast to bf16:
+/// with mean = std = 0.5, byte 127 lands on the other side of a bf16 rounding
+/// tie.
+fn hf_normalize(mean: &[f64; 3], std: &[f64; 3]) -> impl Fn(usize, u8) -> f32 + Copy + Send + Sync {
+    let mean: [f32; 3] = std::array::from_fn(|c| mean[c] as f32 * 255.0);
+    let std: [f32; 3] = std::array::from_fn(|c| std[c] as f32 * 255.0);
+    move |c, byte| (f32::from(byte) - mean[c]) / std[c]
+}
+
+/// [`deinterleave_rgb_to_planes`] with an arbitrary per-channel byte map
+/// `map(channel, byte)`.
+fn deinterleave_rgb_with(
+    rgb: &[u8],
+    r_plane: &mut [f32],
+    g_plane: &mut [f32],
+    b_plane: &mut [f32],
+    map: impl Fn(usize, u8) -> f32 + Copy + Send + Sync,
+) {
     let pixels = r_plane.len();
     debug_assert_eq!(pixels, g_plane.len());
     debug_assert_eq!(pixels, b_plane.len());
@@ -178,7 +206,7 @@ pub fn deinterleave_rgb_to_planes(
     // reduction). Small images stay serial.
     let nthreads = par_threads(pixels * 3 * 4, pixels);
     if nthreads <= 1 {
-        deinterleave_contiguous(rgb, r_plane, g_plane, b_plane, scale, bias);
+        deinterleave_contiguous(rgb, r_plane, g_plane, b_plane, map);
         return;
     }
     let chunk = pixels.div_ceil(nthreads);
@@ -194,7 +222,7 @@ pub fn deinterleave_rgb_to_planes(
             gg = gt;
             bb = bt;
             let rgb_band = &rgb[p0 * 3..(p0 + n) * 3];
-            s.spawn(move |_| deinterleave_contiguous(rgb_band, rb, gb, bbnd, scale, bias));
+            s.spawn(move |_| deinterleave_contiguous(rgb_band, rb, gb, bbnd, map));
             p0 += n;
         }
     });
@@ -206,8 +234,7 @@ fn deinterleave_contiguous(
     r_plane: &mut [f32],
     g_plane: &mut [f32],
     b_plane: &mut [f32],
-    scale: [f32; 3],
-    bias: [f32; 3],
+    map: impl Fn(usize, u8) -> f32,
 ) {
     let pixels = r_plane.len();
     let full_blocks = pixels / 8;
@@ -223,9 +250,9 @@ fn deinterleave_contiguous(
 
         for i in 0..8 {
             let s = i * 3;
-            rd[i] = src[s] as f32 * scale[0] + bias[0];
-            gd[i] = src[s + 1] as f32 * scale[1] + bias[1];
-            bd[i] = src[s + 2] as f32 * scale[2] + bias[2];
+            rd[i] = map(0, src[s]);
+            gd[i] = map(1, src[s + 1]);
+            bd[i] = map(2, src[s + 2]);
         }
     }
 
@@ -233,20 +260,19 @@ fn deinterleave_contiguous(
     let tail_src = tail_dst * 3;
     for i in 0..remainder {
         let s = tail_src + i * 3;
-        r_plane[tail_dst + i] = rgb[s] as f32 * scale[0] + bias[0];
-        g_plane[tail_dst + i] = rgb[s + 1] as f32 * scale[1] + bias[1];
-        b_plane[tail_dst + i] = rgb[s + 2] as f32 * scale[2] + bias[2];
+        r_plane[tail_dst + i] = map(0, rgb[s]);
+        g_plane[tail_dst + i] = map(1, rgb[s + 1]);
+        b_plane[tail_dst + i] = map(2, rgb[s + 2]);
     }
 }
 
-/// Build a [C, H, W] f32 tensor from interleaved RGB bytes with per-channel
-/// `scale` and `bias`: `output[c][i] = raw[i*3 + c] * scale[c] + bias[c]`.
+/// Build a [C, H, W] f32 tensor from interleaved RGB bytes with a per-channel
+/// byte map: `output[c][i] = map(c, raw[i*3 + c])`.
 fn build_planar_tensor(
     raw: &[u8],
     w: usize,
     h: usize,
-    scale: [f32; 3],
-    bias: [f32; 3],
+    map: impl Fn(usize, u8) -> f32 + Copy + Send + Sync,
 ) -> Array3<f32> {
     let pixels = h * w;
     // Pooled: this large per-image buffer is the data plane's hottest allocation.
@@ -254,7 +280,7 @@ fn build_planar_tensor(
     let (r_plane, rest) = data.split_at_mut(pixels);
     let (g_plane, b_plane) = rest.split_at_mut(pixels);
 
-    deinterleave_rgb_to_planes(raw, r_plane, g_plane, b_plane, scale, bias);
+    deinterleave_rgb_with(raw, r_plane, g_plane, b_plane, map);
 
     #[expect(
         clippy::expect_used,
@@ -271,10 +297,43 @@ fn build_planar_tensor(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    (image_w, image_h): (usize, usize),
-    (canvas_w, canvas_h): (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
+    planes: &mut [f32],
+) {
+    paint_rgb_with(rgb, image_size, canvas_size, affine(scale, bias), planes);
+}
+
+/// [`paint_rgb_onto_planes`] with HF's fused rescale-and-normalize
+/// (`(byte - 255 * mean[c]) / (255 * std[c])`, matching
+/// [`to_tensor_and_normalize`]) in place of `scale` and `bias`; the margin
+/// holds normalized black.
+pub fn paint_rgb_onto_planes_normalized(
+    rgb: &[u8],
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
+    mean: &[f64; 3],
+    std: &[f64; 3],
+    planes: &mut [f32],
+) {
+    paint_rgb_with(
+        rgb,
+        image_size,
+        canvas_size,
+        hf_normalize(mean, std),
+        planes,
+    );
+}
+
+/// [`paint_rgb_onto_planes`] with an arbitrary per-channel byte map
+/// `map(channel, byte)`; the margin holds `map(channel, 0)`.
+fn paint_rgb_with(
+    rgb: &[u8],
+    (image_w, image_h): (usize, usize),
+    (canvas_w, canvas_h): (usize, usize),
+    map: impl Fn(usize, u8) -> f32 + Copy + Send + Sync,
     planes: &mut [f32],
 ) {
     let canvas_pixels = canvas_w * canvas_h;
@@ -283,22 +342,21 @@ pub fn paint_rgb_onto_planes(
     let (r_plane, rest) = planes.split_at_mut(canvas_pixels);
     let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
 
-    r_plane.fill(bias[0]);
-    g_plane.fill(bias[1]);
-    b_plane.fill(bias[2]);
+    r_plane.fill(map(0, 0));
+    g_plane.fill(map(1, 0));
+    b_plane.fill(map(2, 0));
 
     let painted_w = image_w.min(canvas_w);
     let painted_h = image_h.min(canvas_h);
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        deinterleave_rgb_to_planes(
+        deinterleave_rgb_with(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
             &mut b_plane[dst..dst + painted_w],
-            scale,
-            bias,
+            map,
         );
     }
 }
@@ -309,14 +367,14 @@ pub fn paint_rgb_onto_planes(
 pub fn to_tensor(image: &DynamicImage) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
     let s = 1.0 / 255.0;
-    build_planar_tensor(&raw, w, h, [s, s, s], [0.0, 0.0, 0.0])
+    build_planar_tensor(&raw, w, h, affine([s, s, s], [0.0, 0.0, 0.0]))
 }
 
 /// Convert image to tensor [C, H, W] without normalization (keeps [0, 255]).
 #[cfg(test)]
 pub fn to_tensor_no_norm(image: &DynamicImage) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
-    build_planar_tensor(&raw, w, h, [1.0, 1.0, 1.0], [0.0, 0.0, 0.0])
+    build_planar_tensor(&raw, w, h, affine([1.0, 1.0, 1.0], [0.0, 0.0, 0.0]))
 }
 
 /// Normalize tensor per channel: (x - mean) / std.
@@ -354,18 +412,16 @@ pub fn normalize(tensor: &mut Array3<f32>, mean: &[f64; 3], std: &[f64; 3]) {
 
 /// Convert image to tensor and normalize in a single pass.
 ///
-/// Fuses `to_tensor` (u8→f32 with /255) and `normalize` ((x-mean)/std)
-/// into one loop to avoid an extra pass over the data.
+/// Computes HF's fused rescale-and-normalize (`BaseImageProcessorFast` with
+/// `do_rescale` and `do_normalize`, rescale factor 1/255),
+/// `(pixel - 255 * mean) / (255 * std)` in f32, bit for bit.
 pub fn to_tensor_and_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
 ) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
-    // Fused: (pixel/255 - mean) / std = pixel * (1/(255*std)) - mean/std
-    let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-    let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
-    build_planar_tensor(&raw, w, h, scale, bias)
+    build_planar_tensor(&raw, w, h, hf_normalize(mean, std))
 }
 
 /// Rescale tensor by a constant factor.
@@ -2075,6 +2131,55 @@ mod tests {
         // (0.5 - 0.5) / 0.5 = 0.0
         for val in &tensor {
             assert!(val.abs() < 1e-6);
+        }
+    }
+
+    /// Golden bits from HF's fused rescale-and-normalize (transformers 5.10.1,
+    /// torch 2.12). With mean = std = 0.5, byte 127 sits next to a bf16
+    /// rounding tie, so any other f32 formula can cast to a different bf16.
+    #[test]
+    fn to_tensor_and_normalize_is_bit_exact_with_hf() {
+        let img = create_test_image(3, 2, Rgb([127, 128, 1]));
+        let clip_mean = [0.48145466, 0.4578275, 0.40821073];
+        let clip_std = [0.26862954, 0.26130258, 0.27577711];
+        for (mean, std, golden) in [
+            (
+                [0.5; 3],
+                [0.5; 3],
+                [0xbb80_8081_u32, 0x3b80_8081, 0xbf7d_fdfe],
+            ),
+            (clip_mean, clip_std, [0x3d7c_e08c, 0x3e2c_f360, 0xbfbb_a5e2]),
+        ] {
+            let tensor = to_tensor_and_normalize(&img, &mean, &std);
+            for (c, bits) in golden.into_iter().enumerate() {
+                assert_eq!(
+                    tensor[[c, 1, 2]].to_bits(),
+                    bits,
+                    "mean {mean:?}, channel {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn paint_rgb_onto_planes_normalized_matches_to_tensor_and_normalize() {
+        let img = create_test_image(2, 2, Rgb([127, 128, 1]));
+        let (mean, std) = ([0.5; 3], [0.5; 3]);
+        let expected = to_tensor_and_normalize(&img, &mean, &std);
+        let (w, h, raw) = rgb_bytes(&img);
+        let mut planes = vec![f32::NAN; 3 * 3 * 2];
+        paint_rgb_onto_planes_normalized(&raw, (w, h), (3, 2), &mean, &std, &mut planes);
+        for c in 0..3 {
+            for y in 0..2 {
+                for x in 0..3 {
+                    let value = if x < 2 { expected[[c, y, x]] } else { -1.0 };
+                    assert_eq!(
+                        planes[c * 6 + y * 3 + x].to_bits(),
+                        value.to_bits(),
+                        "channel {c} at ({x}, {y})"
+                    );
+                }
+            }
         }
     }
 
